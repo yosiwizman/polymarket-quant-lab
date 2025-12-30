@@ -1,0 +1,25 @@
+# Statistical Arbitrage Pairs Configuration
+# 
+# Define pairs of correlated markets to monitor for spread divergence.
+# When the spread exceeds entry_threshold, a signal is generated.
+#
+# Format:
+#   - market_a_id: First market condition ID
+#     market_b_id: Second market condition ID
+#     name: Human-readable name for the pair
+#     correlation: 1.0 for same direction, -1.0 for inverse correlation
+
+pairs:
+  # Example pairs - replace with actual market IDs from Polymarket
+  # You can find market IDs using: pmq sync && pmq scan
+  
+  # - market_a_id: "0x1234567890abcdef..."
+  #   market_b_id: "0xfedcba0987654321..."
+  #   name: "Example pair - Market A vs Market B"
+  #   correlation: 1.0
+  
+  # Inverse correlation example (market A up = market B down)
+  # - market_a_id: "0xabc..."
+  #   market_b_id: "0xdef..."
+  #   name: "Inverse pair example"
+  #   correlation: -1.0

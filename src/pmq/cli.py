@@ -303,30 +303,68 @@ def paper_run(
         bool,
         typer.Option("--dry-run", help="Detect signals but don't execute trades"),
     ] = False,
+    strategy: Annotated[
+        str,
+        typer.Option("--strategy", "-s", help="Strategy name (must be approved)"),
+    ] = "arb",
+    override_unsafe: Annotated[
+        bool,
+        typer.Option(
+            "--override-unsafe",
+            help="Bypass approval check (NOT RECOMMENDED for production)",
+        ),
+    ] = False,
 ) -> None:
     """Run paper trading strategy loop.
 
     Continuously scans for arbitrage signals and executes paper trades.
     All trades are simulated - no real orders are placed.
 
+    Requires strategy approval unless --override-unsafe is used.
+
     Example:
-        pmq paper run --minutes 10 --quantity 5
+        pmq paper run --strategy arb --minutes 10 --quantity 5
     """
+    from pmq.governance import RiskGate
+
     settings = get_settings()
 
     if settings.safety.kill_switch:
         console.print("[red]Kill switch is active. Trading halted.[/red]")
         raise typer.Exit(1)
 
+    dao = DAO()
+
+    # Check strategy approval
+    risk_gate = RiskGate(dao=dao)
+    try:
+        approval_status = risk_gate.enforce_approval(
+            strategy_name=strategy,
+            allow_override=override_unsafe,
+        )
+        if approval_status.approved:
+            console.print(f"[green]✓ Strategy '{strategy}' is APPROVED[/green]")
+        else:
+            console.print(
+                f"[yellow]⚠ Running with OVERRIDE - strategy '{strategy}' is NOT approved[/yellow]"
+            )
+    except PermissionError as e:
+        console.print(f"[red]{e}[/red]")
+        console.print(
+            "\n[dim]Use 'pmq approve grant' to approve this strategy, "
+            "or --override-unsafe to bypass (not recommended)[/dim]"
+        )
+        raise typer.Exit(1) from e
+
     console.print(
-        f"[bold green]Starting paper trading loop[/bold green]\n"
+        f"\n[bold green]Starting paper trading loop[/bold green]\n"
+        f"Strategy: {strategy}\n"
         f"Duration: {minutes} minutes\n"
         f"Quantity: {quantity} per signal\n"
         f"Interval: {interval} seconds\n"
         f"Dry run: {dry_run}\n"
     )
 
-    dao = DAO()
     ledger = PaperLedger(dao=dao)
     arb_scanner = ArbitrageScanner()
     client = GammaClient()
@@ -1482,6 +1520,407 @@ def snapshots_summary() -> None:
         q_table.add_row("Created", latest_report["created_at"][:19])
 
         console.print(q_table)
+
+
+# =============================================================================
+# Strategy Approval Commands (Phase 3)
+# =============================================================================
+
+approve_app = typer.Typer(help="Strategy approval and risk governance commands")
+app.add_typer(approve_app, name="approve")
+
+
+@approve_app.command("evaluate")
+def approve_evaluate(
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", "-r", help="Backtest run ID to evaluate"),
+    ],
+) -> None:
+    """Evaluate a backtest run for approval.
+
+    Computes a strategy scorecard with pass/fail criteria and
+    recommended risk limits.
+
+    Example:
+        pmq approve evaluate --run-id abc123
+    """
+    from pmq.backtest import BacktestRunner
+    from pmq.governance import compute_scorecard
+
+    dao = DAO()
+    runner = BacktestRunner(dao=dao)
+
+    # Get backtest report
+    report = runner.get_run_report(run_id)
+    if not report:
+        console.print(f"[red]Backtest run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+
+    run = report["run"]
+    metrics = report.get("metrics")
+
+    if not metrics:
+        console.print(f"[red]No metrics found for run: {run_id}[/red]")
+        raise typer.Exit(1)
+
+    # Get data quality for the backtest window
+    from pmq.quality import QualityReporter
+
+    quality_reporter = QualityReporter()
+    quality_report = quality_reporter.generate_report(
+        start_time=run["start_date"],
+        end_time=run["end_date"],
+        save=False,
+    )
+
+    # Compute scorecard
+    scorecard = compute_scorecard(
+        total_pnl=metrics["total_pnl"],
+        max_drawdown=metrics["max_drawdown"],
+        win_rate=metrics["win_rate"],
+        sharpe_ratio=metrics["sharpe_ratio"],
+        total_trades=metrics["total_trades"],
+        trades_per_day=metrics["trades_per_day"],
+        capital_utilization=metrics.get("capital_utilization", 0.5),
+        initial_balance=run.get("initial_balance", 10000.0),
+        data_quality_pct=quality_report.coverage_pct,
+    )
+
+    # Display results
+    status = "[green]PASSED[/green]" if scorecard.passed else "[red]FAILED[/red]"
+    console.print(f"\n[bold]Strategy Evaluation: {status}[/bold]")
+    console.print(f"Run ID: [cyan]{run_id}[/cyan]")
+    console.print(f"Strategy: [cyan]{run['strategy']}[/cyan]")
+
+    # Score breakdown
+    score_table = Table(title="Scorecard")
+    score_table.add_column("Metric", style="cyan")
+    score_table.add_column("Value", justify="right")
+    score_table.add_column("Score", justify="right")
+
+    score_table.add_row("Total PnL", f"${metrics['total_pnl']:,.2f}", "—")
+    score_table.add_row("Max Drawdown", f"{metrics['max_drawdown']:.2%}", "—")
+    score_table.add_row("Win Rate", f"{metrics['win_rate']:.2%}", "—")
+    score_table.add_row("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}", "—")
+    score_table.add_row("Trades/Day", f"{metrics['trades_per_day']:.1f}", "—")
+    score_table.add_row("Data Quality", f"{quality_report.coverage_pct:.1f}%", "—")
+    score_table.add_row("[bold]TOTAL SCORE[/bold]", "", f"[bold]{scorecard.score:.1f}/100[/bold]")
+
+    console.print(score_table)
+
+    # Reasons
+    if scorecard.reasons:
+        console.print("\n[bold]Pass/Fail Reasons:[/bold]")
+        for reason in scorecard.reasons:
+            icon = "✓" if "pass" in reason.lower() or "ok" in reason.lower() else "✗"
+            color = "green" if icon == "✓" else "red"
+            console.print(f"  [{color}]{icon}[/{color}] {reason}")
+
+    if scorecard.warnings:
+        console.print("\n[yellow]Warnings:[/yellow]")
+        for warning in scorecard.warnings:
+            console.print(f"  ⚠ {warning}")
+
+    # Recommended limits
+    if scorecard.passed:
+        limits = scorecard.recommended_limits
+        limits_table = Table(title="Recommended Risk Limits")
+        limits_table.add_column("Limit", style="cyan")
+        limits_table.add_column("Value", justify="right")
+
+        limits_table.add_row("Max Notional/Market", f"${limits.max_notional_per_market:,.0f}")
+        limits_table.add_row("Max Total Notional", f"${limits.max_total_notional:,.0f}")
+        limits_table.add_row("Max Positions", str(limits.max_positions))
+        limits_table.add_row("Max Trades/Hour", str(limits.max_trades_per_hour))
+        limits_table.add_row("Stop Loss", f"{limits.stop_loss_pct:.1%}")
+
+        console.print(limits_table)
+
+        console.print(
+            f"\n[dim]To approve: pmq approve grant --run-id {run_id} "
+            f"--name {run['strategy']} --version v1[/dim]"
+        )
+    else:
+        console.print(
+            "\n[dim]Strategy did not pass evaluation. Improve backtest performance before approval.[/dim]"
+        )
+
+
+@approve_app.command("grant")
+def approve_grant(
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", "-r", help="Backtest run ID to approve"),
+    ],
+    name: Annotated[
+        str,
+        typer.Option("--name", "-n", help="Strategy name"),
+    ],
+    version: Annotated[
+        str,
+        typer.Option("--version", help="Strategy version"),
+    ],
+    approved_by: Annotated[
+        str,
+        typer.Option("--approved-by", help="Approver identifier"),
+    ] = "cli",
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Force approval even if scorecard fails"),
+    ] = False,
+) -> None:
+    """Grant approval for a strategy based on backtest results.
+
+    Creates an APPROVED record that enables paper/live execution.
+
+    Example:
+        pmq approve grant --run-id abc123 --name arb --version v1
+    """
+    from pmq.backtest import BacktestRunner
+    from pmq.governance import compute_scorecard, limits_to_dict
+
+    dao = DAO()
+    runner = BacktestRunner(dao=dao)
+
+    # Get backtest report
+    report = runner.get_run_report(run_id)
+    if not report:
+        console.print(f"[red]Backtest run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+
+    run = report["run"]
+    metrics = report.get("metrics")
+
+    if not metrics:
+        console.print(f"[red]No metrics found for run: {run_id}[/red]")
+        raise typer.Exit(1)
+
+    # Get data quality
+    from pmq.quality import QualityReporter
+
+    quality_reporter = QualityReporter()
+    quality_report = quality_reporter.generate_report(
+        start_time=run["start_date"],
+        end_time=run["end_date"],
+        save=False,
+    )
+
+    # Compute scorecard
+    scorecard = compute_scorecard(
+        total_pnl=metrics["total_pnl"],
+        max_drawdown=metrics["max_drawdown"],
+        win_rate=metrics["win_rate"],
+        sharpe_ratio=metrics["sharpe_ratio"],
+        total_trades=metrics["total_trades"],
+        trades_per_day=metrics["trades_per_day"],
+        capital_utilization=metrics.get("capital_utilization", 0.5),
+        initial_balance=run.get("initial_balance", 10000.0),
+        data_quality_pct=quality_report.coverage_pct,
+    )
+
+    if not scorecard.passed and not force:
+        console.print("[red]Scorecard failed. Use --force to approve anyway.[/red]")
+        console.print("\n[dim]Reasons:[/dim]")
+        for reason in scorecard.reasons:
+            console.print(f"  • {reason}")
+        raise typer.Exit(1)
+
+    # Get manifest for git SHA / config hash
+    manifest = dao.get_backtest_manifest(run_id)
+    git_sha = manifest.get("git_sha") if manifest else None
+    config_hash = manifest.get("config_hash") if manifest else None
+
+    # Save approval
+    status = "APPROVED" if scorecard.passed else "APPROVED_FORCED"
+    approval_id = dao.save_approval(
+        strategy_name=name,
+        strategy_version=version,
+        window_from=run["start_date"],
+        window_to=run["end_date"],
+        run_id=run_id,
+        git_sha=git_sha,
+        config_hash=config_hash,
+        score=scorecard.score,
+        status=status,
+        reasons=scorecard.reasons,
+        limits=limits_to_dict(scorecard.recommended_limits),
+        approved_by=approved_by,
+    )
+
+    # Log risk event
+    dao.save_risk_event(
+        severity="INFO",
+        event_type="APPROVAL_GRANTED",
+        strategy_name=name,
+        message=f"Strategy {name} v{version} approved with score {scorecard.score:.1f}",
+        details={
+            "approval_id": approval_id,
+            "run_id": run_id,
+            "score": scorecard.score,
+            "forced": not scorecard.passed,
+        },
+    )
+
+    console.print("\n[bold green]✓ Strategy APPROVED[/bold green]")
+    console.print(f"Approval ID: [cyan]{approval_id}[/cyan]")
+    console.print(f"Strategy: [cyan]{name} v{version}[/cyan]")
+    console.print(f"Score: [cyan]{scorecard.score:.1f}/100[/cyan]")
+
+    if not scorecard.passed:
+        console.print("[yellow]⚠ Approval was forced despite failing scorecard[/yellow]")
+
+    console.print(
+        f"\n[dim]This strategy is now eligible for: pmq paper run --strategy {name}[/dim]"
+    )
+
+
+@approve_app.command("list")
+def approve_list(
+    status: Annotated[
+        str | None,
+        typer.Option("--status", "-s", help="Filter by status: APPROVED, REVOKED, PENDING"),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum approvals to show"),
+    ] = 20,
+) -> None:
+    """List strategy approvals.
+
+    Example:
+        pmq approve list
+        pmq approve list --status APPROVED
+    """
+    dao = DAO()
+    approvals = dao.get_approvals(status=status, limit=limit)
+
+    if not approvals:
+        console.print("[dim]No approvals found[/dim]")
+        return
+
+    table = Table(title="Strategy Approvals")
+    table.add_column("ID", style="dim")
+    table.add_column("Strategy", style="cyan")
+    table.add_column("Version")
+    table.add_column("Score", justify="right")
+    table.add_column("Status")
+    table.add_column("Approved By")
+    table.add_column("Created")
+
+    for appr in approvals:
+        status_str = appr["status"]
+        status_color = {"APPROVED": "green", "REVOKED": "red", "PENDING": "yellow"}.get(
+            status_str, "dim"
+        )
+
+        table.add_row(
+            str(appr["id"]),
+            appr["strategy_name"],
+            appr["strategy_version"],
+            f"{appr['score']:.1f}",
+            f"[{status_color}]{status_str}[/{status_color}]",
+            appr.get("approved_by") or "—",
+            appr["created_at"][:19],
+        )
+
+    console.print(table)
+
+
+@approve_app.command("revoke")
+def approve_revoke(
+    approval_id: Annotated[
+        int,
+        typer.Option("--approval-id", "-a", help="Approval ID to revoke"),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", "-r", help="Reason for revocation"),
+    ],
+) -> None:
+    """Revoke a strategy approval.
+
+    Example:
+        pmq approve revoke --approval-id 1 --reason "Degraded performance"
+    """
+    dao = DAO()
+
+    # Check approval exists
+    approval = dao.get_approval(approval_id)
+    if not approval:
+        console.print(f"[red]Approval not found: {approval_id}[/red]")
+        raise typer.Exit(1)
+
+    if approval["status"] == "REVOKED":
+        console.print("[yellow]Approval already revoked[/yellow]")
+        return
+
+    # Revoke
+    dao.revoke_approval(approval_id, reason)
+
+    # Log risk event
+    dao.save_risk_event(
+        severity="WARN",
+        event_type="APPROVAL_REVOKED",
+        strategy_name=approval["strategy_name"],
+        message=f"Approval {approval_id} revoked: {reason}",
+        details={
+            "approval_id": approval_id,
+            "reason": reason,
+        },
+    )
+
+    console.print(f"[bold yellow]✓ Approval {approval_id} revoked[/bold yellow]")
+    console.print(
+        f"Strategy: [cyan]{approval['strategy_name']} v{approval['strategy_version']}[/cyan]"
+    )
+    console.print(f"Reason: {reason}")
+
+
+@approve_app.command("risk-events")
+def approve_risk_events(
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum events to show"),
+    ] = 50,
+    severity: Annotated[
+        str | None,
+        typer.Option("--severity", "-s", help="Filter by severity: INFO, WARN, CRITICAL"),
+    ] = None,
+) -> None:
+    """List risk events.
+
+    Example:
+        pmq approve risk-events
+        pmq approve risk-events --severity CRITICAL
+    """
+    dao = DAO()
+    events = dao.get_risk_events(severity=severity, limit=limit)
+
+    if not events:
+        console.print("[dim]No risk events found[/dim]")
+        return
+
+    table = Table(title="Risk Events")
+    table.add_column("Time", style="dim")
+    table.add_column("Severity")
+    table.add_column("Type", style="cyan")
+    table.add_column("Strategy")
+    table.add_column("Message", max_width=50)
+
+    for event in events:
+        sev = event["severity"]
+        sev_color = {"INFO": "blue", "WARN": "yellow", "CRITICAL": "red"}.get(sev, "dim")
+
+        table.add_row(
+            event["created_at"][:19],
+            f"[{sev_color}]{sev}[/{sev_color}]",
+            event["event_type"],
+            event.get("strategy_name") or "—",
+            event["message"][:50],
+        )
+
+    console.print(table)
 
 
 if __name__ == "__main__":

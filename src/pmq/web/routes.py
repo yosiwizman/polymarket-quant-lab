@@ -188,6 +188,85 @@ def get_latest_quality_report() -> dict[str, Any]:
 
 
 # =============================================================================
+# Governance Endpoints (Phase 3)
+# =============================================================================
+
+
+@router.get("/api/governance/approvals")
+def get_approvals(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    """Get strategy approvals.
+
+    Args:
+        status: Optional filter (APPROVED, REVOKED, PENDING)
+        limit: Maximum results
+
+    Returns:
+        List of approval records
+    """
+    dao = get_dao()
+    approvals = dao.get_approvals(status=status, limit=limit)
+    return {
+        "approvals": approvals,
+        "count": len(approvals),
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.get("/api/governance/risk-events")
+def get_risk_events(
+    severity: str | None = Query(default=None),
+    event_type: str | None = Query(default=None, alias="type"),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Get risk events.
+
+    Args:
+        severity: Optional filter (INFO, WARN, CRITICAL)
+        event_type: Optional filter by event type
+        limit: Maximum results
+
+    Returns:
+        List of risk events
+    """
+    dao = get_dao()
+    events = dao.get_risk_events(severity=severity, event_type=event_type, limit=limit)
+    return {
+        "events": events,
+        "count": len(events),
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.get("/api/governance/summary")
+def get_governance_summary() -> dict[str, Any]:
+    """Get governance summary.
+
+    Returns:
+        Summary with approval and risk event counts
+    """
+    dao = get_dao()
+    approvals = dao.get_approvals(status="APPROVED", limit=100)
+    recent_events = dao.get_risk_events(limit=50)
+
+    # Count by severity
+    severity_counts = {"INFO": 0, "WARN": 0, "CRITICAL": 0}
+    for event in recent_events:
+        sev = event.get("severity", "INFO")
+        if sev in severity_counts:
+            severity_counts[sev] += 1
+
+    return {
+        "approved_strategies": len(approvals),
+        "recent_risk_events": len(recent_events),
+        "severity_counts": severity_counts,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+# =============================================================================
 # Dashboard (HTML)
 # =============================================================================
 
@@ -229,6 +308,10 @@ def dashboard(request: Request) -> HTMLResponse:
     else:
         quality_status = "unknown"
 
+    # Governance data (Phase 3)
+    approvals = dao.get_approvals(status="APPROVED", limit=10)
+    risk_events = dao.get_risk_events(limit=10)
+
     templates = request.app.state.templates
     response: HTMLResponse = templates.TemplateResponse(
         request,
@@ -243,6 +326,8 @@ def dashboard(request: Request) -> HTMLResponse:
             "snapshot_summary": snapshot_summary,
             "quality_report": quality_report,
             "quality_status": quality_status,
+            "approvals": approvals,
+            "risk_events": risk_events,
             "now": datetime.now(UTC).isoformat(),
         },
     )

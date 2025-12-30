@@ -213,6 +213,58 @@
         {% endif %}
     </div>
 
+    <div class="grid" style="margin-top: 20px;">
+        <div class="card">
+            <h2>Approved Strategies ({{ approvals|length }})</h2>
+            {% if approvals %}
+            <table>
+                <tr>
+                    <th>Strategy</th>
+                    <th>Version</th>
+                    <th>Score</th>
+                    <th>Approved</th>
+                </tr>
+                {% for appr in approvals %}
+                <tr>
+                    <td>{{ appr.strategy_name }}</td>
+                    <td>{{ appr.strategy_version }}</td>
+                    <td>{{ "%.1f"|format(appr.score) }}</td>
+                    <td>{{ appr.created_at[:10] }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% else %}
+            <div class="empty">No approved strategies. Run `pmq approve grant` to approve.</div>
+            {% endif %}
+        </div>
+
+        <div class="card">
+            <h2>Risk Events ({{ risk_events|length }})</h2>
+            {% if risk_events %}
+            <table>
+                <tr>
+                    <th>Severity</th>
+                    <th>Type</th>
+                    <th>Message</th>
+                    <th>Time</th>
+                </tr>
+                {% for event in risk_events %}
+                <tr>
+                    <td style="color: {% if event.severity == 'CRITICAL' %}var(--red){% elif event.severity == 'WARN' %}var(--yellow){% else %}var(--blue){% endif %};">
+                        {{ event.severity }}
+                    </td>
+                    <td>{{ event.event_type }}</td>
+                    <td class="truncate">{{ event.message[:30] }}{% if event.message|length > 30 %}...{% endif %}</td>
+                    <td>{{ event.created_at[:16] }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% else %}
+            <div class="empty">No risk events recorded</div>
+            {% endif %}
+        </div>
+    </div>
+
     <footer>
         <span class="refresh">Auto-refreshes every 30 seconds</span> |
         <a href="/api/health" style="color: var(--blue);">/api/health</a> |

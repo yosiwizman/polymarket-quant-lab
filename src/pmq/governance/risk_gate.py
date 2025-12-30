@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from pmq.governance.scorecard import RiskLimits
+from pmq.governance.scorecard import RiskLimits as RiskLimits
 from pmq.logging import get_logger
 from pmq.storage.dao import DAO
 

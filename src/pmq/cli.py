@@ -1582,6 +1582,8 @@ def approve_evaluate(
         sharpe_ratio=metrics["sharpe_ratio"],
         total_trades=metrics["total_trades"],
         trades_per_day=metrics["trades_per_day"],
+        capital_utilization=metrics.get("capital_utilization", 0.5),
+        initial_balance=run.get("initial_balance", 10000.0),
         data_quality_pct=quality_report.coverage_pct,
     )
 
@@ -1712,6 +1714,8 @@ def approve_grant(
         sharpe_ratio=metrics["sharpe_ratio"],
         total_trades=metrics["total_trades"],
         trades_per_day=metrics["trades_per_day"],
+        capital_utilization=metrics.get("capital_utilization", 0.5),
+        initial_balance=run.get("initial_balance", 10000.0),
         data_quality_pct=quality_report.coverage_pct,
     )
 

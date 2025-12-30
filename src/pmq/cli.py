@@ -3112,5 +3112,328 @@ def statarb_validate(
     console.print("\n[green]✓ All pairs have sufficient overlap for the date range.[/green]")
 
 
+@statarb_app.command("tune")
+def statarb_tune(
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (ISO format or YYYY-MM-DD)"),
+    ],
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (ISO format or YYYY-MM-DD)"),
+    ],
+    pairs_config: Annotated[
+        Path,
+        typer.Option("--pairs", "-p", help="Path to pairs config file"),
+    ] = Path("config/pairs.yml"),
+    grid_config: Annotated[
+        Path | None,
+        typer.Option("--grid", "-g", help="Path to grid search config YAML"),
+    ] = None,
+    train_times: Annotated[
+        int,
+        typer.Option("--train-times", help="Number of snapshots for TRAIN"),
+    ] = 120,
+    test_times: Annotated[
+        int,
+        typer.Option("--test-times", help="Number of snapshots for TEST"),
+    ] = 60,
+    top_k: Annotated[
+        int,
+        typer.Option("--top-k", help="Number of top results to show/save"),
+    ] = 10,
+    output: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="Output CSV file for leaderboard"),
+    ] = None,
+    export_best: Annotated[
+        Path | None,
+        typer.Option("--export-best", help="Export best config to YAML file"),
+    ] = None,
+) -> None:
+    """Run grid search to find optimal statarb parameters.
+
+    Performs walk-forward evaluation for each parameter combination:
+    - Split data into TRAIN (fit params) and TEST (evaluate) segments
+    - Rank results by Sharpe ratio on TEST data
+    - Output leaderboard and optionally export best config
+
+    This command is deterministic and does NOT bypass governance gates.
+
+    Example:
+        pmq statarb tune --from 2024-12-01 --to 2024-12-30 --pairs config/pairs.yml
+        pmq statarb tune --from 2024-12-01 --to 2024-12-30 --grid config/statarb_grid.yml --out results/tuning.csv
+    """
+    from pmq.statarb import PairsConfigError, load_validated_pairs_config
+    from pmq.statarb.tuning import (
+        GridConfig,
+        export_best_config,
+        load_grid_config,
+        run_grid_search,
+        save_leaderboard_csv,
+    )
+
+    # Normalize dates
+    if len(from_date) == 10:
+        from_date = f"{from_date}T00:00:00"
+    if len(to_date) == 10:
+        to_date = f"{to_date}T23:59:59"
+
+    # Load pairs config
+    try:
+        pairs_result = load_validated_pairs_config(pairs_config)
+    except PairsConfigError as e:
+        console.print(f"[red]Failed to load pairs config: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    if not pairs_result.enabled_pairs:
+        console.print("[red]No enabled pairs in config[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Loaded {len(pairs_result.enabled_pairs)} pairs[/cyan]")
+
+    # Load grid config
+    if grid_config:
+        grid = load_grid_config(grid_config)
+        console.print(f"[cyan]Loaded grid config from {grid_config}[/cyan]")
+    else:
+        grid = GridConfig()
+        console.print("[cyan]Using default grid config[/cyan]")
+
+    console.print(f"[cyan]Grid has {grid.total_combinations} parameter combinations[/cyan]")
+
+    # Get market IDs from pairs
+    pair_market_ids = set()
+    for pair in pairs_result.enabled_pairs:
+        pair_market_ids.add(pair.market_a_id)
+        pair_market_ids.add(pair.market_b_id)
+
+    # Load snapshots
+    dao = DAO()
+    snapshots = dao.get_snapshots(from_date, to_date, list(pair_market_ids))
+
+    if not snapshots:
+        console.print(f"[red]No snapshots found for {from_date[:10]} to {to_date[:10]}[/red]")
+        console.print("[dim]Run 'pmq sync --snapshot' to collect data first.[/dim]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Loaded {len(snapshots)} snapshots[/cyan]")
+
+    # Run grid search
+    console.print("\n[bold]Starting grid search...[/bold]")
+    with console.status("[bold green]Running parameter combinations..."):
+        leaderboard = run_grid_search(
+            snapshots=snapshots,
+            pairs=pairs_result.enabled_pairs,
+            train_count=train_times,
+            test_count=test_times,
+            grid=grid,
+            top_k=top_k,
+        )
+
+    # Display results
+    console.print("\n[bold]Tuning Results[/bold]")
+    console.print(f"  Combinations tested: {leaderboard.total_combinations}")
+    console.print(f"  TRAIN snapshots: {train_times}")
+    console.print(f"  TEST snapshots: {test_times}")
+
+    if not leaderboard.results:
+        console.print("[red]No valid results from grid search[/red]")
+        raise typer.Exit(1)
+
+    # Show leaderboard table
+    table = Table(title="Top Parameter Combinations (ranked by Sharpe on TEST)")
+    table.add_column("Rank", style="dim")
+    table.add_column("Sharpe", justify="right")
+    table.add_column("PnL", justify="right")
+    table.add_column("WR", justify="right")
+    table.add_column("DD", justify="right")
+    table.add_column("Trades", justify="right")
+    table.add_column("lookback", justify="right")
+    table.add_column("entry_z", justify="right")
+    table.add_column("exit_z", justify="right")
+    table.add_column("max_hold", justify="right")
+
+    for r in leaderboard.results:
+        sharpe_color = "green" if r.sharpe > 0 else "red"
+        pnl_color = "green" if r.pnl > 0 else "red"
+        table.add_row(
+            str(r.rank),
+            f"[{sharpe_color}]{r.sharpe:.3f}[/{sharpe_color}]",
+            f"[{pnl_color}]${r.pnl:.2f}[/{pnl_color}]",
+            f"{r.win_rate:.1%}",
+            f"{r.max_drawdown:.1%}",
+            str(r.total_trades),
+            str(r.params["lookback"]),
+            str(r.params["entry_z"]),
+            str(r.params["exit_z"]),
+            str(r.params["max_hold_bars"]),
+        )
+
+    console.print(table)
+
+    # Best result summary
+    best = leaderboard.results[0]
+    console.print("\n[bold]Best Configuration[/bold]")
+    console.print(f"  lookback: {best.params['lookback']}")
+    console.print(f"  entry_z: {best.params['entry_z']}")
+    console.print(f"  exit_z: {best.params['exit_z']}")
+    console.print(f"  max_hold_bars: {best.params['max_hold_bars']}")
+    console.print(f"  cooldown_bars: {best.params['cooldown_bars']}")
+    console.print(f"  TEST Sharpe: {best.sharpe:.3f}")
+    console.print(f"  TEST PnL: ${best.pnl:.2f}")
+
+    # Save outputs
+    if output:
+        save_leaderboard_csv(leaderboard, output)
+        console.print(f"\n[green]✓ Saved leaderboard to {output}[/green]")
+
+    if export_best:
+        export_best_config(leaderboard, export_best)
+        console.print(f"[green]✓ Exported best config to {export_best}[/green]")
+
+    # Guidance
+    console.print("\n[dim]To use best config, set environment variables or update config file:[/dim]")
+    console.print(f"[dim]  PMQ_STATARB_LOOKBACK={best.params['lookback']}[/dim]")
+    console.print(f"[dim]  PMQ_STATARB_ENTRY_Z={best.params['entry_z']}[/dim]")
+    console.print(f"[dim]  PMQ_STATARB_EXIT_Z={best.params['exit_z']}[/dim]")
+    console.print(f"[dim]  PMQ_STATARB_MAX_HOLD_BARS={best.params['max_hold_bars']}[/dim]")
+
+
+@statarb_app.command("walkforward")
+def statarb_walkforward(
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (ISO format or YYYY-MM-DD)"),
+    ],
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (ISO format or YYYY-MM-DD)"),
+    ],
+    pairs_config: Annotated[
+        Path,
+        typer.Option("--pairs", "-p", help="Path to pairs config file"),
+    ] = Path("config/pairs.yml"),
+    train_times: Annotated[
+        int,
+        typer.Option("--train-times", help="Number of snapshots for TRAIN"),
+    ] = 120,
+    test_times: Annotated[
+        int,
+        typer.Option("--test-times", help="Number of snapshots for TEST"),
+    ] = 60,
+    lookback: Annotated[
+        int,
+        typer.Option("--lookback", help="Z-score lookback window"),
+    ] = 30,
+    entry_z: Annotated[
+        float,
+        typer.Option("--entry-z", help="Entry z-score threshold"),
+    ] = 2.0,
+    exit_z: Annotated[
+        float,
+        typer.Option("--exit-z", help="Exit z-score threshold"),
+    ] = 0.5,
+    max_hold_bars: Annotated[
+        int,
+        typer.Option("--max-hold", help="Max bars before forced exit"),
+    ] = 60,
+) -> None:
+    """Run single walk-forward evaluation with z-score signals.
+
+    Splits data into TRAIN and TEST segments:
+    - Fit OLS beta and spread params on TRAIN
+    - Generate signals and compute metrics on TEST
+    - Display TRAIN summary and TEST scorecard metrics
+
+    Example:
+        pmq statarb walkforward --from 2024-12-01 --to 2024-12-30
+        pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 --entry-z 1.5 --exit-z 0.3
+    """
+    from pmq.backtest.runner import BacktestRunner
+
+    # Run walk-forward backtest
+    runner = BacktestRunner()
+    run_id, metrics, wf_data = runner.run_walkforward_statarb(
+        start_date=from_date,
+        end_date=to_date,
+        pairs_config=str(pairs_config),
+        train_count=train_times,
+        test_count=test_times,
+        lookback=lookback,
+        entry_z=entry_z,
+        exit_z=exit_z,
+        max_hold_bars=max_hold_bars,
+    )
+
+    # Display results
+    console.print("\n[bold]Walk-Forward Evaluation Results[/bold]")
+    console.print(f"  Run ID: {run_id}")
+
+    if "error" in wf_data:
+        console.print(f"[red]Error: {wf_data['error']}[/red]")
+        raise typer.Exit(1)
+
+    # TRAIN summary
+    split = wf_data.get("split", {})
+    console.print("\n[bold]TRAIN Summary[/bold]")
+    console.print(f"  Snapshots: {split.get('train_count', 0)}")
+    console.print(f"  Period: {split.get('first_train', '?')[:10]} to {split.get('last_train', '?')[:10]}")
+
+    fitted = wf_data.get("fitted_params", {})
+    valid_pairs = sum(1 for p in fitted.values() if p.get("is_valid", False))
+    console.print(f"  Pairs fitted: {valid_pairs}/{len(fitted)}")
+
+    # TEST summary
+    test_m = wf_data.get("test_metrics", {})
+    console.print("\n[bold]TEST Summary (Scorecard Metrics)[/bold]")
+    console.print(f"  Snapshots: {split.get('test_count', 0)}")
+    console.print(f"  Period: {split.get('first_test', '?')[:10]} to {split.get('last_test', '?')[:10]}")
+
+    pnl_color = "green" if metrics.total_pnl > 0 else "red"
+    sharpe_color = "green" if metrics.sharpe_ratio > 1.0 else "yellow" if metrics.sharpe_ratio > 0 else "red"
+    wr_color = "green" if metrics.win_rate > 0.5 else "yellow" if metrics.win_rate > 0.4 else "red"
+
+    console.print(f"  Total PnL: [{pnl_color}]${metrics.total_pnl:.2f}[/{pnl_color}]")
+    console.print(f"  Sharpe Ratio: [{sharpe_color}]{metrics.sharpe_ratio:.3f}[/{sharpe_color}]")
+    console.print(f"  Win Rate: [{wr_color}]{metrics.win_rate:.1%}[/{wr_color}]")
+    console.print(f"  Max Drawdown: {metrics.max_drawdown:.1%}")
+    console.print(f"  Total Trades: {metrics.total_trades}")
+    console.print(f"  Net PnL: ${test_m.get('net_pnl', 0):.2f}")
+    console.print(f"  Total Fees: ${test_m.get('total_fees', 0):.2f}")
+
+    # Pair summaries
+    pair_summaries = wf_data.get("pair_summaries", [])
+    if pair_summaries:
+        console.print("\n[bold]Per-Pair Results[/bold]")
+        table = Table()
+        table.add_column("Pair", style="cyan", max_width=30)
+        table.add_column("Status")
+        table.add_column("Beta", justify="right")
+        table.add_column("TEST Points", justify="right")
+        table.add_column("Signals", justify="right")
+
+        for ps in pair_summaries:
+            status_color = "green" if ps.get("status") == "evaluated" else "red"
+            beta = ps.get("beta", 0)
+            table.add_row(
+                ps.get("pair_name", "?")[:30],
+                f"[{status_color}]{ps.get('status', '?')}[/{status_color}]",
+                f"{beta:.3f}" if beta else "—",
+                str(ps.get("test_points", 0)),
+                str(ps.get("signals", 0)),
+            )
+
+        console.print(table)
+
+    # Config used
+    config = wf_data.get("config_used", {})
+    console.print("\n[bold]Config Used[/bold]")
+    console.print(f"  lookback: {config.get('lookback', '?')}")
+    console.print(f"  entry_z: {config.get('entry_z', '?')}")
+    console.print(f"  exit_z: {config.get('exit_z', '?')}")
+    console.print(f"  max_hold_bars: {config.get('max_hold_bars', '?')}")
+
+
 if __name__ == "__main__":
     app()

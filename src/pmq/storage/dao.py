@@ -682,3 +682,389 @@ class DAO:
             """
         )
         return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Market Snapshots (Backtest)
+    # =========================================================================
+
+    def save_snapshot(
+        self,
+        market_id: str,
+        yes_price: float,
+        no_price: float,
+        liquidity: float,
+        volume: float,
+        snapshot_time: str,
+    ) -> int:
+        """Save a market snapshot for backtesting.
+
+        Args:
+            market_id: Market identifier
+            yes_price: YES token price at snapshot time
+            no_price: NO token price at snapshot time
+            liquidity: Liquidity at snapshot time
+            volume: Volume at snapshot time
+            snapshot_time: UTC timestamp of snapshot
+
+        Returns:
+            Snapshot ID
+        """
+        cursor = self._db.execute(
+            """
+            INSERT INTO market_snapshots
+            (market_id, yes_price, no_price, liquidity, volume, snapshot_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (market_id, yes_price, no_price, liquidity, volume, snapshot_time),
+        )
+        return cursor.lastrowid or 0
+
+    def save_snapshots_bulk(self, markets: list[GammaMarket], snapshot_time: str) -> int:
+        """Save snapshots for multiple markets.
+
+        Args:
+            markets: List of markets to snapshot
+            snapshot_time: UTC timestamp for all snapshots
+
+        Returns:
+            Number of snapshots saved
+        """
+        count = 0
+        for market in markets:
+            if market.yes_price > 0 and market.no_price > 0:
+                self.save_snapshot(
+                    market_id=market.id,
+                    yes_price=market.yes_price,
+                    no_price=market.no_price,
+                    liquidity=market.liquidity,
+                    volume=market.volume,
+                    snapshot_time=snapshot_time,
+                )
+                count += 1
+        logger.info(f"Saved {count} snapshots at {snapshot_time}")
+        return count
+
+    def get_snapshots(
+        self,
+        start_time: str,
+        end_time: str,
+        market_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get snapshots within a time range.
+
+        Args:
+            start_time: Start of time range (ISO format)
+            end_time: End of time range (ISO format)
+            market_ids: Optional list of market IDs to filter
+
+        Returns:
+            List of snapshot dicts ordered by time
+        """
+        if market_ids:
+            placeholders = ",".join("?" * len(market_ids))
+            rows = self._db.fetch_all(
+                f"""
+                SELECT * FROM market_snapshots
+                WHERE snapshot_time >= ? AND snapshot_time <= ?
+                  AND market_id IN ({placeholders})
+                ORDER BY snapshot_time ASC, market_id ASC
+                """,
+                (start_time, end_time, *market_ids),
+            )
+        else:
+            rows = self._db.fetch_all(
+                """
+                SELECT * FROM market_snapshots
+                WHERE snapshot_time >= ? AND snapshot_time <= ?
+                ORDER BY snapshot_time ASC, market_id ASC
+                """,
+                (start_time, end_time),
+            )
+        return [dict(row) for row in rows]
+
+    def get_snapshot_times(self, start_time: str, end_time: str) -> list[str]:
+        """Get distinct snapshot times in a range.
+
+        Args:
+            start_time: Start of time range
+            end_time: End of time range
+
+        Returns:
+            List of distinct snapshot times (sorted)
+        """
+        rows = self._db.fetch_all(
+            """
+            SELECT DISTINCT snapshot_time FROM market_snapshots
+            WHERE snapshot_time >= ? AND snapshot_time <= ?
+            ORDER BY snapshot_time ASC
+            """,
+            (start_time, end_time),
+        )
+        return [row["snapshot_time"] for row in rows]
+
+    def count_snapshots(self, start_time: str | None = None, end_time: str | None = None) -> int:
+        """Count snapshots, optionally within a time range.
+
+        Args:
+            start_time: Optional start of time range
+            end_time: Optional end of time range
+
+        Returns:
+            Number of snapshots
+        """
+        if start_time and end_time:
+            row = self._db.fetch_one(
+                "SELECT COUNT(*) as count FROM market_snapshots WHERE snapshot_time >= ? AND snapshot_time <= ?",
+                (start_time, end_time),
+            )
+        else:
+            row = self._db.fetch_one("SELECT COUNT(*) as count FROM market_snapshots")
+        return row["count"] if row else 0
+
+    # =========================================================================
+    # Backtest Runs
+    # =========================================================================
+
+    def create_backtest_run(
+        self,
+        run_id: str,
+        strategy: str,
+        start_date: str,
+        end_date: str,
+        initial_balance: float,
+        config_json: str | None = None,
+    ) -> str:
+        """Create a new backtest run.
+
+        Args:
+            run_id: Unique run identifier
+            strategy: Strategy name
+            start_date: Backtest start date
+            end_date: Backtest end date
+            initial_balance: Starting balance
+            config_json: Optional strategy config JSON
+
+        Returns:
+            Run ID
+        """
+        self._db.execute(
+            """
+            INSERT INTO backtest_runs
+            (id, strategy, start_date, end_date, initial_balance, config_json, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'running')
+            """,
+            (run_id, strategy, start_date, end_date, initial_balance, config_json),
+        )
+        logger.info(f"Created backtest run {run_id}: {strategy} ({start_date} to {end_date})")
+        return run_id
+
+    def complete_backtest_run(
+        self,
+        run_id: str,
+        final_balance: float,
+        status: str = "completed",
+    ) -> None:
+        """Mark a backtest run as completed.
+
+        Args:
+            run_id: Run identifier
+            final_balance: Final balance after backtest
+            status: Final status (completed/failed)
+        """
+        now = datetime.now(UTC).isoformat()
+        self._db.execute(
+            """
+            UPDATE backtest_runs
+            SET final_balance = ?, status = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (final_balance, status, now, run_id),
+        )
+
+    def get_backtest_run(self, run_id: str) -> dict[str, Any] | None:
+        """Get a backtest run by ID.
+
+        Args:
+            run_id: Run identifier
+
+        Returns:
+            Run data or None
+        """
+        row = self._db.fetch_one(
+            "SELECT * FROM backtest_runs WHERE id = ?",
+            (run_id,),
+        )
+        if row:
+            data = dict(row)
+            if data.get("config_json"):
+                data["config"] = json.loads(data["config_json"])
+            return data
+        return None
+
+    def get_backtest_runs(
+        self,
+        strategy: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Get backtest runs.
+
+        Args:
+            strategy: Optional strategy filter
+            limit: Maximum results
+
+        Returns:
+            List of run dicts
+        """
+        if strategy:
+            rows = self._db.fetch_all(
+                """
+                SELECT * FROM backtest_runs
+                WHERE strategy = ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (strategy, limit),
+            )
+        else:
+            rows = self._db.fetch_all(
+                "SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Backtest Trades
+    # =========================================================================
+
+    def save_backtest_trade(
+        self,
+        run_id: str,
+        market_id: str,
+        side: str,
+        outcome: str,
+        price: float,
+        quantity: float,
+        trade_time: str,
+    ) -> int:
+        """Save a backtest trade.
+
+        Args:
+            run_id: Backtest run ID
+            market_id: Market identifier
+            side: BUY or SELL
+            outcome: YES or NO
+            price: Trade price
+            quantity: Trade quantity
+            trade_time: Simulated trade time
+
+        Returns:
+            Trade ID
+        """
+        notional = price * quantity
+        cursor = self._db.execute(
+            """
+            INSERT INTO backtest_trades
+            (run_id, market_id, side, outcome, price, quantity, notional, trade_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, market_id, side, outcome, price, quantity, notional, trade_time),
+        )
+        return cursor.lastrowid or 0
+
+    def get_backtest_trades(
+        self,
+        run_id: str,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Get trades for a backtest run.
+
+        Args:
+            run_id: Backtest run ID
+            limit: Maximum results
+
+        Returns:
+            List of trade dicts
+        """
+        rows = self._db.fetch_all(
+            """
+            SELECT * FROM backtest_trades
+            WHERE run_id = ?
+            ORDER BY trade_time ASC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        )
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Backtest Metrics
+    # =========================================================================
+
+    def save_backtest_metrics(
+        self,
+        run_id: str,
+        total_pnl: float,
+        max_drawdown: float,
+        win_rate: float,
+        sharpe_ratio: float,
+        total_trades: int,
+        trades_per_day: float,
+        capital_utilization: float,
+        extra_metrics: dict[str, Any] | None = None,
+    ) -> int:
+        """Save metrics for a backtest run.
+
+        Args:
+            run_id: Backtest run ID
+            total_pnl: Total profit/loss
+            max_drawdown: Maximum drawdown percentage
+            win_rate: Win rate (0-1)
+            sharpe_ratio: Sharpe-like ratio
+            total_trades: Number of trades
+            trades_per_day: Average trades per day
+            capital_utilization: Average capital utilization
+            extra_metrics: Additional metrics as dict
+
+        Returns:
+            Metrics record ID
+        """
+        metrics_json = json.dumps(extra_metrics) if extra_metrics else None
+        cursor = self._db.execute(
+            """
+            INSERT INTO backtest_metrics
+            (run_id, total_pnl, max_drawdown, win_rate, sharpe_ratio,
+             total_trades, trades_per_day, capital_utilization, metrics_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                total_pnl,
+                max_drawdown,
+                win_rate,
+                sharpe_ratio,
+                total_trades,
+                trades_per_day,
+                capital_utilization,
+                metrics_json,
+            ),
+        )
+        return cursor.lastrowid or 0
+
+    def get_backtest_metrics(self, run_id: str) -> dict[str, Any] | None:
+        """Get metrics for a backtest run.
+
+        Args:
+            run_id: Backtest run ID
+
+        Returns:
+            Metrics dict or None
+        """
+        row = self._db.fetch_one(
+            "SELECT * FROM backtest_metrics WHERE run_id = ?",
+            (run_id,),
+        )
+        if row:
+            data = dict(row)
+            if data.get("metrics_json"):
+                data["extra_metrics"] = json.loads(data["metrics_json"])
+            return data
+        return None

@@ -1714,3 +1714,319 @@ class DAO:
                 data["details"] = json.loads(data["details_json"])
             results.append(data)
         return results
+
+    # =========================================================================
+    # Evaluation Runs (Phase 4)
+    # =========================================================================
+
+    def create_evaluation_run(
+        self,
+        eval_id: str,
+        strategy_name: str,
+        strategy_version: str,
+        window_mode: str,
+        interval_seconds: int,
+        window_value: int | None = None,
+        window_from: str | None = None,
+        window_to: str | None = None,
+        git_sha: str | None = None,
+        config_hash: str | None = None,
+    ) -> str:
+        """Create a new evaluation run.
+
+        Args:
+            eval_id: Unique evaluation ID (UUID)
+            strategy_name: Strategy being evaluated
+            strategy_version: Strategy version
+            window_mode: Quality window mode (last_times, last_minutes, explicit)
+            interval_seconds: Expected snapshot interval
+            window_value: N for last_times/last_minutes modes
+            window_from: Explicit window start
+            window_to: Explicit window end
+            git_sha: Git commit SHA
+            config_hash: Config hash
+
+        Returns:
+            Evaluation ID
+        """
+        self._db.execute(
+            """
+            INSERT INTO evaluation_runs
+            (id, strategy_name, strategy_version, window_mode, window_value,
+             window_from, window_to, interval_seconds, git_sha, config_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                eval_id,
+                strategy_name,
+                strategy_version,
+                window_mode,
+                window_value,
+                window_from,
+                window_to,
+                interval_seconds,
+                git_sha,
+                config_hash,
+            ),
+        )
+        logger.info(f"Created evaluation run {eval_id}: {strategy_name} v{strategy_version}")
+        return eval_id
+
+    def update_evaluation_quality(
+        self,
+        eval_id: str,
+        quality_status: str,
+        maturity_score: int,
+        ready_for_scorecard: bool,
+        window_from: str | None = None,
+        window_to: str | None = None,
+    ) -> None:
+        """Update evaluation with quality results.
+
+        Args:
+            eval_id: Evaluation ID
+            quality_status: Quality status (SUFFICIENT, INSUFFICIENT_DATA, etc.)
+            maturity_score: Maturity score 0-100
+            ready_for_scorecard: Whether ready for scorecard
+            window_from: Actual window start (computed)
+            window_to: Actual window end (computed)
+        """
+        self._db.execute(
+            """
+            UPDATE evaluation_runs
+            SET quality_status = ?, maturity_score = ?, ready_for_scorecard = ?,
+                window_from = COALESCE(?, window_from),
+                window_to = COALESCE(?, window_to)
+            WHERE id = ?
+            """,
+            (
+                quality_status,
+                maturity_score,
+                1 if ready_for_scorecard else 0,
+                window_from,
+                window_to,
+                eval_id,
+            ),
+        )
+
+    def update_evaluation_backtest(
+        self,
+        eval_id: str,
+        backtest_run_id: str,
+        backtest_pnl: float,
+        backtest_score: float,
+    ) -> None:
+        """Update evaluation with backtest results.
+
+        Args:
+            eval_id: Evaluation ID
+            backtest_run_id: Backtest run ID
+            backtest_pnl: Backtest PnL
+            backtest_score: Backtest scorecard score
+        """
+        self._db.execute(
+            """
+            UPDATE evaluation_runs
+            SET backtest_run_id = ?, backtest_pnl = ?, backtest_score = ?
+            WHERE id = ?
+            """,
+            (backtest_run_id, backtest_pnl, backtest_score, eval_id),
+        )
+
+    def update_evaluation_approval(
+        self,
+        eval_id: str,
+        approval_status: str,
+        approval_reasons: list[str] | None = None,
+    ) -> None:
+        """Update evaluation with approval results.
+
+        Args:
+            eval_id: Evaluation ID
+            approval_status: PASSED or FAILED
+            approval_reasons: List of reasons
+        """
+        reasons_json = json.dumps(approval_reasons) if approval_reasons else None
+        self._db.execute(
+            """
+            UPDATE evaluation_runs
+            SET approval_status = ?, approval_reasons_json = ?
+            WHERE id = ?
+            """,
+            (approval_status, reasons_json, eval_id),
+        )
+
+    def update_evaluation_paper(
+        self,
+        eval_id: str,
+        paper_run_id: str | None,
+        paper_trades_count: int,
+        paper_errors_count: int,
+    ) -> None:
+        """Update evaluation with paper run results.
+
+        Args:
+            eval_id: Evaluation ID
+            paper_run_id: Paper run ID (for tracking)
+            paper_trades_count: Number of trades executed
+            paper_errors_count: Number of errors
+        """
+        self._db.execute(
+            """
+            UPDATE evaluation_runs
+            SET paper_run_id = ?, paper_trades_count = ?, paper_errors_count = ?
+            WHERE id = ?
+            """,
+            (paper_run_id, paper_trades_count, paper_errors_count, eval_id),
+        )
+
+    def complete_evaluation(
+        self,
+        eval_id: str,
+        final_status: str,
+        summary: str,
+        commands: list[str] | None = None,
+    ) -> None:
+        """Mark evaluation as complete.
+
+        Args:
+            eval_id: Evaluation ID
+            final_status: PASSED or FAILED
+            summary: Human-readable summary
+            commands: List of commands executed
+        """
+        commands_json = json.dumps(commands) if commands else None
+        self._db.execute(
+            """
+            UPDATE evaluation_runs
+            SET final_status = ?, summary = ?, commands_json = ?
+            WHERE id = ?
+            """,
+            (final_status, summary, commands_json, eval_id),
+        )
+        logger.info(f"Completed evaluation {eval_id}: {final_status}")
+
+    def get_evaluation_run(self, eval_id: str) -> dict[str, Any] | None:
+        """Get an evaluation run by ID.
+
+        Args:
+            eval_id: Evaluation ID
+
+        Returns:
+            Evaluation dict or None
+        """
+        row = self._db.fetch_one(
+            "SELECT * FROM evaluation_runs WHERE id = ?",
+            (eval_id,),
+        )
+        if row:
+            return self._parse_evaluation_row(row)
+        return None
+
+    def get_evaluation_runs(
+        self,
+        strategy_name: str | None = None,
+        final_status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Get evaluation runs.
+
+        Args:
+            strategy_name: Optional strategy filter
+            final_status: Optional status filter
+            limit: Maximum results
+
+        Returns:
+            List of evaluation dicts
+        """
+        conditions = []
+        params: list[Any] = []
+
+        if strategy_name:
+            conditions.append("strategy_name = ?")
+            params.append(strategy_name)
+        if final_status:
+            conditions.append("final_status = ?")
+            params.append(final_status)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+
+        rows = self._db.fetch_all(
+            f"SELECT * FROM evaluation_runs {where} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [self._parse_evaluation_row(row) for row in rows]
+
+    def _parse_evaluation_row(self, row: Any) -> dict[str, Any]:
+        """Parse an evaluation row from database."""
+        data = dict(row)
+        if data.get("approval_reasons_json"):
+            data["approval_reasons"] = json.loads(data["approval_reasons_json"])
+        if data.get("commands_json"):
+            data["commands"] = json.loads(data["commands_json"])
+        data["ready_for_scorecard"] = bool(data.get("ready_for_scorecard", 0))
+        return data
+
+    # =========================================================================
+    # Evaluation Artifacts (Phase 4)
+    # =========================================================================
+
+    def save_evaluation_artifact(
+        self,
+        evaluation_id: str,
+        kind: str,
+        content: str,
+    ) -> int:
+        """Save an evaluation artifact.
+
+        Args:
+            evaluation_id: Parent evaluation ID
+            kind: Artifact type (QUALITY_JSON, BACKTEST_JSON, etc.)
+            content: Artifact content
+
+        Returns:
+            Artifact ID
+        """
+        cursor = self._db.execute(
+            """
+            INSERT INTO evaluation_artifacts (evaluation_id, kind, content)
+            VALUES (?, ?, ?)
+            """,
+            (evaluation_id, kind, content),
+        )
+        return cursor.lastrowid or 0
+
+    def get_evaluation_artifacts(
+        self,
+        evaluation_id: str,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get artifacts for an evaluation.
+
+        Args:
+            evaluation_id: Evaluation ID
+            kind: Optional artifact type filter
+
+        Returns:
+            List of artifact dicts
+        """
+        if kind:
+            rows = self._db.fetch_all(
+                """
+                SELECT * FROM evaluation_artifacts
+                WHERE evaluation_id = ? AND kind = ?
+                ORDER BY created_at ASC
+                """,
+                (evaluation_id, kind),
+            )
+        else:
+            rows = self._db.fetch_all(
+                """
+                SELECT * FROM evaluation_artifacts
+                WHERE evaluation_id = ?
+                ORDER BY created_at ASC
+                """,
+                (evaluation_id,),
+            )
+        return [dict(row) for row in rows]

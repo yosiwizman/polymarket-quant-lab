@@ -258,3 +258,60 @@ CREATE TABLE IF NOT EXISTS risk_events (
 CREATE INDEX IF NOT EXISTS idx_risk_events_severity ON risk_events(severity);
 CREATE INDEX IF NOT EXISTS idx_risk_events_type ON risk_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_risk_events_created ON risk_events(created_at DESC);
+
+-- =============================================================================
+-- Phase 4: Evaluation Pipeline
+-- =============================================================================
+
+-- Evaluation runs: end-to-end strategy evaluation records
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id TEXT PRIMARY KEY,  -- UUID
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    strategy_name TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    git_sha TEXT,
+    config_hash TEXT,
+    -- Quality window configuration
+    window_mode TEXT NOT NULL,  -- last_times, last_minutes, explicit
+    window_value INTEGER,  -- N for last_times/last_minutes, null for explicit
+    window_from TEXT,  -- Actual window start (computed or explicit)
+    window_to TEXT,  -- Actual window end
+    interval_seconds INTEGER NOT NULL DEFAULT 60,
+    -- Quality results
+    quality_status TEXT,  -- SUFFICIENT, INSUFFICIENT_DATA, etc.
+    maturity_score INTEGER DEFAULT 0,
+    ready_for_scorecard INTEGER DEFAULT 0,  -- boolean
+    -- Backtest results
+    backtest_run_id TEXT,  -- Reference to backtest_runs.id
+    backtest_pnl REAL,
+    backtest_score REAL,
+    -- Approval results
+    approval_status TEXT DEFAULT 'PENDING',  -- PENDING, PASSED, FAILED
+    approval_reasons_json TEXT,
+    -- Paper run results (optional)
+    paper_run_id TEXT,
+    paper_trades_count INTEGER DEFAULT 0,
+    paper_errors_count INTEGER DEFAULT 0,
+    -- Final evaluation
+    final_status TEXT DEFAULT 'PENDING',  -- PENDING, PASSED, FAILED
+    summary TEXT,
+    commands_json TEXT,  -- JSON array of commands executed
+    FOREIGN KEY (backtest_run_id) REFERENCES backtest_runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_strategy ON evaluation_runs(strategy_name, strategy_version);
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_status ON evaluation_runs(final_status);
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_created ON evaluation_runs(created_at DESC);
+
+-- Evaluation artifacts: reports and logs from evaluation runs
+CREATE TABLE IF NOT EXISTS evaluation_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_id TEXT NOT NULL,
+    kind TEXT NOT NULL,  -- QUALITY_JSON, BACKTEST_JSON, SCORECARD_TXT, PAPER_LOG, REPORT_MD, REPORT_JSON
+    content TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (evaluation_id) REFERENCES evaluation_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_artifacts_eval ON evaluation_artifacts(evaluation_id);
+CREATE INDEX IF NOT EXISTS idx_evaluation_artifacts_kind ON evaluation_artifacts(kind);

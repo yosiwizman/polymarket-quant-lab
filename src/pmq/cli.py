@@ -1664,6 +1664,8 @@ def approve_evaluate(
         data_quality_pct=quality_report.coverage_pct,
         validation_mode=validation_mode,
         data_quality_status=quality_report.status,
+        maturity_score=quality_report.maturity_score,
+        ready_for_scorecard=quality_report.ready_for_scorecard,
     )
 
     # Display results
@@ -1673,6 +1675,7 @@ def approve_evaluate(
     console.print(f"Run ID: [cyan]{run_id}[/cyan]")
     console.print(f"Strategy: [cyan]{run['strategy']}[/cyan]")
     console.print(f"Data Quality Status: [cyan]{quality_report.status}[/cyan]")
+    console.print(f"Maturity: [cyan]{quality_report.maturity_score}/100[/cyan] {'✓ Ready' if quality_report.ready_for_scorecard else '⚠ Not Ready'}")
 
     # Score breakdown
     score_table = Table(title="Scorecard")
@@ -1818,6 +1821,8 @@ def approve_grant(
         data_quality_pct=quality_report.coverage_pct,
         validation_mode=validation_mode,
         data_quality_status=quality_report.status,
+        maturity_score=quality_report.maturity_score,
+        ready_for_scorecard=quality_report.ready_for_scorecard,
     )
 
     if not scorecard.passed and not force:

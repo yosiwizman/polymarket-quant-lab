@@ -790,7 +790,7 @@ class DAO:
             end_time: End of time range
 
         Returns:
-            List of distinct snapshot times (sorted)
+            List of distinct snapshot times (sorted ascending)
         """
         rows = self._db.fetch_all(
             """
@@ -801,6 +801,26 @@ class DAO:
             (start_time, end_time),
         )
         return [row["snapshot_time"] for row in rows]
+
+    def get_recent_snapshot_times(self, limit: int = 30) -> list[str]:
+        """Get the N most recent distinct snapshot times.
+
+        Args:
+            limit: Maximum number of distinct times to return
+
+        Returns:
+            List of distinct snapshot times (sorted ascending by time)
+        """
+        rows = self._db.fetch_all(
+            """
+            SELECT DISTINCT snapshot_time FROM market_snapshots
+            ORDER BY snapshot_time DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        # Reverse to get ascending order
+        return [row["snapshot_time"] for row in reversed(rows)]
 
     def count_snapshots(self, start_time: str | None = None, end_time: str | None = None) -> int:
         """Count snapshots, optionally within a time range.

@@ -1356,55 +1356,104 @@ def snapshots_run(
 @snapshots_app.command("quality")
 def snapshots_quality(
     from_date: Annotated[
-        str,
+        str | None,
         typer.Option("--from", help="Start date (YYYY-MM-DD or ISO)"),
-    ],
+    ] = None,
     to_date: Annotated[
-        str,
+        str | None,
         typer.Option("--to", help="End date (YYYY-MM-DD or ISO)"),
-    ],
+    ] = None,
+    last_minutes: Annotated[
+        int | None,
+        typer.Option("--last-minutes", help="Rolling window: last N minutes"),
+    ] = None,
+    last_times: Annotated[
+        int | None,
+        typer.Option("--last-times", help="Last K distinct snapshot times"),
+    ] = None,
     interval: Annotated[
         int,
         typer.Option("--interval", "-i", help="Expected interval in seconds"),
     ] = 60,
 ) -> None:
-    """Analyze snapshot data quality for a time window.
+    """Analyze snapshot data quality.
 
-    Checks for gaps, duplicates, and coverage issues.
-    Saves a quality report to the database.
+    Supports three window modes:
+    1. Explicit: --from/--to date range
+    2. Rolling: --last-minutes N (last N minutes)
+    3. Last times: --last-times K (last K distinct snapshots)
 
-    Example:
+    The --last-times mode is recommended for evaluating recent data quality
+    without being penalized by historical gaps.
+
+    Examples:
         pmq snapshots quality --from 2024-01-01 --to 2024-01-07 --interval 60
+        pmq snapshots quality --last-minutes 60 --interval 60
+        pmq snapshots quality --last-times 30 --interval 60
     """
-    from pmq.quality import QualityReporter
+    from pmq.quality import QualityChecker, QualityReporter, WindowMode
 
+    # Validate arguments - exactly one window mode must be specified
+    explicit_mode = from_date is not None and to_date is not None
+    rolling_mode = last_minutes is not None
+    times_mode = last_times is not None
+
+    mode_count = sum([explicit_mode, rolling_mode, times_mode])
+    if mode_count == 0:
+        console.print("[red]Error: Must specify --from/--to, --last-minutes, or --last-times[/red]")
+        raise typer.Exit(1)
+    if mode_count > 1:
+        console.print("[red]Error: Cannot combine window modes. Use one of:[/red]")
+        console.print("  --from/--to (explicit range)")
+        console.print("  --last-minutes (rolling window)")
+        console.print("  --last-times (last K snapshots)")
+        raise typer.Exit(1)
+
+    checker = QualityChecker()
     reporter = QualityReporter()
 
     with console.status("[bold green]Analyzing snapshot quality..."):
-        result = reporter.generate_report(
-            start_time=from_date,
-            end_time=to_date,
-            expected_interval_seconds=interval,
-            save=True,
-        )
+        if rolling_mode:
+            result = checker.check_last_minutes(last_minutes, interval)
+            window_desc = f"Last {last_minutes} minutes"
+        elif times_mode:
+            result = checker.check_last_times(last_times, interval)
+            window_desc = f"Last {last_times} snapshot times"
+        else:
+            result = reporter.generate_report(
+                start_time=from_date,
+                end_time=to_date,
+                expected_interval_seconds=interval,
+                save=True,
+            )
+            window_desc = f"{from_date} to {to_date}"
 
     # Display results
     status = reporter.get_status_badge(result)
     status_color = {"healthy": "green", "degraded": "yellow", "unhealthy": "red"}.get(status, "dim")
 
+    # Readiness badge
+    ready_badge = "[green]✓ READY[/green]" if result.ready_for_scorecard else "[yellow]⚠ NOT READY[/yellow]"
+
     console.print(
-        f"\n[bold]Quality Report: [{status_color}]{status.upper()}[/{status_color}][/bold]"
+        f"\n[bold]Quality Report: [{status_color}]{status.upper()}[/{status_color}][/bold]  {ready_badge}"
     )
 
     table = Table(title="Quality Metrics")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", justify="right")
 
-    table.add_row("Window", f"{from_date} to {to_date}")
+    table.add_row("Window Mode", result.window_mode)
+    table.add_row("Window", window_desc)
+    if result.window_from and result.window_to:
+        table.add_row("Actual Range", f"{result.window_from[:19]} to {result.window_to[:19]}")
     table.add_row("Expected Interval", f"{interval}s")
+    table.add_row("Distinct Times", f"{result.distinct_times} / {result.expected_times}")
     table.add_row("Total Snapshots", str(result.snapshots_written))
     table.add_row("Markets Covered", str(result.markets_seen))
     table.add_row("Coverage", f"{result.coverage_pct:.1f}%")
+    table.add_row("Maturity Score", f"{result.maturity_score}/100")
+    table.add_row("Ready for Scorecard", "Yes" if result.ready_for_scorecard else "No")
     table.add_row("Missing Intervals", str(result.missing_intervals))
     table.add_row("Largest Gap", f"{result.largest_gap_seconds:.0f}s")
     table.add_row("Duplicates", str(result.duplicate_count))

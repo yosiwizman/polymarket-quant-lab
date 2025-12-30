@@ -84,7 +84,7 @@ class GammaClient:
         try:
             data = json.loads(cache_file.read_text(encoding="utf-8"))
             cached_at = datetime.fromisoformat(data.get("_cached_at", "2000-01-01"))
-            age = (datetime.now(UTC) - cached_at.replace(tzinfo=UTC)).seconds
+            age = (datetime.now(UTC) - cached_at.replace(tzinfo=UTC)).total_seconds()
 
             if age < self._cache_ttl:
                 logger.debug(f"Cache hit for {key} (age={age}s)")

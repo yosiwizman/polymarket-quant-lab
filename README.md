@@ -361,6 +361,101 @@ poetry run pmq paper run --strategy arb --override-unsafe
 
 This logs a WARN-level risk event but allows execution.
 
+### Evaluation Pipeline (Phase 4)
+
+The evaluation pipeline automates end-to-end strategy validation with a single command:
+
+1. **Quality Check**: Assert data is READY (maturity ≥ 70)
+2. **Backtest**: Run deterministic backtest on quality window
+3. **Approval**: Evaluate scorecard for go/no-go decision
+4. **Paper Run** (optional): Short smoke test
+5. **Report**: Generate deterministic report
+
+#### Running an Evaluation
+
+```powershell
+# Basic evaluation (requires 30 recent snapshots)
+poetry run pmq eval run --strategy arb --version v1 --last-times 30
+
+# With paper trading smoke test
+poetry run pmq eval run --strategy arb --version v1 --last-times 30 --paper-minutes 10
+
+# Custom parameters
+poetry run pmq eval run --strategy arb --version v1 --last-times 60 --interval 60 --quantity 20 --balance 5000
+
+# Observer strategy (validation mode)
+poetry run pmq eval run --strategy observer --version v1 --last-times 30
+```
+
+#### Viewing Evaluations
+
+```powershell
+# List recent evaluations
+poetry run pmq eval list
+
+# Filter by status
+poetry run pmq eval list --status PASSED
+poetry run pmq eval list --strategy arb
+
+# View detailed report
+poetry run pmq eval report --id <eval-id>
+
+# Show artifact details
+poetry run pmq eval report --id <eval-id> --artifacts
+```
+
+#### Exporting Reports
+
+```powershell
+# Export as Markdown
+poetry run pmq eval export --id <eval-id> --format md
+
+# Export as JSON
+poetry run pmq eval export --id <eval-id> --format json --out reports/
+
+# Export as CSV
+poetry run pmq eval export --id <eval-id> --format csv
+```
+
+#### Recommended Operator Workflow
+
+```powershell
+# 1. Start snapshot collection (Phase 2.5)
+poetry run pmq snapshots run --interval 60 --duration-minutes 0  # Run indefinitely
+
+# 2. Wait ~30 minutes for data maturity, then check quality
+poetry run pmq snapshots quality --last-times 30 --interval 60
+
+# 3. When READY, run full evaluation
+poetry run pmq eval run --strategy arb --version v1 --last-times 30
+
+# 4. If PASSED, proceed to paper trading
+poetry run pmq paper run --strategy arb --minutes 60
+
+# 5. Monitor via dashboard
+poetry run pmq serve
+```
+
+#### Evaluation Artifacts
+
+Each evaluation saves artifacts for reproducibility:
+
+- **QUALITY_JSON**: Quality check results (coverage, maturity, window)
+- **BACKTEST_JSON**: Backtest metrics and run ID
+- **SCORECARD_TXT**: Human-readable scorecard
+- **PAPER_LOG**: Paper trading results (if enabled)
+- **REPORT_MD**: Full markdown report
+- **REPORT_JSON**: Machine-readable report
+
+#### API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/evals` | List evaluation runs |
+| `GET /api/evals/{id}` | Get evaluation details |
+| `GET /api/evals/{id}/artifacts/{kind}` | Get specific artifact |
+| `GET /api/evals/summary` | Status counts and latest by strategy |
+
 ## Configuration
 
 ### Environment Variables
@@ -422,6 +517,9 @@ polymarket-quant-lab/
 │   ├── governance/         # Strategy approval (Phase 3)
 │   │   ├── scorecard.py    # Backtest evaluation
 │   │   └── risk_gate.py    # Approval enforcement
+│   ├── evaluation/         # Evaluation pipeline (Phase 4)
+│   │   ├── pipeline.py     # End-to-end orchestration
+│   │   └── reporter.py     # Report generation
 │   └── web/
 │       ├── app.py          # FastAPI application
 │       ├── routes.py       # API endpoints
@@ -434,6 +532,7 @@ polymarket-quant-lab/
 │   ├── test_backtest.py    # Backtest tests
 │   ├── test_quality.py     # Quality/manifest tests
 │   ├── test_governance.py  # Approval/risk gate tests
+│   ├── test_evaluation.py  # Evaluation pipeline tests
 │   └── test_web_and_export.py
 ├── config/
 │   └── pairs.yml           # Stat-arb pairs config
@@ -521,7 +620,7 @@ poetry run mypy src
 - [x] Backtest run manifests (config hash, git SHA)
 - [x] Dashboard snapshot/quality endpoints
 
-### Phase 3 (Current) ✅
+### Phase 3 ✅
 - [x] Strategy scorecards (evaluate backtest results)
 - [x] Approval registry (grant/revoke/list)
 - [x] RiskGate enforcement (block unapproved strategies)
@@ -529,7 +628,15 @@ poetry run mypy src
 - [x] Dashboard governance section
 - [x] CLI approval commands (`pmq approve`)
 
-### Phase 4 (Future)
+### Phase 4 (Current) ✅
+- [x] Evaluation pipeline (`pmq eval run/list/report/export`)
+- [x] Automated quality → backtest → approval flow
+- [x] Deterministic go/no-go reports (MD/JSON/CSV)
+- [x] Evaluation artifacts persistence
+- [x] Dashboard evaluations section
+- [x] API endpoints (`/api/evals`)
+
+### Phase 5 (Future)
 - [ ] Authenticated CLOB integration
 - [ ] Real order placement via py-clob-client
 - [ ] Wallet integration (Polygon)

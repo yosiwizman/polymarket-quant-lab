@@ -901,7 +901,7 @@ app.add_typer(backtest_app, name="backtest")
 def backtest_run(
     strategy: Annotated[
         str,
-        typer.Option("--strategy", "-s", help="Strategy to backtest: arb, statarb"),
+        typer.Option("--strategy", "-s", help="Strategy to backtest: arb, statarb, observer"),
     ] = "arb",
     from_date: Annotated[
         str,
@@ -929,9 +929,15 @@ def backtest_run(
     Requires snapshots to be collected first via `pmq sync --snapshot`.
     Results are deterministic - same inputs produce same outputs.
 
+    Strategies:
+        arb      - Arbitrage strategy (buys when YES+NO < threshold)
+        statarb  - Statistical arbitrage on configured pairs
+        observer - Validation baseline (observes without trading)
+
     Example:
         pmq backtest run --strategy arb --from 2024-01-01 --to 2024-01-07
         pmq backtest run --strategy statarb --pairs config/pairs.yml
+        pmq backtest run --strategy observer --from 2024-12-01 --to 2024-12-31
     """
     from pmq.backtest import BacktestRunner
 
@@ -964,8 +970,13 @@ def backtest_run(
                     pairs_config=pairs_config,
                     quantity=quantity,
                 )
+            elif strategy == "observer":
+                run_id, metrics = runner.run_observer_backtest(
+                    start_date=from_date,
+                    end_date=to_date,
+                )
             else:
-                console.print(f"[red]Unknown strategy: {strategy}[/red]")
+                console.print(f"[red]Unknown strategy: {strategy}. Use: arb, statarb, observer[/red]")
                 raise typer.Exit(1)
 
             # Display results
@@ -1536,14 +1547,25 @@ def approve_evaluate(
         str,
         typer.Option("--run-id", "-r", help="Backtest run ID to evaluate"),
     ],
+    validation_mode: Annotated[
+        bool,
+        typer.Option(
+            "--validation",
+            help="Use relaxed thresholds for baseline validation strategies",
+        ),
+    ] = False,
 ) -> None:
     """Evaluate a backtest run for approval.
 
     Computes a strategy scorecard with pass/fail criteria and
     recommended risk limits.
 
+    Use --validation for observer/baseline strategies that need
+    relaxed thresholds (e.g., 0 trades allowed).
+
     Example:
         pmq approve evaluate --run-id abc123
+        pmq approve evaluate --run-id abc123 --validation
     """
     from pmq.backtest import BacktestRunner
     from pmq.governance import compute_scorecard
@@ -1563,6 +1585,10 @@ def approve_evaluate(
     if not metrics:
         console.print(f"[red]No metrics found for run: {run_id}[/red]")
         raise typer.Exit(1)
+
+    # Auto-enable validation mode for observer strategy
+    if run["strategy"] == "observer":
+        validation_mode = True
 
     # Get data quality for the backtest window
     from pmq.quality import QualityReporter
@@ -1585,13 +1611,17 @@ def approve_evaluate(
         capital_utilization=metrics.get("capital_utilization", 0.5),
         initial_balance=run.get("initial_balance", 10000.0),
         data_quality_pct=quality_report.coverage_pct,
+        validation_mode=validation_mode,
+        data_quality_status=quality_report.status,
     )
 
     # Display results
+    mode_suffix = " (validation mode)" if validation_mode else ""
     status = "[green]PASSED[/green]" if scorecard.passed else "[red]FAILED[/red]"
-    console.print(f"\n[bold]Strategy Evaluation: {status}[/bold]")
+    console.print(f"\n[bold]Strategy Evaluation: {status}{mode_suffix}[/bold]")
     console.print(f"Run ID: [cyan]{run_id}[/cyan]")
     console.print(f"Strategy: [cyan]{run['strategy']}[/cyan]")
+    console.print(f"Data Quality Status: [cyan]{quality_report.status}[/cyan]")
 
     # Score breakdown
     score_table = Table(title="Scorecard")
@@ -1637,14 +1667,20 @@ def approve_evaluate(
 
         console.print(limits_table)
 
+        validation_flag = " --validation" if validation_mode else ""
         console.print(
             f"\n[dim]To approve: pmq approve grant --run-id {run_id} "
-            f"--name {run['strategy']} --version v1[/dim]"
+            f"--name {run['strategy']} --version v1{validation_flag}[/dim]"
         )
     else:
-        console.print(
-            "\n[dim]Strategy did not pass evaluation. Improve backtest performance before approval.[/dim]"
-        )
+        if validation_mode:
+            console.print(
+                "\n[dim]Strategy did not pass even in validation mode. Check for critical issues.[/dim]"
+            )
+        else:
+            console.print(
+                "\n[dim]Strategy did not pass. Try --validation for baseline strategies, or improve performance.[/dim]"
+            )
 
 
 @approve_app.command("grant")
@@ -1669,6 +1705,13 @@ def approve_grant(
         bool,
         typer.Option("--force", help="Force approval even if scorecard fails"),
     ] = False,
+    validation_mode: Annotated[
+        bool,
+        typer.Option(
+            "--validation",
+            help="Use relaxed thresholds for baseline validation strategies",
+        ),
+    ] = False,
 ) -> None:
     """Grant approval for a strategy based on backtest results.
 
@@ -1676,6 +1719,7 @@ def approve_grant(
 
     Example:
         pmq approve grant --run-id abc123 --name arb --version v1
+        pmq approve grant --run-id abc123 --name observer --version v1 --validation
     """
     from pmq.backtest import BacktestRunner
     from pmq.governance import compute_scorecard, limits_to_dict
@@ -1695,6 +1739,10 @@ def approve_grant(
     if not metrics:
         console.print(f"[red]No metrics found for run: {run_id}[/red]")
         raise typer.Exit(1)
+
+    # Auto-enable validation mode for observer strategy
+    if run["strategy"] == "observer":
+        validation_mode = True
 
     # Get data quality
     from pmq.quality import QualityReporter
@@ -1717,6 +1765,8 @@ def approve_grant(
         capital_utilization=metrics.get("capital_utilization", 0.5),
         initial_balance=run.get("initial_balance", 10000.0),
         data_quality_pct=quality_report.coverage_pct,
+        validation_mode=validation_mode,
+        data_quality_status=quality_report.status,
     )
 
     if not scorecard.passed and not force:
@@ -1732,7 +1782,10 @@ def approve_grant(
     config_hash = manifest.get("config_hash") if manifest else None
 
     # Save approval
-    status = "APPROVED" if scorecard.passed else "APPROVED_FORCED"
+    if validation_mode:
+        status = "APPROVED_VALIDATION" if scorecard.passed else "APPROVED_FORCED"
+    else:
+        status = "APPROVED" if scorecard.passed else "APPROVED_FORCED"
     approval_id = dao.save_approval(
         strategy_name=name,
         strategy_version=version,

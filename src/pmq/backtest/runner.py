@@ -276,9 +276,15 @@ class BacktestRunner:
 
         try:
             # Load pairs from config
+            from pmq.config import StatArbConfig
             from pmq.strategies.statarb import StatArbScanner
 
-            scanner = StatArbScanner(config_path=pairs_config)
+            # Create scanner - uses default config if pairs_config is None
+            if pairs_config:
+                statarb_config = StatArbConfig(pairs_file=pairs_config)
+                scanner = StatArbScanner(config=statarb_config)
+            else:
+                scanner = StatArbScanner()
 
             if not scanner.pairs:
                 logger.warning("No stat-arb pairs configured")

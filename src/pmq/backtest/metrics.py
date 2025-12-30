@@ -223,15 +223,13 @@ class MetricsCalculator:
         mean_return = sum(returns) / len(returns)
 
         variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
-        std_return = variance**0.5
+        std_return = float(variance**0.5)
 
         if std_return == 0:
             return 0.0
 
         # Simplified Sharpe (no risk-free rate adjustment)
-        sharpe = mean_return / std_return
-
-        return sharpe
+        return mean_return / std_return
 
     def _calculate_trades_per_day(
         self,

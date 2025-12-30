@@ -170,6 +170,64 @@ poetry run pmq export signals --type STAT_ARB
 poetry run pmq export signals --limit 100
 ```
 
+### Backtesting (Phase 2)
+
+Run deterministic backtests on historical data.
+
+#### Collecting Snapshots
+
+First, collect market snapshots for backtesting:
+
+```powershell
+# Sync with snapshot (save time-series data)
+poetry run pmq sync --snapshot
+
+# Collect snapshots periodically (e.g., via cron or scheduler)
+# Each --snapshot call adds a new time-series point
+```
+
+#### Running Backtests
+
+```powershell
+# Run arbitrage backtest
+poetry run pmq backtest run --strategy arb --from 2024-01-01 --to 2024-01-07
+
+# With custom parameters
+poetry run pmq backtest run --strategy arb --from 2024-01-01 --to 2024-01-07 --balance 5000 --quantity 20
+
+# Run stat-arb backtest with pairs config
+poetry run pmq backtest run --strategy statarb --pairs config/pairs.yml --from 2024-01-01 --to 2024-01-07
+```
+
+#### Viewing Results
+
+```powershell
+# List recent backtest runs
+poetry run pmq backtest list
+
+# View detailed report for a run
+poetry run pmq backtest report --run-id <run-id>
+
+# Show individual trades
+poetry run pmq backtest report --run-id <run-id> --trades
+
+# Export results
+poetry run pmq backtest export --run-id <run-id> --format csv --out exports/
+poetry run pmq backtest export --run-id <run-id> --format json --out exports/
+```
+
+#### Backtest Metrics
+
+Backtests compute the following metrics:
+- **Total PnL**: Net profit/loss from the backtest period
+- **Max Drawdown**: Maximum peak-to-trough decline as a percentage
+- **Win Rate**: Percentage of profitable arb opportunities
+- **Sharpe Ratio**: Risk-adjusted return (simplified, no risk-free rate)
+- **Trades/Day**: Average number of trades executed per day
+- **Capital Utilization**: Average percentage of capital deployed
+
+> ⚠️ **Warning**: Backtest results are not guarantees of future performance. Historical data may not reflect future market conditions.
+
 ## Configuration
 
 ### Environment Variables
@@ -213,22 +271,28 @@ polymarket-quant-lab/
 │   ├── gamma_client.py     # Gamma API client
 │   ├── logging.py          # Structured logging
 │   ├── models.py           # Pydantic data models
-│   └── storage/
+│   ├── storage/
 │   │   ├── db.py           # SQLite database
 │   │   ├── dao.py          # Data access layer
 │   │   └── schema.sql      # Database schema
-│   └── strategies/
-│       ├── arb.py          # Arbitrage scanner
-│       ├── statarb.py      # Stat-arb scanner
-│       └── paper.py        # Paper trading ledger
+│   ├── strategies/
+│   │   ├── arb.py          # Arbitrage scanner
+│   │   ├── statarb.py      # Stat-arb scanner
+│   │   └── paper.py        # Paper trading ledger
+│   ├── backtest/           # Backtesting framework (Phase 2)
+│   │   ├── engine.py       # Core backtest engine
+│   │   ├── runner.py       # Strategy orchestration
+│   │   └── metrics.py      # Performance metrics
 │   └── web/
 │       ├── app.py          # FastAPI application
 │       ├── routes.py       # API endpoints
+│       ├── static/         # Static files (favicon)
 │       └── templates/      # HTML templates
 ├── tests/
 │   ├── test_gamma_client.py
 │   ├── test_signals.py
 │   ├── test_paper_ledger.py
+│   ├── test_backtest.py    # Backtest tests
 │   └── test_web_and_export.py
 ├── config/
 │   └── pairs.yml           # Stat-arb pairs config
@@ -295,19 +359,25 @@ poetry run mypy src
 - [x] Safety guardrails
 - [x] CI/CD pipeline
 
-### Phase 1.5 (Current) ✅
+### Phase 1.5 ✅
 - [x] Local-only web dashboard (FastAPI + Uvicorn)
 - [x] Operator loop with exponential backoff
 - [x] CSV data export
 - [x] Runtime state tracking
 - [x] Cache TTL correctness fix
 
-### Phase 2 (Future)
+### Phase 2 (Current) ✅
+- [x] Deterministic backtesting engine
+- [x] Historical market snapshots
+- [x] Backtest CLI commands (run, report, export)
+- [x] Performance metrics (PnL, drawdown, Sharpe, win rate)
+- [x] Replay-based strategy evaluation
+
+### Phase 3 (Future)
 - [ ] Authenticated CLOB integration
 - [ ] Real order placement via py-clob-client
 - [ ] Wallet integration (Polygon)
 - [ ] Advanced signal strategies
-- [ ] Backtesting framework
 - [ ] Real-time WebSocket feeds
 
 ## License

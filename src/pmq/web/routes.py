@@ -329,6 +329,138 @@ def get_governance_summary() -> dict[str, Any]:
 
 
 # =============================================================================
+# Evaluation Pipeline Endpoints (Phase 4)
+# =============================================================================
+
+
+@router.get("/api/evals")
+def get_evaluations(
+    strategy: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    """Get evaluation runs.
+
+    Args:
+        strategy: Optional filter by strategy name
+        status: Optional filter (PASSED, FAILED, PENDING)
+        limit: Maximum results
+
+    Returns:
+        List of evaluation runs
+    """
+    dao = get_dao()
+    evals = dao.get_evaluation_runs(
+        limit=limit,
+        strategy_name=strategy,
+        final_status=status,
+    )
+    return {
+        "evaluations": evals,
+        "count": len(evals),
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.get("/api/evals/{eval_id}")
+def get_evaluation(
+    eval_id: str,
+) -> dict[str, Any]:
+    """Get a specific evaluation run.
+
+    Args:
+        eval_id: Evaluation ID (UUID)
+
+    Returns:
+        Evaluation details with artifacts
+    """
+    dao = get_dao()
+    eval_data = dao.get_evaluation_run(eval_id)
+
+    if not eval_data:
+        return {
+            "error": "Evaluation not found",
+            "eval_id": eval_id,
+        }
+
+    # Get artifacts
+    artifacts = dao.get_evaluation_artifacts(eval_id)
+
+    return {
+        "evaluation": eval_data,
+        "artifacts": [
+            {"kind": a["kind"], "size": len(a["content"]), "created_at": a["created_at"]}
+            for a in artifacts
+        ],
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.get("/api/evals/{eval_id}/artifacts/{kind}")
+def get_evaluation_artifact(
+    eval_id: str,
+    kind: str,
+) -> dict[str, Any]:
+    """Get a specific artifact from an evaluation.
+
+    Args:
+        eval_id: Evaluation ID (UUID)
+        kind: Artifact kind (QUALITY_JSON, BACKTEST_JSON, SCORECARD_TXT, etc.)
+
+    Returns:
+        Artifact content
+    """
+    dao = get_dao()
+    artifacts = dao.get_evaluation_artifacts(eval_id)
+
+    for art in artifacts:
+        if art["kind"] == kind.upper():
+            return {
+                "kind": art["kind"],
+                "content": art["content"],
+                "created_at": art["created_at"],
+            }
+
+    return {
+        "error": "Artifact not found",
+        "eval_id": eval_id,
+        "kind": kind,
+    }
+
+
+@router.get("/api/evals/summary")
+def get_evaluations_summary() -> dict[str, Any]:
+    """Get evaluation summary statistics.
+
+    Returns:
+        Summary with counts by status
+    """
+    dao = get_dao()
+    all_evals = dao.get_evaluation_runs(limit=1000)
+
+    # Count by status
+    status_counts = {"PASSED": 0, "FAILED": 0, "PENDING": 0}
+    for ev in all_evals:
+        status = ev.get("final_status", "PENDING")
+        if status in status_counts:
+            status_counts[status] += 1
+
+    # Get latest by strategy
+    latest_by_strategy: dict[str, dict[str, Any]] = {}
+    for ev in all_evals:
+        strat = ev.get("strategy_name", "unknown")
+        if strat not in latest_by_strategy:
+            latest_by_strategy[strat] = ev
+
+    return {
+        "total_evaluations": len(all_evals),
+        "status_counts": status_counts,
+        "latest_by_strategy": latest_by_strategy,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+# =============================================================================
 # Dashboard (HTML)
 # =============================================================================
 
@@ -379,6 +511,11 @@ def dashboard(request: Request) -> HTMLResponse:
     approvals = dao.get_approvals(status="APPROVED", limit=10)
     risk_events = dao.get_risk_events(limit=10)
 
+    # Evaluation data (Phase 4)
+    evaluations = dao.get_evaluation_runs(limit=10)
+    eval_passed = sum(1 for ev in evaluations if ev.get("final_status") == "PASSED")
+    eval_failed = sum(1 for ev in evaluations if ev.get("final_status") == "FAILED")
+
     templates = request.app.state.templates
     response: HTMLResponse = templates.TemplateResponse(
         request,
@@ -397,6 +534,9 @@ def dashboard(request: Request) -> HTMLResponse:
             "ready_for_scorecard": ready_for_scorecard,
             "approvals": approvals,
             "risk_events": risk_events,
+            "evaluations": evaluations,
+            "eval_passed": eval_passed,
+            "eval_failed": eval_failed,
             "now": datetime.now(UTC).isoformat(),
         },
     )

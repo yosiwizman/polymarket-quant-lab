@@ -549,3 +549,136 @@ class DAO:
             "total_signals": signals_row["total_signals"] if signals_row else 0,
             "open_positions": self.count_positions(),
         }
+
+    # =========================================================================
+    # Runtime State
+    # =========================================================================
+
+    def set_runtime_state(self, key: str, value: str) -> None:
+        """Set a runtime state value.
+
+        Args:
+            key: State key (e.g., 'last_sync_at')
+            value: State value
+        """
+        now = datetime.now(UTC).isoformat()
+        self._db.execute(
+            """
+            INSERT INTO runtime_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, now),
+        )
+
+    def get_runtime_state(self, key: str) -> str | None:
+        """Get a runtime state value.
+
+        Args:
+            key: State key
+
+        Returns:
+            State value or None
+        """
+        row = self._db.fetch_one(
+            "SELECT value FROM runtime_state WHERE key = ?",
+            (key,),
+        )
+        return row["value"] if row else None
+
+    def get_all_runtime_state(self) -> dict[str, str]:
+        """Get all runtime state values.
+
+        Returns:
+            Dict of key -> value
+        """
+        rows = self._db.fetch_all("SELECT key, value FROM runtime_state")
+        return {row["key"]: row["value"] for row in rows}
+
+    # =========================================================================
+    # Export Helpers
+    # =========================================================================
+
+    def get_signals_for_export(
+        self,
+        signal_type: SignalType | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Get signals in export-friendly format.
+
+        Args:
+            signal_type: Filter by signal type
+            limit: Maximum number of results
+
+        Returns:
+            List of signal dicts with flattened payload
+        """
+        if signal_type:
+            rows = self._db.fetch_all(
+                """
+                SELECT id, type, market_ids, payload_json, profit_potential, created_at
+                FROM signals WHERE type = ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (signal_type.value, limit),
+            )
+        else:
+            rows = self._db.fetch_all(
+                """
+                SELECT id, type, market_ids, payload_json, profit_potential, created_at
+                FROM signals ORDER BY created_at DESC LIMIT ?
+                """,
+                (limit,),
+            )
+
+        results = []
+        for row in rows:
+            data = dict(row)
+            # Parse JSON fields
+            data["market_ids"] = json.loads(data["market_ids"])
+            payload = json.loads(data["payload_json"])
+            del data["payload_json"]
+            # Flatten payload into data
+            for k, v in payload.items():
+                if k not in data:
+                    data[k] = v
+            results.append(data)
+        return results
+
+    def get_trades_for_export(self, limit: int = 1000) -> list[dict[str, Any]]:
+        """Get trades in export-friendly format.
+
+        Args:
+            limit: Maximum number of results
+
+        Returns:
+            List of trade dicts
+        """
+        rows = self._db.fetch_all(
+            """
+            SELECT id, strategy, market_id, market_question, side, outcome,
+                   price, quantity, notional, created_at
+            FROM paper_trades ORDER BY created_at DESC LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def get_positions_for_export(self) -> list[dict[str, Any]]:
+        """Get positions in export-friendly format.
+
+        Returns:
+            List of position dicts
+        """
+        rows = self._db.fetch_all(
+            """
+            SELECT market_id, market_question, yes_quantity, no_quantity,
+                   avg_price_yes, avg_price_no, realized_pnl, created_at, updated_at
+            FROM paper_positions
+            WHERE yes_quantity != 0 OR no_quantity != 0
+            ORDER BY updated_at DESC
+            """
+        )
+        return [dict(row) for row in rows]

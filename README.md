@@ -104,6 +104,72 @@ View trading performance summary:
 poetry run pmq report
 ```
 
+### Operator Console (Phase 1.5)
+
+Start the local web dashboard:
+
+```powershell
+# Start local-only dashboard (no auth required)
+poetry run pmq serve
+
+# Custom host/port
+poetry run pmq serve --host 127.0.0.1 --port 9000
+```
+
+Then open http://localhost:8080 in your browser. The dashboard shows:
+- Trading statistics (trades, positions, PnL)
+- Runtime state (last scan, errors, etc.)
+- Recent signals and trades
+- Open positions
+
+### Operator Loop
+
+Run a long-running operator loop with automatic error recovery:
+
+```powershell
+# Run continuously (Ctrl+C to stop)
+poetry run pmq run
+
+# Custom interval (seconds between cycles)
+poetry run pmq run --interval 120
+
+# Limit number of cycles
+poetry run pmq run --cycles 10
+
+# Customize market limit and trade quantity
+poetry run pmq run --limit 500 --quantity 25
+```
+
+Features:
+- Exponential backoff on errors (5s → 10s → ... → 300s)
+- Automatic recovery after transient failures
+- Runtime state logged to database (viewable in dashboard)
+- Graceful shutdown on Ctrl+C
+
+### Export Data
+
+Export trading data to CSV files:
+
+```powershell
+# Export all data (signals, trades, positions)
+poetry run pmq export all
+
+# Export specific data types
+poetry run pmq export signals
+poetry run pmq export trades
+poetry run pmq export positions
+
+# Custom output directory
+poetry run pmq export all --out ./exports
+
+# Filter signals by type
+poetry run pmq export signals --type ARBITRAGE
+poetry run pmq export signals --type STAT_ARB
+
+# Limit number of records
+poetry run pmq export signals --limit 100
+```
+
 ## Configuration
 
 ### Environment Variables
@@ -155,10 +221,15 @@ polymarket-quant-lab/
 │       ├── arb.py          # Arbitrage scanner
 │       ├── statarb.py      # Stat-arb scanner
 │       └── paper.py        # Paper trading ledger
+│   └── web/
+│       ├── app.py          # FastAPI application
+│       ├── routes.py       # API endpoints
+│       └── templates/      # HTML templates
 ├── tests/
 │   ├── test_gamma_client.py
 │   ├── test_signals.py
-│   └── test_paper_ledger.py
+│   ├── test_paper_ledger.py
+│   └── test_web_and_export.py
 ├── config/
 │   └── pairs.yml           # Stat-arb pairs config
 ├── .github/workflows/
@@ -215,7 +286,7 @@ poetry run mypy src
 
 ## Roadmap
 
-### Phase 1 (Current) ✅
+### Phase 1 ✅
 - [x] Market data ingestion from Gamma API
 - [x] Arbitrage signal detection
 - [x] Statistical arbitrage framework
@@ -223,6 +294,13 @@ poetry run mypy src
 - [x] CLI interface
 - [x] Safety guardrails
 - [x] CI/CD pipeline
+
+### Phase 1.5 (Current) ✅
+- [x] Local-only web dashboard (FastAPI + Uvicorn)
+- [x] Operator loop with exponential backoff
+- [x] CSV data export
+- [x] Runtime state tracking
+- [x] Cache TTL correctness fix
 
 ### Phase 2 (Future)
 - [ ] Authenticated CLOB integration

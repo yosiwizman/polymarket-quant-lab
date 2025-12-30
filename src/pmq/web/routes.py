@@ -157,8 +157,12 @@ def get_snapshots_coverage(
 
 @router.get("/api/snapshots/quality/latest")
 def get_latest_quality_report(
-    mode: str | None = Query(default=None, description="Window mode: explicit, last_minutes, last_times"),
-    value: int | None = Query(default=None, description="Minutes or times count (for rolling modes)"),
+    mode: str | None = Query(
+        default=None, description="Window mode: explicit, last_minutes, last_times"
+    ),
+    value: int | None = Query(
+        default=None, description="Minutes or times count (for rolling modes)"
+    ),
     interval: int = Query(default=60, description="Expected interval in seconds"),
 ) -> dict[str, Any]:
     """Get quality report - stored or on-demand.

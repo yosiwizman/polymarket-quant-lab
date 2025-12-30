@@ -128,7 +128,9 @@ def compute_scorecard(
                 f"Maturity score: {maturity_score}/100 (need 70+ for readiness)",
                 "Hint: Use --last-times to evaluate recent data quality, or run in --validation mode",
             ],
-            warnings=["Data quality assessment indicates insufficient maturity for reliable evaluation"],
+            warnings=[
+                "Data quality assessment indicates insufficient maturity for reliable evaluation"
+            ],
             recommended_limits=RiskLimits(),
             metrics_used={
                 "maturity_score": maturity_score,

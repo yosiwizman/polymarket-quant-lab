@@ -1433,7 +1433,9 @@ def snapshots_quality(
     status_color = {"healthy": "green", "degraded": "yellow", "unhealthy": "red"}.get(status, "dim")
 
     # Readiness badge
-    ready_badge = "[green]✓ READY[/green]" if result.ready_for_scorecard else "[yellow]⚠ NOT READY[/yellow]"
+    ready_badge = (
+        "[green]✓ READY[/green]" if result.ready_for_scorecard else "[yellow]⚠ NOT READY[/yellow]"
+    )
 
     console.print(
         f"\n[bold]Quality Report: [{status_color}]{status.upper()}[/{status_color}][/bold]  {ready_badge}"
@@ -1675,7 +1677,9 @@ def approve_evaluate(
     console.print(f"Run ID: [cyan]{run_id}[/cyan]")
     console.print(f"Strategy: [cyan]{run['strategy']}[/cyan]")
     console.print(f"Data Quality Status: [cyan]{quality_report.status}[/cyan]")
-    console.print(f"Maturity: [cyan]{quality_report.maturity_score}/100[/cyan] {'✓ Ready' if quality_report.ready_for_scorecard else '⚠ Not Ready'}")
+    console.print(
+        f"Maturity: [cyan]{quality_report.maturity_score}/100[/cyan] {'✓ Ready' if quality_report.ready_for_scorecard else '⚠ Not Ready'}"
+    )
 
     # Score breakdown
     score_table = Table(title="Scorecard")

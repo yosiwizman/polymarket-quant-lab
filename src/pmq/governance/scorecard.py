@@ -217,13 +217,13 @@ def compute_scorecard(
 
     # --- Calculate Recommended Limits ---
     limits = _compute_recommended_limits(
-        total_pnl=total_pnl,
-        max_drawdown=max_drawdown,
-        win_rate=win_rate,
-        trades_per_day=trades_per_day,
-        capital_utilization=capital_utilization,
-        initial_balance=initial_balance,
-        data_quality_pct=data_quality_pct,
+        total_pnl,
+        max_drawdown,
+        win_rate,
+        trades_per_day,
+        capital_utilization,
+        initial_balance,
+        data_quality_pct,
     )
 
     return StrategyScorecard(

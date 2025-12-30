@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="30">
+    <title>PMQ Operator Console</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --bg-secondary: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --green: #3fb950;
+            --yellow: #d29922;
+            --red: #f85149;
+            --blue: #58a6ff;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+            padding: 20px;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        h1 { font-size: 24px; font-weight: 600; }
+        .version { color: var(--text-muted); font-size: 14px; }
+        .note { color: var(--yellow); font-size: 12px; margin-top: 4px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 24px; }
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 16px;
+        }
+        .card h2 {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .stat { }
+        .stat-label { font-size: 12px; color: var(--text-muted); }
+        .stat-value { font-size: 20px; font-weight: 600; }
+        .stat-value.green { color: var(--green); }
+        .stat-value.red { color: var(--red); }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
+        th { color: var(--text-muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
+        td { font-family: 'SF Mono', Monaco, monospace; }
+        .truncate { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .empty { color: var(--text-muted); font-style: italic; text-align: center; padding: 20px; }
+        footer { margin-top: 24px; text-align: center; color: var(--text-muted); font-size: 12px; }
+        .refresh { color: var(--blue); }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>Polymarket Quant Lab</h1>
+            <div class="note">⚠️ Paper Trading Only - No Real Money</div>
+        </div>
+        <div class="version">v{{ version }} | {{ now[:19] }}</div>
+    </header>
+
+    <div class="grid">
+        <div class="card">
+            <h2>Trading Statistics</h2>
+            <div class="stat-grid">
+                <div class="stat">
+                    <div class="stat-label">Total Trades</div>
+                    <div class="stat-value">{{ stats.total_trades }}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Open Positions</div>
+                    <div class="stat-value">{{ stats.open_positions }}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Total Notional</div>
+                    <div class="stat-value">${{ "%.2f"|format(stats.total_notional) }}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Realized PnL</div>
+                    <div class="stat-value {% if stats.total_realized_pnl >= 0 %}green{% else %}red{% endif %}">
+                        ${{ "%.2f"|format(stats.total_realized_pnl) }}
+                    </div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Total Signals</div>
+                    <div class="stat-value">{{ stats.total_signals }}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Unique Markets</div>
+                    <div class="stat-value">{{ stats.unique_markets }}</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Runtime State</h2>
+            {% if runtime %}
+            <table>
+                <tr><th>Key</th><th>Value</th></tr>
+                {% for key, value in runtime.items() %}
+                <tr>
+                    <td>{{ key }}</td>
+                    <td class="truncate">{{ value[:30] }}{% if value|length > 30 %}...{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </table>
+            {% else %}
+            <div class="empty">No runtime state recorded</div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="card" style="margin-bottom: 20px;">
+        <h2>Recent Signals ({{ signals|length }})</h2>
+        {% if signals %}
+        <table>
+            <tr>
+                <th>ID</th>
+                <th>Type</th>
+                <th>Market(s)</th>
+                <th>Profit %</th>
+                <th>Time</th>
+            </tr>
+            {% for sig in signals %}
+            <tr>
+                <td>{{ sig.id }}</td>
+                <td>{{ sig.type }}</td>
+                <td class="truncate">{{ sig.market_ids|join(', ')|truncate(30, True, '...') }}</td>
+                <td>{{ "%.2f"|format(sig.profit_potential * 100) }}%</td>
+                <td>{{ sig.created_at[:19] }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <div class="empty">No signals detected yet. Run `pmq scan` to detect signals.</div>
+        {% endif %}
+    </div>
+
+    <div class="card" style="margin-bottom: 20px;">
+        <h2>Recent Trades ({{ trades|length }})</h2>
+        {% if trades %}
+        <table>
+            <tr>
+                <th>ID</th>
+                <th>Strategy</th>
+                <th>Side</th>
+                <th>Outcome</th>
+                <th>Price</th>
+                <th>Qty</th>
+                <th>Notional</th>
+                <th>Time</th>
+            </tr>
+            {% for trade in trades %}
+            <tr>
+                <td>{{ trade.id }}</td>
+                <td>{{ trade.strategy }}</td>
+                <td>{{ trade.side }}</td>
+                <td>{{ trade.outcome }}</td>
+                <td>{{ "%.4f"|format(trade.price) }}</td>
+                <td>{{ "%.1f"|format(trade.quantity) }}</td>
+                <td>${{ "%.2f"|format(trade.notional) }}</td>
+                <td>{{ trade.created_at[:19] }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <div class="empty">No trades executed yet. Run `pmq paper run` to execute paper trades.</div>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <h2>Open Positions ({{ positions|length }})</h2>
+        {% if positions %}
+        <table>
+            <tr>
+                <th>Market</th>
+                <th>YES Qty</th>
+                <th>NO Qty</th>
+                <th>Avg YES</th>
+                <th>Avg NO</th>
+                <th>Realized PnL</th>
+            </tr>
+            {% for pos in positions %}
+            <tr>
+                <td class="truncate">{{ pos.market_question[:40] }}{% if pos.market_question|length > 40 %}...{% endif %}</td>
+                <td>{{ "%.2f"|format(pos.yes_quantity) }}</td>
+                <td>{{ "%.2f"|format(pos.no_quantity) }}</td>
+                <td>{{ "%.4f"|format(pos.avg_price_yes) }}</td>
+                <td>{{ "%.4f"|format(pos.avg_price_no) }}</td>
+                <td class="{% if pos.realized_pnl >= 0 %}green{% else %}red{% endif %}">${{ "%.2f"|format(pos.realized_pnl) }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <div class="empty">No open positions</div>
+        {% endif %}
+    </div>
+
+    <footer>
+        <span class="refresh">Auto-refreshes every 30 seconds</span> |
+        <a href="/api/health" style="color: var(--blue);">/api/health</a> |
+        <a href="/docs" style="color: var(--blue);">API Docs</a>
+    </footer>
+</body>
+</html>

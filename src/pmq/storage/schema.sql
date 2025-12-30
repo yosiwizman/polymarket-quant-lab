@@ -89,3 +89,10 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     window_start TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Runtime state: operational status tracking
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);

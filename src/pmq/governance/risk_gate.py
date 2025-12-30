@@ -129,9 +129,7 @@ class RiskGate:
                     strategy_name=strategy_name,
                     message=f"Running unapproved strategy '{strategy_name}' with override",
                 )
-                logger.warning(
-                    f"OVERRIDE: Running unapproved strategy '{strategy_name}'"
-                )
+                logger.warning(f"OVERRIDE: Running unapproved strategy '{strategy_name}'")
                 # Use default limits for override mode
                 status.limits = RiskLimits()
                 return status

@@ -343,9 +343,7 @@ def paper_run(
             allow_override=override_unsafe,
         )
         if approval_status.approved:
-            console.print(
-                f"[green]✓ Strategy '{strategy}' is APPROVED[/green]"
-            )
+            console.print(f"[green]✓ Strategy '{strategy}' is APPROVED[/green]")
         else:
             console.print(
                 f"[yellow]⚠ Running with OVERRIDE - strategy '{strategy}' is NOT approved[/yellow]"
@@ -1869,7 +1867,9 @@ def approve_revoke(
     )
 
     console.print(f"[bold yellow]✓ Approval {approval_id} revoked[/bold yellow]")
-    console.print(f"Strategy: [cyan]{approval['strategy_name']} v{approval['strategy_version']}[/cyan]")
+    console.print(
+        f"Strategy: [cyan]{approval['strategy_name']} v{approval['strategy_version']}[/cyan]"
+    )
     console.print(f"Reason: {reason}")
 
 

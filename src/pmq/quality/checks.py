@@ -98,7 +98,8 @@ class QualityResult:
     @property
     def distinct_times(self) -> int:
         """Get distinct snapshot times from notes."""
-        return self.notes.get("distinct_snapshot_times", 0)
+        value = self.notes.get("distinct_snapshot_times", 0)
+        return int(value) if value is not None else 0
 
 
 class QualityChecker:

@@ -179,12 +179,21 @@ Run deterministic backtests on historical data.
 First, collect market snapshots for backtesting:
 
 ```powershell
-# Sync with snapshot (save time-series data)
+# Single snapshot (manual)
 poetry run pmq sync --snapshot
 
-# Collect snapshots periodically (e.g., via cron or scheduler)
-# Each --snapshot call adds a new time-series point
+# Automated collection with scheduler (Phase 2.5)
+poetry run pmq snapshots run --interval 60 --limit 200 --duration-minutes 60
+
+# Run indefinitely (Ctrl+C to stop)
+poetry run pmq snapshots run --interval 60 --duration-minutes 0
 ```
+
+The scheduler:
+- Collects snapshots at regular intervals
+- Uses exponential backoff on API errors
+- Respects `PMQ_SNAPSHOT_KILL=true` environment variable
+- Does NOT execute any trades - data capture only
 
 #### Running Backtests
 
@@ -227,6 +236,38 @@ Backtests compute the following metrics:
 - **Capital Utilization**: Average percentage of capital deployed
 
 > ⚠️ **Warning**: Backtest results are not guarantees of future performance. Historical data may not reflect future market conditions.
+
+#### Snapshot Quality & Coverage (Phase 2.5)
+
+Check snapshot data quality before running backtests:
+
+```powershell
+# Check overall snapshot stats
+poetry run pmq snapshots summary
+
+# Analyze quality for a time window (detects gaps, duplicates)
+poetry run pmq snapshots quality --from 2024-01-01 --to 2024-01-07 --interval 60
+
+# View coverage by market
+poetry run pmq snapshots coverage --from 2024-01-01 --to 2024-01-07
+```
+
+Quality metrics:
+- **Coverage %**: Percentage of expected intervals with data
+- **Missing Intervals**: Gaps larger than 50% of expected interval
+- **Duplicates**: Same market+timestamp entries
+- **Status Badge**: healthy (≥95% coverage), degraded (≥80%), unhealthy (<80%)
+
+#### Backtest Manifests
+
+Every backtest run automatically saves a manifest for reproducibility:
+
+- **Config Hash**: SHA256 of all config parameters
+- **Git SHA**: Commit hash at run time
+- **Snapshot Range**: First/last snapshot times used
+- **Market Filter**: List of market IDs (for stat-arb)
+
+Manifests ensure backtests can be reproduced exactly by recording all inputs.
 
 ## Configuration
 
@@ -283,6 +324,9 @@ polymarket-quant-lab/
 │   │   ├── engine.py       # Core backtest engine
 │   │   ├── runner.py       # Strategy orchestration
 │   │   └── metrics.py      # Performance metrics
+│   ├── quality/            # Snapshot quality (Phase 2.5)
+│   │   ├── checks.py       # Gap/duplicate detection
+│   │   └── report.py       # Quality reporting
 │   └── web/
 │       ├── app.py          # FastAPI application
 │       ├── routes.py       # API endpoints
@@ -293,6 +337,7 @@ polymarket-quant-lab/
 │   ├── test_signals.py
 │   ├── test_paper_ledger.py
 │   ├── test_backtest.py    # Backtest tests
+│   ├── test_quality.py     # Quality/manifest tests
 │   └── test_web_and_export.py
 ├── config/
 │   └── pairs.yml           # Stat-arb pairs config
@@ -366,12 +411,19 @@ poetry run mypy src
 - [x] Runtime state tracking
 - [x] Cache TTL correctness fix
 
-### Phase 2 (Current) ✅
+### Phase 2 ✅
 - [x] Deterministic backtesting engine
 - [x] Historical market snapshots
 - [x] Backtest CLI commands (run, report, export)
 - [x] Performance metrics (PnL, drawdown, Sharpe, win rate)
 - [x] Replay-based strategy evaluation
+
+### Phase 2.5 (Current) ✅
+- [x] Snapshot scheduler (`pmq snapshots run`)
+- [x] Data quality validation (gap/duplicate detection)
+- [x] Coverage reporting (`pmq snapshots quality/coverage`)
+- [x] Backtest run manifests (config hash, git SHA)
+- [x] Dashboard snapshot/quality endpoints
 
 ### Phase 3 (Future)
 - [ ] Authenticated CLOB integration

@@ -2039,5 +2039,405 @@ def approve_risk_events(
     console.print(table)
 
 
+# =============================================================================
+# Evaluation Pipeline Commands (Phase 4)
+# =============================================================================
+
+eval_app = typer.Typer(help="Evaluation pipeline commands for automated strategy validation")
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("run")
+def eval_run(
+    strategy: Annotated[
+        str,
+        typer.Option("--strategy", "-s", help="Strategy to evaluate: arb, statarb, observer"),
+    ] = "arb",
+    version: Annotated[
+        str,
+        typer.Option("--version", help="Strategy version string"),
+    ] = "v1",
+    last_times: Annotated[
+        int,
+        typer.Option("--last-times", help="Quality window: last K snapshot times"),
+    ] = 30,
+    interval: Annotated[
+        int,
+        typer.Option("--interval", "-i", help="Expected snapshot interval in seconds"),
+    ] = 60,
+    paper_minutes: Annotated[
+        int,
+        typer.Option("--paper-minutes", help="Optional paper trading smoke test duration (0=skip)"),
+    ] = 0,
+    quantity: Annotated[
+        float,
+        typer.Option("--quantity", "-q", help="Trade quantity for backtest"),
+    ] = 10.0,
+    balance: Annotated[
+        float,
+        typer.Option("--balance", "-b", help="Initial balance for backtest"),
+    ] = 10000.0,
+) -> None:
+    """Run automated evaluation pipeline.
+
+    Executes end-to-end strategy validation:
+    1. Check data quality (must be READY)
+    2. Run deterministic backtest
+    3. Evaluate for approval
+    4. Optional paper trading smoke test
+    5. Generate report
+
+    Example:
+        pmq eval run --strategy arb --version v1 --last-times 30
+        pmq eval run --strategy observer --version v1 --last-times 30 --paper-minutes 10
+    """
+    from pmq.evaluation import EvaluationPipeline, EvaluationReporter
+
+    console.print(
+        f"\n[bold green]Starting Evaluation Pipeline[/bold green]\n"
+        f"Strategy: {strategy} v{version}\n"
+        f"Quality Window: last {last_times} snapshots\n"
+        f"Interval: {interval}s\n"
+        f"Paper Minutes: {paper_minutes if paper_minutes > 0 else 'skip'}\n"
+    )
+
+    dao = DAO()
+    pipeline = EvaluationPipeline(dao=dao)
+    reporter = EvaluationReporter(dao=dao)
+
+    with console.status("[bold green]Running evaluation pipeline..."):
+        result = pipeline.run(
+            strategy_name=strategy,
+            strategy_version=version,
+            window_mode="last_times",
+            window_value=last_times,
+            interval_seconds=interval,
+            paper_minutes=paper_minutes if paper_minutes > 0 else None,
+            quantity=quantity,
+            initial_balance=balance,
+        )
+
+        # Save reports as artifacts
+        reporter.save_report_to_db(result.eval_id, result=result)
+
+    # Display results
+    status_color = "green" if result.final_status == "PASSED" else "red"
+    status_emoji = "✅" if result.final_status == "PASSED" else "❌"
+
+    console.print(f"\n[bold]Evaluation Complete {status_emoji}[/bold]")
+    console.print(f"Eval ID: [cyan]{result.eval_id}[/cyan]")
+    console.print(f"Final Status: [{status_color}]{result.final_status}[/{status_color}]")
+
+    # Summary table
+    table = Table(title="Evaluation Results")
+    table.add_column("Step", style="cyan")
+    table.add_column("Result", justify="right")
+
+    # Quality
+    quality_color = "green" if result.ready_for_scorecard else "yellow"
+    table.add_row("Data Quality", f"[{quality_color}]{result.quality_status}[/{quality_color}]")
+    table.add_row("Maturity Score", f"{result.maturity_score}/100")
+    table.add_row("Ready for Scorecard", "Yes" if result.ready_for_scorecard else "No")
+
+    # Backtest
+    if result.backtest_run_id:
+        pnl_color = "green" if result.backtest_pnl >= 0 else "red"
+        table.add_row("Backtest PnL", f"[{pnl_color}]${result.backtest_pnl:.2f}[/{pnl_color}]")
+        table.add_row("Backtest Score", f"{result.backtest_score:.1f}/100")
+
+    # Approval
+    approval_color = "green" if result.approval_status == "PASSED" else "red"
+    table.add_row("Approval", f"[{approval_color}]{result.approval_status}[/{approval_color}]")
+
+    # Paper
+    if result.paper_run_id:
+        table.add_row("Paper Trades", str(result.paper_trades_count))
+        table.add_row("Paper Errors", str(result.paper_errors_count))
+
+    console.print(table)
+
+    # Summary
+    console.print(f"\n[bold]Summary:[/bold] {result.summary}")
+
+    # Commands executed
+    if result.commands:
+        console.print("\n[dim]Commands executed:[/dim]")
+        for cmd in result.commands:
+            console.print(f"  [dim]$ {cmd}[/dim]")
+
+    console.print(f"\n[dim]View details: pmq eval report --id {result.eval_id}[/dim]")
+    console.print(f"[dim]Export report: pmq eval export --id {result.eval_id} --format md[/dim]")
+
+
+@eval_app.command("list")
+def eval_list(
+    strategy: Annotated[
+        str | None,
+        typer.Option("--strategy", "-s", help="Filter by strategy"),
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option("--status", help="Filter by status: PASSED, FAILED, PENDING"),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum evaluations to show"),
+    ] = 20,
+) -> None:
+    """List recent evaluation runs.
+
+    Example:
+        pmq eval list
+        pmq eval list --strategy arb --status PASSED
+    """
+    from pmq.evaluation import EvaluationReporter
+
+    dao = DAO()
+    reporter = EvaluationReporter(dao=dao)
+
+    evals = reporter.list_evaluations(
+        limit=limit,
+        strategy_name=strategy,
+        status=status,
+    )
+
+    if not evals:
+        console.print("[dim]No evaluations found[/dim]")
+        return
+
+    table = Table(title="Evaluation Runs")
+    table.add_column("ID", style="cyan", max_width=12)
+    table.add_column("Strategy")
+    table.add_column("Version")
+    table.add_column("Score", justify="right")
+    table.add_column("Status")
+    table.add_column("Maturity", justify="right")
+    table.add_column("Created")
+
+    for ev in evals:
+        eval_id_short = ev["id"][:8] + "..."
+        status_str = ev.get("final_status", "PENDING")
+        status_color = {"PASSED": "green", "FAILED": "red", "PENDING": "yellow"}.get(
+            status_str, "dim"
+        )
+
+        score = ev.get("backtest_score", 0)
+        maturity = ev.get("maturity_score", 0)
+
+        table.add_row(
+            eval_id_short,
+            ev.get("strategy_name", "—"),
+            ev.get("strategy_version", "—"),
+            f"{score:.1f}" if score else "—",
+            f"[{status_color}]{status_str}[/{status_color}]",
+            f"{maturity}/100" if maturity else "—",
+            ev["created_at"][:19],
+        )
+
+    console.print(table)
+
+
+@eval_app.command("report")
+def eval_report(
+    eval_id: Annotated[
+        str,
+        typer.Option("--id", help="Evaluation ID"),
+    ],
+    show_artifacts: Annotated[
+        bool,
+        typer.Option("--artifacts", help="Show artifact details"),
+    ] = False,
+) -> None:
+    """Display detailed report for an evaluation.
+
+    Example:
+        pmq eval report --id abc123
+        pmq eval report --id abc123 --artifacts
+    """
+    from pmq.evaluation import EvaluationReporter
+
+    dao = DAO()
+    reporter = EvaluationReporter(dao=dao)
+
+    # Get evaluation
+    eval_data = reporter.get_evaluation(eval_id)
+    if not eval_data:
+        console.print(f"[red]Evaluation not found: {eval_id}[/red]")
+        raise typer.Exit(1)
+
+    # Display header
+    final_status = eval_data.get("final_status", "UNKNOWN")
+    status_emoji = "✅" if final_status == "PASSED" else "❌"
+    status_color = "green" if final_status == "PASSED" else "red"
+
+    console.print(f"\n[bold]Evaluation Report {status_emoji}[/bold]")
+    console.print(f"ID: [cyan]{eval_id}[/cyan]")
+    console.print(
+        f"Strategy: [cyan]{eval_data.get('strategy_name', 'N/A')} "
+        f"v{eval_data.get('strategy_version', 'N/A')}[/cyan]"
+    )
+    console.print(f"Created: {eval_data.get('created_at', 'N/A')[:19]}")
+    console.print(f"Git SHA: [dim]{eval_data.get('git_sha', 'N/A')}[/dim]")
+    console.print(f"Final Status: [{status_color}]{final_status}[/{status_color}]")
+
+    # Summary
+    console.print(f"\n[bold]Summary:[/bold] {eval_data.get('summary', 'N/A')}")
+
+    # Quality section
+    console.print("\n[bold]Step 1: Data Quality[/bold]")
+    quality_table = Table()
+    quality_table.add_column("Metric", style="cyan")
+    quality_table.add_column("Value")
+
+    quality_table.add_row("Window Mode", eval_data.get("window_mode", "N/A"))
+    quality_table.add_row("Status", eval_data.get("quality_status", "N/A"))
+    quality_table.add_row("Maturity Score", f"{eval_data.get('maturity_score', 0)}/100")
+    quality_table.add_row(
+        "Ready for Scorecard", "Yes" if eval_data.get("ready_for_scorecard") else "No"
+    )
+    if eval_data.get("window_from") and eval_data.get("window_to"):
+        quality_table.add_row(
+            "Window",
+            f"{eval_data['window_from'][:19]} to {eval_data['window_to'][:19]}",
+        )
+
+    console.print(quality_table)
+
+    # Backtest section
+    if eval_data.get("backtest_run_id"):
+        console.print("\n[bold]Step 2: Backtest[/bold]")
+        backtest_table = Table()
+        backtest_table.add_column("Metric", style="cyan")
+        backtest_table.add_column("Value", justify="right")
+
+        pnl = eval_data.get("backtest_pnl", 0)
+        pnl_color = "green" if pnl >= 0 else "red"
+        backtest_table.add_row("Run ID", eval_data["backtest_run_id"][:16] + "...")
+        backtest_table.add_row("PnL", f"[{pnl_color}]${pnl:.2f}[/{pnl_color}]")
+        backtest_table.add_row("Score", f"{eval_data.get('backtest_score', 0):.1f}/100")
+
+        console.print(backtest_table)
+
+    # Approval section
+    console.print("\n[bold]Step 3: Approval[/bold]")
+    approval_status = eval_data.get("approval_status", "PENDING")
+    approval_color = "green" if approval_status == "PASSED" else "red"
+    console.print(f"Status: [{approval_color}]{approval_status}[/{approval_color}]")
+
+    import json as json_module
+
+    reasons_json = eval_data.get("approval_reasons_json")
+    if reasons_json:
+        try:
+            reasons = json_module.loads(reasons_json)
+            if reasons:
+                console.print("Reasons:")
+                for reason in reasons:
+                    icon = "✓" if "pass" in reason.lower() or "ok" in reason.lower() else "✗"
+                    color = "green" if icon == "✓" else "red"
+                    console.print(f"  [{color}]{icon}[/{color}] {reason}")
+        except json_module.JSONDecodeError:
+            pass
+
+    # Paper section
+    if eval_data.get("paper_run_id"):
+        console.print("\n[bold]Step 4: Paper Trading[/bold]")
+        paper_table = Table()
+        paper_table.add_column("Metric", style="cyan")
+        paper_table.add_column("Value", justify="right")
+
+        paper_table.add_row("Run ID", eval_data["paper_run_id"])
+        paper_table.add_row("Trades", str(eval_data.get("paper_trades_count", 0)))
+        paper_table.add_row("Errors", str(eval_data.get("paper_errors_count", 0)))
+
+        console.print(paper_table)
+
+    # Commands
+    commands_json = eval_data.get("commands_json")
+    if commands_json:
+        try:
+            commands = json_module.loads(commands_json)
+            if commands:
+                console.print("\n[bold]Commands Executed:[/bold]")
+                for cmd in commands:
+                    console.print(f"  [dim]$ {cmd}[/dim]")
+        except json_module.JSONDecodeError:
+            pass
+
+    # Artifacts
+    if show_artifacts:
+        artifacts = reporter.get_artifacts(eval_id)
+        if artifacts:
+            console.print("\n[bold]Artifacts:[/bold]")
+            for art in artifacts:
+                console.print(f"  • {art['kind']} ({len(art['content'])} bytes) @ {art['created_at'][:19]}")
+
+    console.print(
+        f"\n[dim]Export: pmq eval export --id {eval_id} --format md|json|csv[/dim]"
+    )
+
+
+@eval_app.command("export")
+def eval_export(
+    eval_id: Annotated[
+        str,
+        typer.Option("--id", help="Evaluation ID"),
+    ],
+    format_type: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Export format: md, json, csv"),
+    ] = "md",
+    output_dir: Annotated[
+        Path,
+        typer.Option("--out", "-o", help="Output directory"),
+    ] = Path("exports"),
+) -> None:
+    """Export evaluation report to file.
+
+    Example:
+        pmq eval export --id abc123 --format md
+        pmq eval export --id abc123 --format json --out reports/
+    """
+    from pmq.evaluation import EvaluationReporter
+
+    dao = DAO()
+    reporter = EvaluationReporter(dao=dao)
+
+    # Check evaluation exists
+    eval_data = reporter.get_evaluation(eval_id)
+    if not eval_data:
+        console.print(f"[red]Evaluation not found: {eval_id}[/red]")
+        raise typer.Exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    eval_id_short = eval_id[:8]
+
+    if format_type == "md":
+        content = reporter.generate_report_md(eval_data=eval_data)
+        filename = output_dir / f"eval_{eval_id_short}_{timestamp}.md"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+        console.print(f"[green]✓ Exported markdown report to {filename}[/green]")
+
+    elif format_type == "json":
+        content = reporter.generate_report_json(eval_data=eval_data)
+        filename = output_dir / f"eval_{eval_id_short}_{timestamp}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+        console.print(f"[green]✓ Exported JSON report to {filename}[/green]")
+
+    elif format_type == "csv":
+        content = reporter.generate_report_csv(eval_data=eval_data)
+        filename = output_dir / f"eval_{eval_id_short}_{timestamp}.csv"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+        console.print(f"[green]✓ Exported CSV report to {filename}[/green]")
+
+    else:
+        console.print(f"[red]Unknown format: {format_type}. Use: md, json, csv[/red]")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

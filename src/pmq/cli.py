@@ -2077,6 +2077,10 @@ def eval_run(
         float,
         typer.Option("--balance", "-b", help="Initial balance for backtest"),
     ] = 10000.0,
+    pairs_config: Annotated[
+        str | None,
+        typer.Option("--pairs", "-p", help="Pairs config file (required for statarb)"),
+    ] = None,
 ) -> None:
     """Run automated evaluation pipeline.
 
@@ -2087,17 +2091,24 @@ def eval_run(
     4. Optional paper trading smoke test
     5. Generate report
 
+    For statarb strategy, --pairs is required. Generate with:
+        pmq statarb pairs suggest --out config/pairs.yml
+
     Example:
         pmq eval run --strategy arb --version v1 --last-times 30
+        pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml --last-times 30
         pmq eval run --strategy observer --version v1 --last-times 30 --paper-minutes 10
     """
     from pmq.evaluation import EvaluationPipeline, EvaluationReporter
 
+    # Print startup info
+    pairs_info = f"Pairs: {pairs_config}" if pairs_config else "Pairs: N/A"
     console.print(
         f"\n[bold green]Starting Evaluation Pipeline[/bold green]\n"
         f"Strategy: {strategy} v{version}\n"
         f"Quality Window: last {last_times} snapshots\n"
         f"Interval: {interval}s\n"
+        f"{pairs_info}\n"
         f"Paper Minutes: {paper_minutes if paper_minutes > 0 else 'skip'}\n"
     )
 
@@ -2105,20 +2116,25 @@ def eval_run(
     pipeline = EvaluationPipeline(dao=dao)
     reporter = EvaluationReporter(dao=dao)
 
-    with console.status("[bold green]Running evaluation pipeline..."):
-        result = pipeline.run(
-            strategy_name=strategy,
-            strategy_version=version,
-            window_mode="last_times",
-            window_value=last_times,
-            interval_seconds=interval,
-            paper_minutes=paper_minutes if paper_minutes > 0 else None,
-            quantity=quantity,
-            initial_balance=balance,
-        )
+    try:
+        with console.status("[bold green]Running evaluation pipeline..."):
+            result = pipeline.run(
+                strategy_name=strategy,
+                strategy_version=version,
+                window_mode="last_times",
+                window_value=last_times,
+                interval_seconds=interval,
+                paper_minutes=paper_minutes if paper_minutes > 0 else None,
+                quantity=quantity,
+                initial_balance=balance,
+                pairs_config=pairs_config,
+            )
 
-        # Save reports as artifacts
-        reporter.save_report_to_db(result.eval_id, result=result)
+            # Save reports as artifacts
+            reporter.save_report_to_db(result.eval_id, result=result)
+    except ValueError as e:
+        console.print(f"[red]Evaluation failed: {e}[/red]")
+        raise typer.Exit(1) from e
 
     # Display results
     status_color = "green" if result.final_status == "PASSED" else "red"
@@ -2437,6 +2453,392 @@ def eval_export(
     else:
         console.print(f"[red]Unknown format: {format_type}. Use: md, json, csv[/red]")
         raise typer.Exit(1)
+
+
+# =============================================================================
+# StatArb Commands (Phase 4.1)
+# =============================================================================
+
+statarb_app = typer.Typer(help="Statistical arbitrage commands")
+app.add_typer(statarb_app, name="statarb")
+
+
+@statarb_app.command("pairs")
+def statarb_pairs(
+    action: Annotated[
+        str,
+        typer.Argument(help="Action: validate, suggest"),
+    ],
+    pairs_config: Annotated[
+        Path,
+        typer.Option("--pairs", "-p", help="Path to pairs config file"),
+    ] = Path("config/pairs.yml"),
+    last_times: Annotated[
+        int,
+        typer.Option("--last-times", help="For suggest: use last K snapshot times"),
+    ] = 30,
+    _interval: Annotated[
+        int,
+        typer.Option("--interval", "-i", help="For suggest: expected snapshot interval seconds"),
+    ] = 60,  # noqa: ARG001 - reserved for future use
+    output: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="For suggest: output file path"),
+    ] = None,
+    top: Annotated[
+        int,
+        typer.Option("--top", help="For suggest: maximum pairs to suggest"),
+    ] = 50,
+) -> None:
+    """Validate or generate pairs configuration.
+
+    Actions:
+        validate - Validate an existing pairs config file
+        suggest  - Generate candidate pairs from captured snapshot data (DB-only)
+
+    Example:
+        pmq statarb pairs validate --pairs config/pairs.yml
+        pmq statarb pairs suggest --last-times 30 --interval 60 --out config/pairs.yml
+    """
+    from pmq.statarb import PairsConfigError, load_validated_pairs_config
+    from pmq.statarb.pairs_config import PairConfig, generate_pairs_yaml
+
+    if action == "validate":
+        try:
+            result = load_validated_pairs_config(pairs_config)
+            console.print("[green]✓ Valid pairs configuration[/green]")
+            console.print(f"  File: {result.config_path}")
+            console.print(f"  Hash: {result.config_hash}")
+            console.print(f"  Enabled pairs: {len(result.enabled_pairs)}")
+            console.print(f"  Disabled pairs: {len(result.disabled_pairs)}")
+
+            if result.warnings:
+                for w in result.warnings:
+                    console.print(f"  [yellow]⚠ {w}[/yellow]")
+
+            # Show pairs
+            if result.enabled_pairs:
+                table = Table(title="Enabled Pairs")
+                table.add_column("Name", style="cyan")
+                table.add_column("Market A", max_width=20)
+                table.add_column("Market B", max_width=20)
+                table.add_column("Correlation")
+
+                for p in result.enabled_pairs:
+                    table.add_row(
+                        p.name,
+                        f"{p.market_a_id[:16]}...",
+                        f"{p.market_b_id[:16]}...",
+                        str(p.correlation),
+                    )
+                console.print(table)
+
+        except PairsConfigError as e:
+            console.print("[red]✗ Invalid pairs configuration[/red]")
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
+
+    elif action == "suggest":
+        # Suggest pairs from snapshot data (DB-only, no live API)
+        dao = DAO()
+
+        # Get recent snapshot times
+        snapshot_times = dao.get_recent_snapshot_times(limit=last_times)
+        if not snapshot_times:
+            console.print("[red]No snapshots found. Run 'pmq sync --snapshot' first.[/red]")
+            raise typer.Exit(1)
+
+        console.print(f"[cyan]Analyzing {len(snapshot_times)} snapshot times...[/cyan]")
+
+        # Get all markets from these snapshots
+        start_time = snapshot_times[0]
+        end_time = snapshot_times[-1]
+        snapshots = dao.get_snapshots(start_time, end_time)
+
+        # Group snapshots by market
+        market_snapshots: dict[str, list[dict[str, Any]]] = {}
+        for snap in snapshots:
+            mid = snap["market_id"]
+            if mid not in market_snapshots:
+                market_snapshots[mid] = []
+            market_snapshots[mid].append(snap)
+
+        # Get market metadata
+        market_ids = list(market_snapshots.keys())
+        markets = {m["id"]: m for m in dao.get_markets_by_ids(market_ids)}
+
+        console.print(f"[cyan]Found {len(markets)} unique markets with snapshot data[/cyan]")
+
+        # Simple heuristic: Group markets by slug prefix (related events)
+        # This is a basic approach; more sophisticated methods could use
+        # question similarity, event grouping, etc.
+        slug_groups: dict[str, list[str]] = {}
+        for mid, market in markets.items():
+            slug = market.get("slug", "")
+            if not slug:
+                continue
+            # Extract prefix (first 2-3 words or event slug)
+            parts = slug.split("-")
+            prefix = "-".join(parts[:3]) if len(parts) >= 3 else slug
+            if prefix not in slug_groups:
+                slug_groups[prefix] = []
+            slug_groups[prefix].append(mid)
+
+        # Generate pairs from groups (markets with same prefix)
+        suggested_pairs: list[PairConfig] = []
+        pair_count = 0
+
+        for prefix, group_ids in sorted(slug_groups.items(), key=lambda x: -len(x[1])):
+            if len(group_ids) < 2:
+                continue
+            if pair_count >= top:
+                break
+
+            # Create pairs within the group
+            for i, market_a_id in enumerate(group_ids):
+                if pair_count >= top:
+                    break
+                for market_b_id in group_ids[i + 1 :]:
+                    if pair_count >= top:
+                        break
+
+                    market_a = markets.get(market_a_id, {})
+                    market_b = markets.get(market_b_id, {})
+
+                    # Skip if either market has low coverage
+                    a_snapshots = len(market_snapshots.get(market_a_id, []))
+                    b_snapshots = len(market_snapshots.get(market_b_id, []))
+                    if a_snapshots < 5 or b_snapshots < 5:
+                        continue
+
+                    q_a = market_a.get("question", "")[:30]
+                    q_b = market_b.get("question", "")[:30]
+                    name = f"{prefix}: {q_a} vs {q_b}"
+                    suggested_pairs.append(
+                        PairConfig(
+                            market_a_id=market_a_id,
+                            market_b_id=market_b_id,
+                            name=name[:80],
+                            correlation=1.0,
+                            enabled=True,
+                        )
+                    )
+                    pair_count += 1
+
+        if not suggested_pairs:
+            console.print(
+                "[yellow]No pairs could be suggested from snapshot data.\n"
+                "This could mean:\n"
+                "  - Markets don't have enough shared slug prefixes\n"
+                "  - Not enough snapshots collected yet\n"
+                "  - Markets are too diverse (no related events)\n\n"
+                "Try collecting more snapshots or manually creating pairs.[/yellow]"
+            )
+            raise typer.Exit(1)
+
+        console.print(f"[green]✓ Suggested {len(suggested_pairs)} pairs[/green]")
+
+        # Generate YAML
+        timestamp = datetime.now(UTC).isoformat()[:19]
+        yaml_content = generate_pairs_yaml(
+            suggested_pairs,
+            header_comment=f"Generated from {len(snapshot_times)} snapshots on {timestamp}",
+        )
+
+        # Output
+        output_path = output or pairs_config
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(yaml_content)
+
+        console.print(f"[green]✓ Saved pairs config to {output_path}[/green]")
+        console.print("[dim]Review and edit the file, then run 'pmq statarb pairs validate'[/dim]")
+
+    else:
+        console.print(f"[red]Unknown action: {action}. Use: validate, suggest[/red]")
+        raise typer.Exit(1)
+
+
+@statarb_app.command("explain")
+def statarb_explain(
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (ISO format or YYYY-MM-DD)"),
+    ],
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (ISO format or YYYY-MM-DD)"),
+    ],
+    pairs_config: Annotated[
+        Path,
+        typer.Option("--pairs", "-p", help="Path to pairs config file"),
+    ] = Path("config/pairs.yml"),
+) -> None:
+    """Explain why statarb produced zero or few signals.
+
+    Provides deterministic diagnostics from captured snapshot data:
+    - Number of snapshots in window
+    - Per-pair: data coverage, spread statistics, signal counts, skip reasons
+
+    This command is fully deterministic and does not call live APIs.
+
+    Example:
+        pmq statarb explain --from 2024-12-30 --to 2024-12-30 --pairs config/pairs.yml
+    """
+    from pmq.statarb import PairsConfigError, load_validated_pairs_config
+
+    # Normalize dates
+    if len(from_date) == 10:
+        from_date = f"{from_date}T00:00:00"
+    if len(to_date) == 10:
+        to_date = f"{to_date}T23:59:59"
+
+    # Load pairs config
+    try:
+        pairs_result = load_validated_pairs_config(pairs_config)
+    except PairsConfigError as e:
+        console.print(f"[red]Failed to load pairs config: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    dao = DAO()
+    settings = get_settings()
+
+    # Get snapshots in window
+    snapshot_times = dao.get_snapshot_times(from_date, to_date)
+    if not snapshot_times:
+        console.print(f"[red]No snapshots found in window {from_date} to {to_date}[/red]")
+        console.print("[dim]Run 'pmq sync --snapshot' to collect data first.[/dim]")
+        raise typer.Exit(1)
+
+    console.print("\n[bold]StatArb Signal Analysis[/bold]")
+    console.print(f"Window: {from_date} to {to_date}")
+    console.print(f"Pairs config: {pairs_config} (hash: {pairs_result.config_hash})")
+    console.print(f"Entry threshold: {settings.statarb.entry_threshold}")
+
+    # Summary stats
+    console.print("\n[bold]Data Summary[/bold]")
+    console.print(f"  Snapshot times: {len(snapshot_times)}")
+    console.print(f"  First snapshot: {snapshot_times[0]}")
+    console.print(f"  Last snapshot: {snapshot_times[-1]}")
+    console.print(f"  Enabled pairs: {len(pairs_result.enabled_pairs)}")
+
+    # Analyze each pair
+    pair_stats: list[dict[str, Any]] = []
+
+    for pair in pairs_result.enabled_pairs:
+        stats: dict[str, Any] = {
+            "name": pair.name,
+            "market_a_id": pair.market_a_id,
+            "market_b_id": pair.market_b_id,
+            "correlation": pair.correlation,
+            "a_snapshot_count": 0,
+            "b_snapshot_count": 0,
+            "both_count": 0,
+            "spreads": [],
+            "signal_count": 0,
+            "skip_reasons": [],
+        }
+
+        # Get snapshots for both markets
+        a_snapshots = dao.get_snapshots(from_date, to_date, [pair.market_a_id])
+        b_snapshots = dao.get_snapshots(from_date, to_date, [pair.market_b_id])
+
+        stats["a_snapshot_count"] = len(a_snapshots)
+        stats["b_snapshot_count"] = len(b_snapshots)
+
+        if not a_snapshots:
+            stats["skip_reasons"].append("Market A has no snapshots in window")
+        if not b_snapshots:
+            stats["skip_reasons"].append("Market B has no snapshots in window")
+
+        if a_snapshots and b_snapshots:
+            # Index by time
+            a_by_time = {s["snapshot_time"]: s for s in a_snapshots}
+            b_by_time = {s["snapshot_time"]: s for s in b_snapshots}
+
+            # Find overlapping times
+            common_times = set(a_by_time.keys()) & set(b_by_time.keys())
+            stats["both_count"] = len(common_times)
+
+            if not common_times:
+                stats["skip_reasons"].append("No overlapping snapshot times")
+            else:
+                # Calculate spreads
+                for t in sorted(common_times):
+                    price_a = a_by_time[t]["yes_price"]
+                    price_b = b_by_time[t]["yes_price"]
+
+                    if price_a <= 0 or price_b <= 0:
+                        continue
+
+                    if pair.correlation < 0:
+                        spread = price_a - (1.0 - price_b)
+                    else:
+                        spread = price_a - price_b
+
+                    stats["spreads"].append(spread)
+
+                    if abs(spread) > settings.statarb.entry_threshold:
+                        stats["signal_count"] += 1
+
+                if not stats["spreads"]:
+                    stats["skip_reasons"].append("All prices were zero or invalid")
+
+        pair_stats.append(stats)
+
+    # Display results
+    console.print("\n[bold]Per-Pair Analysis[/bold]")
+
+    total_signals = 0
+    table = Table()
+    table.add_column("Pair", style="cyan", max_width=30)
+    table.add_column("A Snaps", justify="right")
+    table.add_column("B Snaps", justify="right")
+    table.add_column("Both", justify="right")
+    table.add_column("Avg Spread", justify="right")
+    table.add_column("Max |Spread|", justify="right")
+    table.add_column("Signals", justify="right")
+    table.add_column("Skip Reasons", max_width=30)
+
+    for s in pair_stats:
+        avg_spread = sum(s["spreads"]) / len(s["spreads"]) if s["spreads"] else 0
+        max_abs_spread = max(abs(x) for x in s["spreads"]) if s["spreads"] else 0
+        total_signals += s["signal_count"]
+
+        signal_color = "green" if s["signal_count"] > 0 else "dim"
+        skip_text = "; ".join(s["skip_reasons"][:2]) if s["skip_reasons"] else "—"
+
+        table.add_row(
+            s["name"][:30],
+            str(s["a_snapshot_count"]),
+            str(s["b_snapshot_count"]),
+            str(s["both_count"]),
+            f"{avg_spread:.4f}",
+            f"{max_abs_spread:.4f}",
+            f"[{signal_color}]{s['signal_count']}[/{signal_color}]",
+            skip_text,
+        )
+
+    console.print(table)
+
+    # Summary
+    console.print("\n[bold]Summary[/bold]")
+    console.print(f"  Total potential signals: {total_signals}")
+    if total_signals == 0:
+        console.print(
+            f"\n[yellow]No signals detected. Possible causes:[/yellow]\n"
+            f"  • Entry threshold ({settings.statarb.entry_threshold}) may be too high\n"
+            f"  • Pairs may not have enough spread divergence\n"
+            f"  • Markets may not have overlapping snapshot coverage\n"
+            f"  • Market IDs may not exist in snapshot data\n\n"
+            f"[dim]Try adjusting PMQ_STATARB_ENTRY_THRESHOLD or updating pairs config.[/dim]"
+        )
+    else:
+        console.print(
+            "\n[green]Signals were detected. If backtest still shows 0 trades:[/green]\n"
+            "  • Ensure backtest date range matches this analysis\n"
+            "  • Check that --pairs flag is passed to backtest command"
+        )
 
 
 if __name__ == "__main__":

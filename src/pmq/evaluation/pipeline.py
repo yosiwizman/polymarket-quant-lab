@@ -109,6 +109,7 @@ class EvaluationPipeline:
         initial_balance: float = 10000.0,
         window_from: str | None = None,
         window_to: str | None = None,
+        pairs_config: str | None = None,
     ) -> EvaluationResult:
         """Run the full evaluation pipeline.
 
@@ -123,6 +124,7 @@ class EvaluationPipeline:
             initial_balance: Starting balance for backtest
             window_from: Explicit window start (for explicit mode)
             window_to: Explicit window end (for explicit mode)
+            pairs_config: Path to pairs config file (required for statarb)
 
         Returns:
             EvaluationResult with all step outcomes
@@ -132,6 +134,31 @@ class EvaluationPipeline:
         git_sha = _get_git_sha()
 
         logger.info(f"Starting evaluation {eval_id}: {strategy_name} v{strategy_version}")
+
+        # Early check: statarb requires pairs config
+        pairs_config_result = None
+        if strategy_name == "statarb":
+            if not pairs_config:
+                raise ValueError(
+                    "statarb strategy requires --pairs config. "
+                    "Run 'pmq statarb pairs suggest' to generate one, or "
+                    "provide an existing config with --pairs config/pairs.yml"
+                )
+            # Validate pairs config
+            from pathlib import Path
+
+            from pmq.statarb import PairsConfigError, load_validated_pairs_config
+
+            try:
+                pairs_config_result = load_validated_pairs_config(Path(pairs_config))
+            except PairsConfigError as e:
+                raise ValueError(f"Invalid pairs config: {e}") from e
+
+            if not pairs_config_result.has_enabled_pairs:
+                raise ValueError(
+                    f"No enabled pairs in {pairs_config}. "
+                    "Enable at least one pair or run 'pmq statarb pairs suggest'."
+                )
 
         # Create evaluation record
         self._dao.create_evaluation_run(
@@ -216,11 +243,14 @@ class EvaluationPipeline:
             return result
 
         # Step 2: Run backtest
-        self._log_command(
+        backtest_cmd = (
             f"pmq backtest run --strategy {strategy_name} "
             f"--from {quality_result.window_from[:10]} --to {quality_result.window_to[:10]} "
             f"--balance {initial_balance} --quantity {quantity}"
         )
+        if pairs_config:
+            backtest_cmd += f" --pairs {pairs_config}"
+        self._log_command(backtest_cmd)
 
         backtest_result = self._run_backtest(
             strategy_name=strategy_name,
@@ -228,7 +258,24 @@ class EvaluationPipeline:
             end_date=quality_result.window_to,
             quantity=quantity,
             initial_balance=initial_balance,
+            pairs_config=pairs_config,
         )
+
+        # Save pairs config artifact if used
+        if pairs_config_result:
+            self._dao.save_evaluation_artifact(
+                evaluation_id=eval_id,
+                kind="PAIRS_CONFIG_JSON",
+                content=json.dumps(
+                    {
+                        "path": pairs_config_result.config_path,
+                        "hash": pairs_config_result.config_hash,
+                        "enabled_pairs": len(pairs_config_result.enabled_pairs),
+                        "disabled_pairs": len(pairs_config_result.disabled_pairs),
+                        "pairs": [p.to_dict() for p in pairs_config_result.enabled_pairs],
+                    }
+                ),
+            )
 
         result.backtest_run_id = backtest_result["run_id"]
         result.backtest_pnl = backtest_result["metrics"].total_pnl
@@ -401,6 +448,7 @@ class EvaluationPipeline:
         end_date: str,
         quantity: float,
         initial_balance: float,
+        pairs_config: str | None = None,
     ) -> dict[str, Any]:
         """Run backtest for the strategy."""
         runner = BacktestRunner(dao=self._dao, initial_balance=initial_balance)
@@ -409,6 +457,13 @@ class EvaluationPipeline:
             run_id, metrics = runner.run_arb_backtest(
                 start_date=start_date,
                 end_date=end_date,
+                quantity=quantity,
+            )
+        elif strategy_name == "statarb":
+            run_id, metrics = runner.run_statarb_backtest(
+                start_date=start_date,
+                end_date=end_date,
+                pairs_config=pairs_config,
                 quantity=quantity,
             )
         elif strategy_name == "observer":
@@ -420,7 +475,7 @@ class EvaluationPipeline:
                 threshold=0.0,  # Impossible threshold
             )
         else:
-            # Default to arb for now
+            # Default to arb for unknown strategies
             run_id, metrics = runner.run_arb_backtest(
                 start_date=start_date,
                 end_date=end_date,

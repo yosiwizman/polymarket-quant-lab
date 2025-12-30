@@ -8,11 +8,18 @@ Exit: abs(spread) < exit_threshold
 """
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-from pmq.config import StatArbConfig, get_settings, load_pairs_config
+from pmq.config import StatArbConfig, get_settings
 from pmq.logging import get_logger, log_trade_event
 from pmq.models import GammaMarket, StatArbSignal
+from pmq.statarb.pairs_config import (
+    PairConfig,
+    PairsConfigError,
+    PairsConfigResult,
+    load_validated_pairs_config,
+)
 
 logger = get_logger("strategies.statarb")
 
@@ -50,6 +57,16 @@ class StatArbPair:
             correlation=data.get("correlation", 1.0),
         )
 
+    @classmethod
+    def from_pair_config(cls, config: PairConfig) -> "StatArbPair":
+        """Create pair from validated PairConfig."""
+        return cls(
+            market_a_id=config.market_a_id,
+            market_b_id=config.market_b_id,
+            name=config.name,
+            correlation=config.correlation,
+        )
+
 
 class StatArbScanner:
     """Scanner for statistical arbitrage opportunities between market pairs.
@@ -66,28 +83,49 @@ class StatArbScanner:
 
         Args:
             config: Stat-arb configuration
-            pairs: List of pairs to monitor (loads from config file if not provided)
+            pairs: List of pairs to monitor (loads from config file if None)
         """
         self._config = config or get_settings().statarb
-        self._pairs = pairs or self._load_pairs()
+        # Explicitly check for None to allow passing an empty list
+        self._pairs = pairs if pairs is not None else self._load_pairs()
         logger.debug(
             f"StatArbScanner initialized: entry={self._config.entry_threshold}, "
             f"exit={self._config.exit_threshold}, pairs={len(self._pairs)}"
         )
 
     def _load_pairs(self) -> list[StatArbPair]:
-        """Load pairs from configuration file."""
-        pairs_data = load_pairs_config(self._config.pairs_file)
+        """Load pairs from configuration file.
+
+        Uses validated config loader. Returns empty list if file not found
+        (soft failure for backward compatibility - callers should check).
+        """
         pairs: list[StatArbPair] = []
-        if not pairs_data:
+        pairs_file = Path(self._config.pairs_file)
+
+        if not pairs_file.exists():
+            logger.warning(
+                f"Pairs config not found: {pairs_file}. "
+                f"Run 'pmq statarb pairs suggest' to generate one."
+            )
             return pairs
-        for data in pairs_data:
-            try:
-                pair = StatArbPair.from_dict(data)
-                pairs.append(pair)
-            except (KeyError, TypeError) as e:
-                logger.warning(f"Invalid pair config: {e}")
+
+        try:
+            result = load_validated_pairs_config(pairs_file)
+            self._pairs_config_result = result  # Store for later inspection
+            for pair_config in result.enabled_pairs:
+                pairs.append(StatArbPair.from_pair_config(pair_config))
+            for warning in result.warnings:
+                logger.warning(warning)
+        except PairsConfigError as e:
+            logger.error(f"Failed to load pairs config: {e}")
+            # Return empty list - callers should check
+
         return pairs
+
+    @property
+    def pairs_config_result(self) -> PairsConfigResult | None:
+        """Get the validated pairs config result (if loaded)."""
+        return getattr(self, "_pairs_config_result", None)
 
     @property
     def entry_threshold(self) -> float:

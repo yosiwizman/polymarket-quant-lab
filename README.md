@@ -471,21 +471,92 @@ Each evaluation saves artifacts for reproducibility:
 | `PMQ_STATARB_ENTRY_THRESHOLD` | `0.10` | Stat-arb entry threshold |
 | `PMQ_STATARB_EXIT_THRESHOLD` | `0.02` | Stat-arb exit threshold |
 
-### Stat-Arb Pairs Configuration
+### Stat-Arb Pairs Configuration (Phase 4.1)
 
-Configure market pairs for statistical arbitrage in `config/pairs.yml`:
+Statistical arbitrage requires a pairs configuration file that defines which markets to monitor.
+
+#### Generating Pairs
+
+```powershell
+# Generate pairs from captured snapshot data (DB-only, no live API calls)
+poetry run pmq statarb pairs suggest --last-times 30 --interval 60 --out config/pairs.yml
+
+# Generate with more pairs
+poetry run pmq statarb pairs suggest --last-times 30 --top 50 --out config/pairs.yml
+```
+
+#### Validating Pairs
+
+```powershell
+# Validate an existing pairs config
+poetry run pmq statarb pairs validate --pairs config/pairs.yml
+```
+
+#### Pairs Config Schema
 
 ```yaml
 pairs:
-  - market_a_id: "0x1234..."
-    market_b_id: "0x5678..."
-    name: "BTC vs ETH prediction"
-    correlation: 1.0  # Same direction
+  - market_a_id: "123456"          # Required: Market ID (numeric or hex)
+    market_b_id: "789012"          # Required: Second market ID
+    name: "My Pair"                # Optional: Human-readable name
+    correlation: 1.0               # Optional: 1.0 = same direction, -1.0 = inverse
+    enabled: true                  # Optional: false to disable pair
+    min_liquidity: 100.0           # Optional: Minimum liquidity threshold
+    max_spread: 0.05               # Optional: Maximum spread to consider
+```
 
-  - market_a_id: "0xabcd..."
-    market_b_id: "0xefgh..."
-    name: "Inverse pair"
-    correlation: -1.0  # Opposite direction
+#### Running StatArb Evaluation
+
+```powershell
+# StatArb evaluation requires --pairs flag
+poetry run pmq eval run --strategy statarb --version v1 --last-times 30 --pairs config/pairs.yml
+
+# With paper trading smoke test
+poetry run pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml --paper-minutes 10
+```
+
+#### Debugging "0 Trades" Issues
+
+If statarb produces 0 trades, use the explain command:
+
+```powershell
+# Analyze why signals weren't generated
+poetry run pmq statarb explain --from 2024-12-30 --to 2024-12-30 --pairs config/pairs.yml
+```
+
+The explain command shows:
+- Number of snapshots in the time window
+- Per-pair analysis: coverage, spread statistics, signal counts
+- Skip reasons (missing data, no overlapping times, etc.)
+
+**Common causes of 0 trades:**
+
+1. **Entry threshold too high**: Default is 0.10 (10%). Lower it with `PMQ_STATARB_ENTRY_THRESHOLD=0.05`
+2. **Missing snapshot data**: Markets in pairs config not captured in snapshots
+3. **No overlapping times**: Markets have snapshots at different times
+4. **Pairs not enabled**: Check `enabled: true` in pairs config
+5. **Markets inactive/closed**: Skipped automatically
+
+#### End-to-End StatArb Workflow
+
+```powershell
+# 1. Start snapshot collection
+poetry run pmq snapshots run --interval 60 --duration-minutes 60
+
+# 2. Check data quality
+poetry run pmq snapshots quality --last-times 30 --interval 60
+
+# 3. Generate pairs from captured data
+poetry run pmq statarb pairs suggest --last-times 30 --out config/pairs.yml
+
+# 4. Validate and review pairs
+poetry run pmq statarb pairs validate --pairs config/pairs.yml
+
+# 5. Debug potential signals
+poetry run pmq statarb explain --from 2024-12-30 --to 2024-12-30 --pairs config/pairs.yml
+
+# 6. Run evaluation
+poetry run pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml --last-times 30
 ```
 
 ## Project Structure
@@ -533,6 +604,7 @@ polymarket-quant-lab/
 │   ├── test_quality.py     # Quality/manifest tests
 │   ├── test_governance.py  # Approval/risk gate tests
 │   ├── test_evaluation.py  # Evaluation pipeline tests
+│   ├── test_statarb.py     # StatArb pairs config tests
 │   └── test_web_and_export.py
 ├── config/
 │   └── pairs.yml           # Stat-arb pairs config
@@ -628,13 +700,21 @@ poetry run mypy src
 - [x] Dashboard governance section
 - [x] CLI approval commands (`pmq approve`)
 
-### Phase 4 (Current) ✅
+### Phase 4 ✅
 - [x] Evaluation pipeline (`pmq eval run/list/report/export`)
 - [x] Automated quality → backtest → approval flow
 - [x] Deterministic go/no-go reports (MD/JSON/CSV)
 - [x] Evaluation artifacts persistence
 - [x] Dashboard evaluations section
 - [x] API endpoints (`/api/evals`)
+
+### Phase 4.1 (Current) ✅
+- [x] StatArb pairs config validation + schema
+- [x] `pmq statarb pairs suggest` - Generate pairs from snapshots
+- [x] `pmq statarb pairs validate` - Validate pairs config
+- [x] `pmq statarb explain` - Debug 0 trades issues
+- [x] Evaluation pipeline integration (`--pairs` flag)
+- [x] Pairs config artifacts in evaluation reports
 
 ### Phase 5 (Future)
 - [ ] Authenticated CLOB integration

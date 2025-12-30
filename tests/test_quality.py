@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from pmq.quality.checks import QualityChecker, QualityResult
+from pmq.quality.checks import (
+    MIN_SNAPSHOTS_FOR_QUALITY,
+    QualityChecker,
+    QualityResult,
+    QualityStatus,
+    _parse_iso_datetime,
+)
 from pmq.quality.report import QualityReporter
 from pmq.storage.dao import DAO
 from pmq.storage.db import Database
@@ -428,3 +434,113 @@ class TestSnapshotCoverageDAO:
 
         assert len(duplicates) == 1
         assert duplicates[0]["dup_count"] == 3
+
+
+class TestTimezoneHandling:
+    """Tests for timezone-aware datetime parsing (Phase 3.1 fix)."""
+
+    def test_parse_iso_datetime_with_z(self) -> None:
+        """Parse datetime with Z suffix."""
+        dt = _parse_iso_datetime("2024-01-01T12:00:00Z")
+        assert dt.tzinfo is not None
+        assert dt.hour == 12
+
+    def test_parse_iso_datetime_with_offset(self) -> None:
+        """Parse datetime with +00:00 offset."""
+        dt = _parse_iso_datetime("2024-01-01T12:00:00+00:00")
+        assert dt.tzinfo is not None
+        assert dt.hour == 12
+
+    def test_parse_iso_datetime_naive(self) -> None:
+        """Parse naive datetime (no timezone) - assumes UTC."""
+        dt = _parse_iso_datetime("2024-01-01T12:00:00")
+        assert dt.tzinfo is not None  # Should be converted to UTC
+        assert dt.hour == 12
+
+    def test_parse_iso_datetime_comparison(self) -> None:
+        """Compare datetimes from different formats."""
+        dt1 = _parse_iso_datetime("2024-01-01T12:00:00Z")
+        dt2 = _parse_iso_datetime("2024-01-01T12:00:00+00:00")
+        dt3 = _parse_iso_datetime("2024-01-01T12:00:00")
+
+        # All should be equal (same moment in time)
+        assert dt1 == dt2
+        assert dt2 == dt3
+
+        # Subtraction should work without TypeError
+        diff = (dt1 - dt2).total_seconds()
+        assert diff == 0.0
+
+
+class TestQualityStatus:
+    """Tests for QualityStatus and INSUFFICIENT_DATA handling."""
+
+    def test_insufficient_data_when_few_snapshots(self, dao_with_db: DAO) -> None:
+        """Status is INSUFFICIENT_DATA when < 30 distinct snapshot times."""
+        _create_test_market(dao_with_db, "market_1")
+
+        # Insert only 10 snapshot times (< MIN_SNAPSHOTS_FOR_QUALITY)
+        base_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for i in range(10):
+            snapshot_time = (base_time + timedelta(minutes=i)).isoformat()
+            dao_with_db.save_snapshot(
+                market_id="market_1",
+                yes_price=0.5,
+                no_price=0.5,
+                liquidity=1000.0,
+                volume=500.0,
+                snapshot_time=snapshot_time,
+            )
+
+        checker = QualityChecker(dao=dao_with_db)
+        result = checker.check_window(
+            start_time="2024-01-01T00:00:00+00:00",
+            end_time="2024-01-01T00:09:00+00:00",
+            expected_interval_seconds=60,
+        )
+
+        assert result.status == QualityStatus.INSUFFICIENT_DATA
+        assert not result.is_sufficient
+        assert "coverage_note" in result.notes
+
+    def test_sufficient_data_when_many_snapshots(self, dao_with_db: DAO) -> None:
+        """Status is SUFFICIENT when >= 30 distinct snapshot times and good coverage."""
+        _create_test_market(dao_with_db, "market_1")
+
+        # Insert 40 snapshot times
+        base_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for i in range(40):
+            snapshot_time = (base_time + timedelta(minutes=i)).isoformat()
+            dao_with_db.save_snapshot(
+                market_id="market_1",
+                yes_price=0.5,
+                no_price=0.5,
+                liquidity=1000.0,
+                volume=500.0,
+                snapshot_time=snapshot_time,
+            )
+
+        checker = QualityChecker(dao=dao_with_db)
+        result = checker.check_window(
+            start_time="2024-01-01T00:00:00+00:00",
+            end_time="2024-01-01T00:39:00+00:00",
+            expected_interval_seconds=60,
+        )
+
+        # With 40 snapshots and 100% coverage, status should be SUFFICIENT
+        assert result.status == QualityStatus.SUFFICIENT
+        assert result.is_sufficient
+
+    def test_min_snapshots_constant(self) -> None:
+        """MIN_SNAPSHOTS_FOR_QUALITY is 30."""
+        assert MIN_SNAPSHOTS_FOR_QUALITY == 30
+
+    def test_quality_result_distinct_times_property(self) -> None:
+        """QualityResult.distinct_times returns notes value."""
+        result = QualityResult(
+            window_from="2024-01-01",
+            window_to="2024-01-01",
+            expected_interval_seconds=60,
+            notes={"distinct_snapshot_times": 42},
+        )
+        assert result.distinct_times == 42

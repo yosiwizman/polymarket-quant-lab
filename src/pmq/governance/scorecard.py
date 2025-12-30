@@ -83,6 +83,8 @@ def compute_scorecard(
     largest_gap_seconds: float = 0.0,
     validation_mode: bool = False,
     data_quality_status: str | None = None,
+    maturity_score: int | None = None,
+    ready_for_scorecard: bool | None = None,
 ) -> StrategyScorecard:
     """Compute a scorecard from backtest metrics.
 
@@ -100,6 +102,8 @@ def compute_scorecard(
         largest_gap_seconds: Largest gap in data
         validation_mode: If True, use relaxed thresholds for baseline validation
         data_quality_status: Quality status (SUFFICIENT, INSUFFICIENT_DATA, etc.)
+        maturity_score: Data maturity score (0-100), if available
+        ready_for_scorecard: Whether data is ready for scorecard evaluation
 
     Returns:
         StrategyScorecard with score, pass/fail, and recommendations
@@ -113,6 +117,28 @@ def compute_scorecard(
 
     if validation_mode:
         warnings.append("Running in VALIDATION MODE with relaxed thresholds")
+
+    # Early exit if data is not ready for scorecard (unless validation mode)
+    if ready_for_scorecard is False and not validation_mode:
+        return StrategyScorecard(
+            score=0,
+            passed=False,
+            reasons=[
+                "FAIL: Data not ready for scorecard evaluation",
+                f"Maturity score: {maturity_score}/100 (need 70+ for readiness)",
+                "Hint: Use --last-times to evaluate recent data quality, or run in --validation mode",
+            ],
+            warnings=[
+                "Data quality assessment indicates insufficient maturity for reliable evaluation"
+            ],
+            recommended_limits=RiskLimits(),
+            metrics_used={
+                "maturity_score": maturity_score,
+                "ready_for_scorecard": ready_for_scorecard,
+                "data_quality_status": data_quality_status,
+                "validation_mode": validation_mode,
+            },
+        )
 
     # Handle INSUFFICIENT_DATA status
     if data_quality_status == "INSUFFICIENT_DATA":
@@ -134,6 +160,8 @@ def compute_scorecard(
         "data_quality_pct": data_quality_pct,
         "validation_mode": validation_mode,
         "data_quality_status": data_quality_status,
+        "maturity_score": maturity_score,
+        "ready_for_scorecard": ready_for_scorecard,
     }
 
     # --- PnL Score (25 points) ---

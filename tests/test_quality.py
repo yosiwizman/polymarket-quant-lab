@@ -11,10 +11,12 @@ from pathlib import Path
 import pytest
 
 from pmq.quality.checks import (
+    MATURITY_READY_THRESHOLD,
     MIN_SNAPSHOTS_FOR_QUALITY,
     QualityChecker,
     QualityResult,
     QualityStatus,
+    WindowMode,
     _parse_iso_datetime,
 )
 from pmq.quality.report import QualityReporter
@@ -544,3 +546,168 @@ class TestQualityStatus:
             notes={"distinct_snapshot_times": 42},
         )
         assert result.distinct_times == 42
+
+
+class TestWindowModes:
+    """Tests for rolling window modes (Phase 3.2)."""
+
+    def test_window_mode_constants(self) -> None:
+        """WindowMode constants are defined."""
+        assert WindowMode.EXPLICIT == "explicit"
+        assert WindowMode.LAST_MINUTES == "last_minutes"
+        assert WindowMode.LAST_TIMES == "last_times"
+
+    def test_check_last_times_no_data(self, dao_with_db: DAO) -> None:
+        """check_last_times returns empty result when no data."""
+        checker = QualityChecker(dao=dao_with_db)
+        result = checker.check_last_times(limit=30, expected_interval_seconds=60)
+
+        assert result.window_mode == WindowMode.LAST_TIMES
+        assert result.status == QualityStatus.INSUFFICIENT_DATA
+        assert result.maturity_score == 0
+        assert result.ready_for_scorecard is False
+        assert result.distinct_times == 0
+
+    def test_check_last_times_with_data(self, dao_with_db: DAO) -> None:
+        """check_last_times returns window based on actual snapshot times."""
+        _create_test_market(dao_with_db, "market_1")
+
+        # Insert 40 snapshots at 1-minute intervals
+        base_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for i in range(40):
+            snapshot_time = (base_time + timedelta(minutes=i)).isoformat()
+            dao_with_db.save_snapshot(
+                market_id="market_1",
+                yes_price=0.5,
+                no_price=0.5,
+                liquidity=1000.0,
+                volume=500.0,
+                snapshot_time=snapshot_time,
+            )
+
+        checker = QualityChecker(dao=dao_with_db)
+        result = checker.check_last_times(limit=30, expected_interval_seconds=60)
+
+        assert result.window_mode == WindowMode.LAST_TIMES
+        assert result.distinct_times == 30  # Limited to 30
+        assert result.coverage_pct == 100.0  # 30/30 = 100%
+        assert result.status == QualityStatus.SUFFICIENT
+
+    def test_check_last_minutes_empty(self, dao_with_db: DAO) -> None:
+        """check_last_minutes returns low maturity when no data."""
+        checker = QualityChecker(dao=dao_with_db)
+        result = checker.check_last_minutes(minutes=60, expected_interval_seconds=60)
+
+        assert result.window_mode == WindowMode.LAST_MINUTES
+        assert result.status == QualityStatus.INSUFFICIENT_DATA
+        assert result.maturity_score == 0
+
+    def test_get_recent_snapshot_times(self, dao_with_db: DAO) -> None:
+        """DAO.get_recent_snapshot_times returns correct number of times."""
+        _create_test_market(dao_with_db, "market_1")
+
+        # Insert 10 snapshots
+        base_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for i in range(10):
+            snapshot_time = (base_time + timedelta(minutes=i)).isoformat()
+            dao_with_db.save_snapshot(
+                market_id="market_1",
+                yes_price=0.5,
+                no_price=0.5,
+                liquidity=1000.0,
+                volume=500.0,
+                snapshot_time=snapshot_time,
+            )
+
+        # Get last 5
+        times = dao_with_db.get_recent_snapshot_times(limit=5)
+        assert len(times) == 5
+
+        # Should be in ascending order (oldest to newest of the selected)
+        assert times[0] < times[-1]
+
+
+class TestMaturityScoring:
+    """Tests for maturity score calculation (Phase 3.2)."""
+
+    def test_maturity_threshold_constant(self) -> None:
+        """Maturity threshold is 70."""
+        assert MATURITY_READY_THRESHOLD == 70
+
+    def test_maturity_zero_when_no_data(self) -> None:
+        """Maturity is 0 when no distinct times."""
+        result = QualityResult(
+            window_from="2024-01-01",
+            window_to="2024-01-01",
+            expected_interval_seconds=60,
+            maturity_score=0,
+            ready_for_scorecard=False,
+        )
+        assert result.maturity_score == 0
+        assert result.ready_for_scorecard is False
+
+    def test_maturity_below_threshold_not_ready(self, dao_with_db: DAO) -> None:
+        """Maturity below 70 means not ready for scorecard."""
+        _create_test_market(dao_with_db, "market_1")
+
+        # Insert only 15 snapshots (below MIN_SNAPSHOTS_FOR_QUALITY)
+        base_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for i in range(15):
+            snapshot_time = (base_time + timedelta(minutes=i)).isoformat()
+            dao_with_db.save_snapshot(
+                market_id="market_1",
+                yes_price=0.5,
+                no_price=0.5,
+                liquidity=1000.0,
+                volume=500.0,
+                snapshot_time=snapshot_time,
+            )
+
+        checker = QualityChecker(dao=dao_with_db)
+        result = checker.check_window(
+            start_time="2024-01-01T00:00:00+00:00",
+            end_time="2024-01-01T00:14:00+00:00",
+            expected_interval_seconds=60,
+        )
+
+        # 15 snapshots / 30 min = 50% towards minimum, scaled to 40 max = 20
+        assert result.maturity_score < MATURITY_READY_THRESHOLD
+        assert result.ready_for_scorecard is False
+
+    def test_maturity_high_when_good_data(self, dao_with_db: DAO) -> None:
+        """Maturity is high with good coverage and enough snapshots."""
+        _create_test_market(dao_with_db, "market_1")
+
+        # Insert 60 snapshots (well above minimum)
+        base_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        for i in range(60):
+            snapshot_time = (base_time + timedelta(minutes=i)).isoformat()
+            dao_with_db.save_snapshot(
+                market_id="market_1",
+                yes_price=0.5,
+                no_price=0.5,
+                liquidity=1000.0,
+                volume=500.0,
+                snapshot_time=snapshot_time,
+            )
+
+        checker = QualityChecker(dao=dao_with_db)
+        result = checker.check_window(
+            start_time="2024-01-01T00:00:00+00:00",
+            end_time="2024-01-01T00:59:00+00:00",
+            expected_interval_seconds=60,
+        )
+
+        # With 60 snapshots and 100% coverage, should be ready
+        assert result.maturity_score >= MATURITY_READY_THRESHOLD
+        assert result.ready_for_scorecard is True
+
+    def test_expected_times_property(self) -> None:
+        """QualityResult.expected_times returns notes value."""
+        result = QualityResult(
+            window_from="2024-01-01",
+            window_to="2024-01-01",
+            expected_interval_seconds=60,
+            notes={"expected_times": 60},
+        )
+        assert result.expected_times == 60

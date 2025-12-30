@@ -269,6 +269,81 @@ Every backtest run automatically saves a manifest for reproducibility:
 
 Manifests ensure backtests can be reproduced exactly by recording all inputs.
 
+### Strategy Approval & Risk Governance (Phase 3)
+
+Before a strategy can run paper trading, it must be formally approved based on backtest results.
+
+#### Approval Workflow
+
+```powershell
+# 1. Run a backtest
+poetry run pmq backtest run --strategy arb --from 2024-01-01 --to 2024-01-31
+
+# 2. Evaluate the backtest for approval (shows scorecard)
+poetry run pmq approve evaluate --run-id <run-id>
+
+# 3. If scorecard passes, grant approval
+poetry run pmq approve grant --run-id <run-id> --name arb --version v1
+
+# 4. Now paper trading requires approval (or --override-unsafe)
+poetry run pmq paper run --strategy arb --minutes 10
+```
+
+#### Scorecard Criteria
+
+The scorecard evaluates backtests on a 0-100 scale:
+
+| Metric | Weight | Minimum Threshold |
+|--------|--------|-------------------|
+| PnL | 25 pts | ≥ 0 (non-negative) |
+| Max Drawdown | 20 pts | ≤ 25% |
+| Win Rate | 15 pts | ≥ 40% |
+| Sharpe Ratio | 20 pts | ≥ 0.5 |
+| Trades/Day | 10 pts | ≥ 5 trades total |
+| Data Quality | 10 pts | ≥ 70% coverage |
+
+A strategy must:
+1. Pass all minimum thresholds (no FAILs)
+2. Achieve a total score ≥ 60/100
+
+#### Risk Limits
+
+Approved strategies receive recommended risk limits based on performance:
+
+- **Max Notional/Market**: Per-market position limit
+- **Max Total Notional**: Total exposure limit
+- **Max Positions**: Maximum concurrent positions
+- **Max Trades/Hour**: Rate limiting
+- **Stop Loss**: Drawdown-based kill trigger
+
+#### Approval Management
+
+```powershell
+# List all approvals
+poetry run pmq approve list
+
+# Filter by status
+poetry run pmq approve list --status APPROVED
+
+# Revoke an approval
+poetry run pmq approve revoke --approval-id 1 --reason "Performance degraded"
+
+# View risk events
+poetry run pmq approve risk-events
+poetry run pmq approve risk-events --severity CRITICAL
+```
+
+#### Override Mode
+
+For testing, you can bypass approval checks:
+
+```powershell
+# NOT recommended for production
+poetry run pmq paper run --strategy arb --override-unsafe
+```
+
+This logs a WARN-level risk event but allows execution.
+
 ## Configuration
 
 ### Environment Variables
@@ -327,6 +402,9 @@ polymarket-quant-lab/
 │   ├── quality/            # Snapshot quality (Phase 2.5)
 │   │   ├── checks.py       # Gap/duplicate detection
 │   │   └── report.py       # Quality reporting
+│   ├── governance/         # Strategy approval (Phase 3)
+│   │   ├── scorecard.py    # Backtest evaluation
+│   │   └── risk_gate.py    # Approval enforcement
 │   └── web/
 │       ├── app.py          # FastAPI application
 │       ├── routes.py       # API endpoints
@@ -338,6 +416,7 @@ polymarket-quant-lab/
 │   ├── test_paper_ledger.py
 │   ├── test_backtest.py    # Backtest tests
 │   ├── test_quality.py     # Quality/manifest tests
+│   ├── test_governance.py  # Approval/risk gate tests
 │   └── test_web_and_export.py
 ├── config/
 │   └── pairs.yml           # Stat-arb pairs config
@@ -418,14 +497,22 @@ poetry run mypy src
 - [x] Performance metrics (PnL, drawdown, Sharpe, win rate)
 - [x] Replay-based strategy evaluation
 
-### Phase 2.5 (Current) ✅
+### Phase 2.5 ✅
 - [x] Snapshot scheduler (`pmq snapshots run`)
 - [x] Data quality validation (gap/duplicate detection)
 - [x] Coverage reporting (`pmq snapshots quality/coverage`)
 - [x] Backtest run manifests (config hash, git SHA)
 - [x] Dashboard snapshot/quality endpoints
 
-### Phase 3 (Future)
+### Phase 3 (Current) ✅
+- [x] Strategy scorecards (evaluate backtest results)
+- [x] Approval registry (grant/revoke/list)
+- [x] RiskGate enforcement (block unapproved strategies)
+- [x] Risk events logging
+- [x] Dashboard governance section
+- [x] CLI approval commands (`pmq approve`)
+
+### Phase 4 (Future)
 - [ ] Authenticated CLOB integration
 - [ ] Real order placement via py-clob-client
 - [ ] Wallet integration (Polygon)

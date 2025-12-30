@@ -246,7 +246,7 @@ class TestApprovalCRUD:
         )
 
         # Create revoked (newer)
-        revoked_id = dao.save_approval(
+        dao.save_approval(
             strategy_name="arb",
             strategy_version="v2",
             window_from="2024-02-01",

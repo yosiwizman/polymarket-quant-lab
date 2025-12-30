@@ -1,6 +1,5 @@
 """Tests for Gamma API client."""
 
-import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pmq.config import Settings
-from pmq.gamma_client import GammaClient, GammaClientError
+from pmq.gamma_client import GammaClient
 from pmq.models import GammaMarket
 
 

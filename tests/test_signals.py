@@ -1,8 +1,8 @@
 """Tests for signal detection strategies."""
 
-from datetime import datetime, timezone
 
 import pytest
+from pydantic import ValidationError
 
 from pmq.config import ArbitrageConfig, StatArbConfig
 from pmq.models import ArbitrageSignal, GammaMarket, StatArbSignal
@@ -304,5 +304,5 @@ class TestArbitrageSignalModel:
             liquidity=1000.0,
         )
 
-        with pytest.raises(Exception):  # ValidationError for frozen model
+        with pytest.raises(ValidationError):
             signal.market_id = "new_id"

@@ -5,11 +5,25 @@ from pathlib import Path
 
 import pytest
 
-from pmq.config import SafetyConfig, Settings
-from pmq.models import ArbitrageSignal, Outcome, PaperPosition, Side
+from pmq.config import SafetyConfig
+from pmq.models import ArbitrageSignal, GammaMarket, Outcome, PaperPosition, Side
 from pmq.storage.dao import DAO
 from pmq.storage.db import Database
 from pmq.strategies.paper import PaperLedger, SafetyError, SafetyGuard
+
+
+def create_test_market(market_id: str, question: str = "Test?") -> GammaMarket:
+    """Create a test market for fixtures."""
+    return GammaMarket(
+        id=market_id,
+        question=question,
+        slug=market_id,
+        active=True,
+        closed=False,
+        liquidity=1000.0,
+        volume=5000.0,
+        volume24hr=500.0,
+    )
 
 
 @pytest.fixture
@@ -97,8 +111,11 @@ class TestSafetyGuard:
 class TestPaperLedger:
     """Tests for PaperLedger."""
 
-    def test_execute_trade(self, ledger):
+    def test_execute_trade(self, ledger, dao):
         """Test executing a simple paper trade."""
+        # Insert market to satisfy foreign key constraint
+        dao.upsert_market(create_test_market("test_market", "Test question?"))
+
         trade = ledger.execute_trade(
             strategy="test",
             market_id="test_market",
@@ -117,8 +134,10 @@ class TestPaperLedger:
         assert trade.quantity == 10.0
         assert trade.notional == 5.0
 
-    def test_position_update_on_buy(self, ledger):
+    def test_position_update_on_buy(self, ledger, dao):
         """Test that position is updated after buy."""
+        dao.upsert_market(create_test_market("market1"))
+
         ledger.execute_trade(
             strategy="test",
             market_id="market1",
@@ -136,8 +155,10 @@ class TestPaperLedger:
         assert position.avg_price_yes == 0.50
         assert position.no_quantity == 0.0
 
-    def test_position_update_on_sell(self, ledger):
+    def test_position_update_on_sell(self, ledger, dao):
         """Test that position is updated after sell."""
+        dao.upsert_market(create_test_market("market1"))
+
         # First buy
         ledger.execute_trade(
             strategy="test",
@@ -166,8 +187,10 @@ class TestPaperLedger:
         assert position.yes_quantity == 5.0
         assert position.realized_pnl == pytest.approx(0.50, abs=0.01)  # (0.60-0.50)*5
 
-    def test_execute_arb_trade(self, ledger):
+    def test_execute_arb_trade(self, ledger, dao):
         """Test executing an arbitrage trade."""
+        dao.upsert_market(create_test_market("arb_market", "Arb test?"))
+
         signal = ArbitrageSignal(
             market_id="arb_market",
             market_question="Arb test?",
@@ -189,8 +212,11 @@ class TestPaperLedger:
         assert position.yes_quantity == 10.0
         assert position.no_quantity == 10.0
 
-    def test_get_all_positions(self, ledger):
+    def test_get_all_positions(self, ledger, dao):
         """Test getting all positions."""
+        dao.upsert_market(create_test_market("m1", "M1?"))
+        dao.upsert_market(create_test_market("m2", "M2?"))
+
         # Create positions in multiple markets
         ledger.execute_trade(
             strategy="test",
@@ -215,9 +241,10 @@ class TestPaperLedger:
 
         assert len(positions) == 2
 
-    def test_get_trades(self, ledger):
+    def test_get_trades(self, ledger, dao):
         """Test getting trade history."""
         for i in range(3):
+            dao.upsert_market(create_test_market(f"m{i}", f"Q{i}?"))
             ledger.execute_trade(
                 strategy="test",
                 market_id=f"m{i}",
@@ -238,8 +265,10 @@ class TestPaperLedger:
         trades = ledger.get_trades(strategy="other")
         assert len(trades) == 0
 
-    def test_calculate_pnl(self, ledger):
+    def test_calculate_pnl(self, ledger, dao):
         """Test PnL calculation."""
+        dao.upsert_market(create_test_market("m1", "Q1?"))
+
         # Buy and hold
         ledger.execute_trade(
             strategy="test",
@@ -257,8 +286,10 @@ class TestPaperLedger:
         assert "total_pnl" in pnl
         assert "positions" in pnl
 
-    def test_get_stats(self, ledger):
+    def test_get_stats(self, ledger, dao):
         """Test getting trading statistics."""
+        dao.upsert_market(create_test_market("m1", "Q1?"))
+
         ledger.execute_trade(
             strategy="test",
             market_id="m1",

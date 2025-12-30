@@ -7,8 +7,7 @@ Entry: abs(spread) > entry_threshold
 Exit: abs(spread) < exit_threshold
 """
 
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
 from typing import Any
 
 from pmq.config import StatArbConfig, get_settings, load_pairs_config
@@ -79,7 +78,7 @@ class StatArbScanner:
     def _load_pairs(self) -> list[StatArbPair]:
         """Load pairs from configuration file."""
         pairs_data = load_pairs_config(self._config.pairs_file)
-        pairs = []
+        pairs: list[StatArbPair] = []
         if not pairs_data:
             return pairs
         for data in pairs_data:
@@ -170,11 +169,8 @@ class StatArbScanner:
         abs_spread = abs(spread)
 
         if abs_spread > self._config.entry_threshold:
-            # Determine direction
-            if spread > 0:
-                direction = "LONG_B_SHORT_A"  # Buy B, sell A
-            else:
-                direction = "LONG_A_SHORT_B"  # Buy A, sell B
+            # Determine direction: Buy B/sell A if spread > 0, else Buy A/sell B
+            direction = "LONG_B_SHORT_A" if spread > 0 else "LONG_A_SHORT_B"
 
             signal = StatArbSignal(
                 market_a_id=pair.market_a_id,
@@ -187,7 +183,7 @@ class StatArbScanner:
                 entry_threshold=self._config.entry_threshold,
                 exit_threshold=self._config.exit_threshold,
                 direction=direction,
-                detected_at=datetime.now(timezone.utc),
+                detected_at=datetime.now(UTC),
             )
 
             log_trade_event(
@@ -283,7 +279,7 @@ class StatArbScanner:
                     entry_threshold=self._config.entry_threshold,
                     exit_threshold=self._config.exit_threshold,
                     direction=direction,
-                    detected_at=datetime.now(timezone.utc),
+                    detected_at=datetime.now(UTC),
                 )
                 signals.append(signal)
 

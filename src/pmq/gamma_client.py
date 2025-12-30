@@ -1,7 +1,7 @@
 """Gamma API client for fetching public market data."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -84,11 +84,12 @@ class GammaClient:
         try:
             data = json.loads(cache_file.read_text(encoding="utf-8"))
             cached_at = datetime.fromisoformat(data.get("_cached_at", "2000-01-01"))
-            age = (datetime.now(timezone.utc) - cached_at.replace(tzinfo=timezone.utc)).seconds
+            age = (datetime.now(UTC) - cached_at.replace(tzinfo=UTC)).seconds
 
             if age < self._cache_ttl:
                 logger.debug(f"Cache hit for {key} (age={age}s)")
-                return data.get("payload")
+                payload: dict[str, Any] | list[Any] | None = data.get("payload")
+                return payload
             logger.debug(f"Cache expired for {key} (age={age}s)")
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.warning(f"Invalid cache file {cache_file}: {e}")
@@ -99,7 +100,7 @@ class GammaClient:
         """Write to cache."""
         cache_file = self._cache_path(key)
         data = {
-            "_cached_at": datetime.now(timezone.utc).isoformat(),
+            "_cached_at": datetime.now(UTC).isoformat(),
             "payload": payload,
         }
         cache_file.write_text(json.dumps(data), encoding="utf-8")
@@ -146,7 +147,8 @@ class GammaClient:
             if use_cache:
                 self._write_cache(cache_key, data)
 
-            return data
+            result: dict[str, Any] | list[Any] = data
+            return result
 
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
@@ -189,10 +191,11 @@ class GammaClient:
         data = self._request("/markets", params=params)
 
         # Handle both array response and object with data field
+        markets_data: list[Any]
         if isinstance(data, list):
             markets_data = data
         elif isinstance(data, dict):
-            markets_data = data.get("data", data.get("markets", []))
+            markets_data = data.get("data") or data.get("markets") or []
         else:
             markets_data = []
 
@@ -253,10 +256,11 @@ class GammaClient:
 
         data = self._request("/events", params=params)
 
+        events_data: list[Any]
         if isinstance(data, list):
             events_data = data
         elif isinstance(data, dict):
-            events_data = data.get("data", data.get("events", []))
+            events_data = data.get("data") or data.get("events") or []
         else:
             events_data = []
 
@@ -284,22 +288,23 @@ class GammaClient:
         params = {"_q": query, "_limit": limit}
         data = self._request("/markets", params=params, use_cache=False)
 
+        markets_data2: list[Any]
         if isinstance(data, list):
-            markets_data = data
+            markets_data2 = data
         elif isinstance(data, dict):
-            markets_data = data.get("data", data.get("markets", []))
+            markets_data2 = data.get("data") or data.get("markets") or []
         else:
-            markets_data = []
+            markets_data2 = []
 
-        markets = []
-        for item in markets_data:
+        markets2: list[GammaMarket] = []
+        for item in markets_data2:
             try:
                 market = GammaMarket.model_validate(item)
-                markets.append(market)
+                markets2.append(market)
             except Exception as e:
                 logger.warning(f"Failed to parse market: {e}")
 
-        return markets
+        return markets2
 
     def clear_cache(self) -> int:
         """Clear all cached data.

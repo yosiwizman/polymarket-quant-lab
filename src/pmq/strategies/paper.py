@@ -4,14 +4,13 @@ Simulates trades and tracks virtual positions without real money.
 Includes safety mechanisms: position limits, notional caps, rate limits, kill switch.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pmq.config import SafetyConfig, get_settings
 from pmq.logging import get_logger, log_trade_event
 from pmq.models import ArbitrageSignal, Outcome, PaperPosition, PaperTrade, Side
 from pmq.storage.dao import DAO
-from pmq.storage.db import get_database
 
 logger = get_logger("strategies.paper")
 
@@ -212,7 +211,7 @@ class PaperLedger:
             price=price,
             quantity=quantity,
             notional=notional,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
 
         # Save trade
@@ -301,7 +300,7 @@ class PaperLedger:
                     position.realized_pnl += pnl
                 position.no_quantity = max(0, position.no_quantity - trade.quantity)
 
-        position.updated_at = datetime.now(timezone.utc)
+        position.updated_at = datetime.now(UTC)
         self._dao.upsert_position(position)
 
     def execute_arb_trade(

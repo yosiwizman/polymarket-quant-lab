@@ -1,7 +1,7 @@
 """Data Access Object layer for database operations."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pmq.logging import get_logger
@@ -41,7 +41,7 @@ class DAO:
         Args:
             market: Market data to upsert
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._db.execute(
             """
             INSERT INTO markets (
@@ -398,7 +398,7 @@ class DAO:
         Args:
             position: Position to upsert
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         self._db.execute(
             """
             INSERT INTO paper_positions (

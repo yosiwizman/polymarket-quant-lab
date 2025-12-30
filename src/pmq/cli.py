@@ -8,7 +8,7 @@ Commands:
 """
 
 import time
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 from rich import print as rprint
@@ -19,7 +19,7 @@ from pmq import __version__
 from pmq.config import get_settings
 from pmq.gamma_client import GammaClient
 from pmq.logging import setup_logging
-from pmq.storage import DAO, get_database
+from pmq.storage import DAO
 from pmq.strategies import ArbitrageScanner, PaperLedger, StatArbScanner
 from pmq.strategies.paper import SafetyError
 
@@ -40,8 +40,8 @@ def version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
-    version: Annotated[
-        Optional[bool],
+    _version: Annotated[
+        bool | None,
         typer.Option(
             "--version",
             "-v",
@@ -84,8 +84,6 @@ def sync(
     Example:
         pmq sync --limit 100
     """
-    settings = get_settings()
-
     with console.status("[bold green]Syncing market data..."):
         client = GammaClient()
 
@@ -126,7 +124,7 @@ def sync(
 
         except Exception as e:
             console.print(f"[red]Error syncing: {e}[/red]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from e
         finally:
             client.close()
 
@@ -241,11 +239,11 @@ def scan(
                 table.add_column("Spread", justify="right", style="yellow")
                 table.add_column("Direction", style="green")
 
-                for sig in statarb_signals[:top]:
+                for statarb_sig in statarb_signals[:top]:
                     table.add_row(
-                        f"{sig.market_a_id[:8]}.. / {sig.market_b_id[:8]}..",
-                        f"{sig.spread:.4f}",
-                        sig.direction,
+                        f"{statarb_sig.market_a_id[:8]}.. / {statarb_sig.market_b_id[:8]}..",
+                        f"{statarb_sig.spread:.4f}",
+                        statarb_sig.direction,
                     )
 
                 console.print(table)
@@ -363,7 +361,7 @@ def paper_run(
         client.close()
 
     # Print summary
-    console.print(f"\n[bold]Paper Trading Summary[/bold]")
+    console.print("\n[bold]Paper Trading Summary[/bold]")
     console.print(f"Duration: {int((time.time() - start_time) / 60)} minutes")
     console.print(f"Signals detected: {signals_detected}")
     console.print(f"Trades executed: {trades_executed}")
@@ -410,7 +408,7 @@ def paper_positions() -> None:
 @paper_app.command("trades")
 def paper_trades(
     limit: Annotated[int, typer.Option("--limit", "-l")] = 20,
-    strategy: Annotated[Optional[str], typer.Option("--strategy", "-s")] = None,
+    strategy: Annotated[str | None, typer.Option("--strategy", "-s")] = None,
 ) -> None:
     """Show recent paper trades."""
     ledger = PaperLedger()

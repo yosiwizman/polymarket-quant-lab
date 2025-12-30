@@ -75,7 +75,8 @@ def compute_correlation(prices_a: list[float], prices_b: list[float]) -> float:
         # Near-zero variance means constant prices, no meaningful correlation
         return 0.0
 
-    return cov / ((var_a**0.5) * (var_b**0.5))
+    result: float = cov / ((var_a**0.5) * (var_b**0.5))
+    return result
 
 
 def discover_pairs(

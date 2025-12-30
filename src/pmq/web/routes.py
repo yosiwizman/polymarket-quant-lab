@@ -156,33 +156,92 @@ def get_snapshots_coverage(
 
 
 @router.get("/api/snapshots/quality/latest")
-def get_latest_quality_report() -> dict[str, Any]:
-    """Get the most recent quality report.
+def get_latest_quality_report(
+    mode: str | None = Query(default=None, description="Window mode: explicit, last_minutes, last_times"),
+    value: int | None = Query(default=None, description="Minutes or times count (for rolling modes)"),
+    interval: int = Query(default=60, description="Expected interval in seconds"),
+) -> dict[str, Any]:
+    """Get quality report - stored or on-demand.
+
+    Modes:
+    - None (default): Return latest stored report
+    - last_minutes: Check quality for last N minutes (requires value)
+    - last_times: Check quality for last K distinct snapshot times (requires value)
 
     Returns:
-        Latest quality report or empty if none exists
+        Quality report with status, maturity, and readiness
     """
+    from pmq.quality import QualityChecker, MATURITY_READY_THRESHOLD
+
     dao = get_dao()
-    report = dao.get_latest_quality_report()
+
+    # Handle rolling window modes
+    if mode == "last_minutes" and value:
+        checker = QualityChecker(dao=dao)
+        result = checker.check_last_minutes(value, interval)
+        report = {
+            "window_from": result.window_from,
+            "window_to": result.window_to,
+            "window_mode": result.window_mode,
+            "coverage_pct": result.coverage_pct,
+            "missing_intervals": result.missing_intervals,
+            "duplicate_count": result.duplicate_count,
+            "status": result.status,
+            "maturity_score": result.maturity_score,
+            "ready_for_scorecard": result.ready_for_scorecard,
+            "distinct_times": result.distinct_times,
+            "expected_times": result.expected_times,
+            "largest_gap_seconds": result.largest_gap_seconds,
+            "markets_seen": result.markets_seen,
+            "snapshots_written": result.snapshots_written,
+        }
+    elif mode == "last_times" and value:
+        checker = QualityChecker(dao=dao)
+        result = checker.check_last_times(value, interval)
+        report = {
+            "window_from": result.window_from,
+            "window_to": result.window_to,
+            "window_mode": result.window_mode,
+            "coverage_pct": result.coverage_pct,
+            "missing_intervals": result.missing_intervals,
+            "duplicate_count": result.duplicate_count,
+            "status": result.status,
+            "maturity_score": result.maturity_score,
+            "ready_for_scorecard": result.ready_for_scorecard,
+            "distinct_times": result.distinct_times,
+            "expected_times": result.expected_times,
+            "largest_gap_seconds": result.largest_gap_seconds,
+            "markets_seen": result.markets_seen,
+            "snapshots_written": result.snapshots_written,
+        }
+    else:
+        # Default: return latest stored report
+        report = dao.get_latest_quality_report()
 
     # Determine status badge
     if report:
+        maturity = report.get("maturity_score", 0)
+        ready = report.get("ready_for_scorecard", False)
         coverage_pct = report.get("coverage_pct", 0)
         missing = report.get("missing_intervals", 0)
         duplicates = report.get("duplicate_count", 0)
 
-        if coverage_pct >= 95 and missing <= 5 and duplicates == 0:
+        if ready and coverage_pct >= 95 and missing <= 5 and duplicates == 0:
             status = "healthy"
         elif coverage_pct >= 80 and missing <= 20:
             status = "degraded"
         else:
             status = "unhealthy"
+
+        readiness = "ready" if ready else "not_ready"
     else:
         status = "unknown"
+        readiness = "unknown"
 
     return {
         "report": report,
         "status": status,
+        "readiness": readiness,
         "timestamp": datetime.now(UTC).isoformat(),
     }
 
@@ -294,12 +353,15 @@ def dashboard(request: Request) -> HTMLResponse:
     snapshot_summary = dao.get_snapshot_summary()
     quality_report = dao.get_latest_quality_report()
 
-    # Compute quality status
+    # Compute quality status + maturity
     if quality_report:
         coverage_pct = quality_report.get("coverage_pct", 0)
         missing = quality_report.get("missing_intervals", 0)
         duplicates = quality_report.get("duplicate_count", 0)
-        if coverage_pct >= 95 and missing <= 5 and duplicates == 0:
+        maturity_score = quality_report.get("maturity_score", 0)
+        ready_for_scorecard = quality_report.get("ready_for_scorecard", False)
+
+        if ready_for_scorecard and coverage_pct >= 95 and missing <= 5 and duplicates == 0:
             quality_status = "healthy"
         elif coverage_pct >= 80 and missing <= 20:
             quality_status = "degraded"
@@ -307,6 +369,8 @@ def dashboard(request: Request) -> HTMLResponse:
             quality_status = "unhealthy"
     else:
         quality_status = "unknown"
+        maturity_score = 0
+        ready_for_scorecard = False
 
     # Governance data (Phase 3)
     approvals = dao.get_approvals(status="APPROVED", limit=10)
@@ -326,6 +390,8 @@ def dashboard(request: Request) -> HTMLResponse:
             "snapshot_summary": snapshot_summary,
             "quality_report": quality_report,
             "quality_status": quality_status,
+            "maturity_score": maturity_score,
+            "ready_for_scorecard": ready_for_scorecard,
             "approvals": approvals,
             "risk_events": risk_events,
             "now": datetime.now(UTC).isoformat(),

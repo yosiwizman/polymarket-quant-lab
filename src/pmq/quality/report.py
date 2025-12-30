@@ -54,9 +54,7 @@ class QualityReporter:
         logger.info(f"Generating quality report: {start_time} to {end_time}")
 
         # Run checks
-        result = self._checker.check_window(
-            start_time, end_time, expected_interval_seconds
-        )
+        result = self._checker.check_window(start_time, end_time, expected_interval_seconds)
 
         # Save to database if requested
         if save:
@@ -95,9 +93,7 @@ class QualityReporter:
         start_time = (now - timedelta(hours=24)).isoformat()
         end_time = now.isoformat()
 
-        return self.generate_report(
-            start_time, end_time, expected_interval_seconds, save
-        )
+        return self.generate_report(start_time, end_time, expected_interval_seconds, save)
 
     def get_coverage_summary(
         self,

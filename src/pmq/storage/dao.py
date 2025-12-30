@@ -1177,9 +1177,7 @@ class DAO:
         Returns:
             Summary dict with counts and time range
         """
-        total_row = self._db.fetch_one(
-            "SELECT COUNT(*) as count FROM market_snapshots"
-        )
+        total_row = self._db.fetch_one("SELECT COUNT(*) as count FROM market_snapshots")
         total_snapshots = total_row["count"] if total_row else 0
 
         markets_row = self._db.fetch_one(
@@ -1381,9 +1379,7 @@ class DAO:
         market_filter_json = json.dumps(market_filter) if market_filter else None
         time_range_json = None
         if first_snapshot_time or last_snapshot_time:
-            time_range_json = json.dumps(
-                {"first": first_snapshot_time, "last": last_snapshot_time}
-            )
+            time_range_json = json.dumps({"first": first_snapshot_time, "last": last_snapshot_time})
 
         cursor = self._db.execute(
             """

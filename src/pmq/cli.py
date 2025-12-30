@@ -1339,11 +1339,11 @@ def snapshots_quality(
 
     # Display results
     status = reporter.get_status_badge(result)
-    status_color = {"healthy": "green", "degraded": "yellow", "unhealthy": "red"}.get(
-        status, "dim"
-    )
+    status_color = {"healthy": "green", "degraded": "yellow", "unhealthy": "red"}.get(status, "dim")
 
-    console.print(f"\n[bold]Quality Report: [{status_color}]{status.upper()}[/{status_color}][/bold]")
+    console.print(
+        f"\n[bold]Quality Report: [{status_color}]{status.upper()}[/{status_color}][/bold]"
+    )
 
     table = Table(title="Quality Metrics")
     table.add_column("Metric", style="cyan")
@@ -1362,7 +1362,9 @@ def snapshots_quality(
 
     # Show top gaps if any
     if result.gaps:
-        console.print(f"\n[yellow]Found {len(result.gaps)} gaps (>50% of expected interval)[/yellow]")
+        console.print(
+            f"\n[yellow]Found {len(result.gaps)} gaps (>50% of expected interval)[/yellow]"
+        )
         for gap in result.gaps[:5]:
             console.print(
                 f"  Gap: {gap.gap_start[:19]} to {gap.gap_end[:19]} "
@@ -1471,7 +1473,9 @@ def snapshots_summary() -> None:
         q_table.add_column("Metric", style="cyan")
         q_table.add_column("Value", justify="right")
 
-        q_table.add_row("Window", f"{latest_report['window_from'][:10]} to {latest_report['window_to'][:10]}")
+        q_table.add_row(
+            "Window", f"{latest_report['window_from'][:10]} to {latest_report['window_to'][:10]}"
+        )
         q_table.add_row("Coverage", f"{latest_report['coverage_pct']:.1f}%")
         q_table.add_row("Missing Intervals", str(latest_report["missing_intervals"]))
         q_table.add_row("Duplicates", str(latest_report["duplicate_count"]))

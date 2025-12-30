@@ -136,9 +136,7 @@ class QualityChecker:
         Returns:
             List of GapInfo objects
         """
-        raw_gaps = self._dao.get_snapshot_gaps(
-            start_time, end_time, expected_interval_seconds
-        )
+        raw_gaps = self._dao.get_snapshot_gaps(start_time, end_time, expected_interval_seconds)
         return [
             GapInfo(
                 gap_start=g["gap_start"],
@@ -222,7 +220,9 @@ class QualityChecker:
                         "market_id": market["market_id"],
                         "snapshot_count": actual,
                         "expected_count": expected_count,
-                        "coverage_pct": (actual / expected_count * 100) if expected_count > 0 else 0,
+                        "coverage_pct": (actual / expected_count * 100)
+                        if expected_count > 0
+                        else 0,
                     }
                 )
 

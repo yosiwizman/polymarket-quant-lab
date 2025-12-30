@@ -1,25 +1,77 @@
 # Statistical Arbitrage Pairs Configuration
-# 
+#
 # Define pairs of correlated markets to monitor for spread divergence.
 # When the spread exceeds entry_threshold, a signal is generated.
 #
-# Format:
-#   - market_a_id: First market condition ID
-#     market_b_id: Second market condition ID
-#     name: Human-readable name for the pair
-#     correlation: 1.0 for same direction, -1.0 for inverse correlation
+# Schema:
+#   market_a_id: First market ID (required)
+#   market_b_id: Second market ID (required)
+#   name: Human-readable name (optional)
+#   correlation: 1.0 for same direction, -1.0 for inverse (default: 1.0)
+#   enabled: true/false to enable/disable pair (default: true)
+#   min_liquidity: Minimum liquidity threshold (optional)
+#   max_spread: Maximum spread to consider (optional)
+#
+# Generated from 30 snapshots on 2025-12-30T22:02:31
+#
 
 pairs:
-  # Example pairs - replace with actual market IDs from Polymarket
-  # You can find market IDs using: pmq sync && pmq scan
-  
-  # - market_a_id: "0x1234567890abcdef..."
-  #   market_b_id: "0xfedcba0987654321..."
-  #   name: "Example pair - Market A vs Market B"
-  #   correlation: 1.0
-  
-  # Inverse correlation example (market A up = market B down)
-  # - market_a_id: "0xabc..."
-  #   market_b_id: "0xdef..."
-  #   name: "Inverse pair example"
-  #   correlation: -1.0
+  - market_a_id: "976939"
+    market_b_id: "976940"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 440-459 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "976941"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 460-479 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "976942"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 480-499 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "976943"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 500-519 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "976944"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 520-539 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "976945"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 540-559 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "976946"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 560-579 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "976947"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 580+ tweet"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "999489"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 240-259 tw"
+    correlation: 1.0
+    enabled: true
+
+  - market_a_id: "976939"
+    market_b_id: "999490"
+    name: "elon-musk-of: Will Elon Musk post 420-439 tw vs Will Elon Musk post 260-279 tw"
+    correlation: 1.0
+    enabled: true

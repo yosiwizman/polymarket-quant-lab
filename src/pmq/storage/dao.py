@@ -1427,3 +1427,270 @@ class DAO:
                 data["snapshot_time_range"] = json.loads(data["snapshot_time_range_json"])
             return data
         return None
+
+    # =========================================================================
+    # Strategy Approvals (Phase 3)
+    # =========================================================================
+
+    def save_approval(
+        self,
+        strategy_name: str,
+        strategy_version: str,
+        window_from: str,
+        window_to: str,
+        score: float,
+        status: str,
+        run_id: str | None = None,
+        git_sha: str | None = None,
+        config_hash: str | None = None,
+        reasons: list[str] | None = None,
+        limits: dict[str, Any] | None = None,
+        approved_by: str | None = None,
+    ) -> int:
+        """Save a strategy approval record.
+
+        Args:
+            strategy_name: Name of the strategy
+            strategy_version: Version string
+            window_from: Backtest window start
+            window_to: Backtest window end
+            score: Scorecard score (0-100)
+            status: PENDING, APPROVED, REJECTED, REVOKED
+            run_id: Backtest run ID used for approval
+            git_sha: Git commit SHA
+            config_hash: Config hash
+            reasons: List of pass/fail reasons
+            limits: Risk limits dict
+            approved_by: Who approved
+
+        Returns:
+            Approval ID
+        """
+        reasons_json = json.dumps(reasons) if reasons else None
+        limits_json = json.dumps(limits) if limits else None
+
+        cursor = self._db.execute(
+            """
+            INSERT INTO strategy_approvals
+            (strategy_name, strategy_version, window_from, window_to, run_id,
+             git_sha, config_hash, score, status, reasons_json, limits_json, approved_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                strategy_name,
+                strategy_version,
+                window_from,
+                window_to,
+                run_id,
+                git_sha,
+                config_hash,
+                score,
+                status,
+                reasons_json,
+                limits_json,
+                approved_by,
+            ),
+        )
+        logger.info(f"Saved approval {strategy_name} v{strategy_version}: {status}")
+        return cursor.lastrowid or 0
+
+    def get_approval(self, approval_id: int) -> dict[str, Any] | None:
+        """Get an approval by ID.
+
+        Args:
+            approval_id: Approval record ID
+
+        Returns:
+            Approval dict or None
+        """
+        row = self._db.fetch_one(
+            "SELECT * FROM strategy_approvals WHERE id = ?",
+            (approval_id,),
+        )
+        if row:
+            return self._parse_approval_row(row)
+        return None
+
+    def get_active_approval(
+        self,
+        strategy_name: str,
+        strategy_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Get the active (APPROVED) approval for a strategy.
+
+        Args:
+            strategy_name: Strategy name
+            strategy_version: Optional specific version
+
+        Returns:
+            Approval dict or None
+        """
+        if strategy_version:
+            row = self._db.fetch_one(
+                """
+                SELECT * FROM strategy_approvals
+                WHERE strategy_name = ? AND strategy_version = ? AND status = 'APPROVED'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (strategy_name, strategy_version),
+            )
+        else:
+            row = self._db.fetch_one(
+                """
+                SELECT * FROM strategy_approvals
+                WHERE strategy_name = ? AND status = 'APPROVED'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (strategy_name,),
+            )
+        if row:
+            return self._parse_approval_row(row)
+        return None
+
+    def get_approvals(
+        self,
+        status: str | None = None,
+        strategy_name: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Get approval records.
+
+        Args:
+            status: Optional status filter
+            strategy_name: Optional strategy filter
+            limit: Maximum results
+
+        Returns:
+            List of approval dicts
+        """
+        conditions = []
+        params: list[Any] = []
+
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if strategy_name:
+            conditions.append("strategy_name = ?")
+            params.append(strategy_name)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+
+        rows = self._db.fetch_all(
+            f"SELECT * FROM strategy_approvals {where} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [self._parse_approval_row(row) for row in rows]
+
+    def revoke_approval(
+        self,
+        approval_id: int,
+        reason: str,
+    ) -> None:
+        """Revoke an approval.
+
+        Args:
+            approval_id: Approval ID to revoke
+            reason: Reason for revocation
+        """
+        now = datetime.now(UTC).isoformat()
+        self._db.execute(
+            """
+            UPDATE strategy_approvals
+            SET status = 'REVOKED', revoked_at = ?, revoke_reason = ?
+            WHERE id = ?
+            """,
+            (now, reason, approval_id),
+        )
+        logger.info(f"Revoked approval {approval_id}: {reason}")
+
+    def _parse_approval_row(self, row: Any) -> dict[str, Any]:
+        """Parse an approval row from database."""
+        data = dict(row)
+        if data.get("reasons_json"):
+            data["reasons"] = json.loads(data["reasons_json"])
+        if data.get("limits_json"):
+            data["limits"] = json.loads(data["limits_json"])
+        return data
+
+    # =========================================================================
+    # Risk Events (Phase 3)
+    # =========================================================================
+
+    def save_risk_event(
+        self,
+        severity: str,
+        event_type: str,
+        message: str,
+        strategy_name: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        """Save a risk event.
+
+        Args:
+            severity: INFO, WARN, CRITICAL
+            event_type: Event type code
+            message: Human-readable message
+            strategy_name: Related strategy
+            details: Additional details dict
+
+        Returns:
+            Event ID
+        """
+        details_json = json.dumps(details) if details else None
+
+        cursor = self._db.execute(
+            """
+            INSERT INTO risk_events (severity, event_type, strategy_name, message, details_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (severity, event_type, strategy_name, message, details_json),
+        )
+        return cursor.lastrowid or 0
+
+    def get_risk_events(
+        self,
+        severity: str | None = None,
+        event_type: str | None = None,
+        strategy_name: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get risk events.
+
+        Args:
+            severity: Optional severity filter
+            event_type: Optional event type filter
+            strategy_name: Optional strategy filter
+            limit: Maximum results
+
+        Returns:
+            List of event dicts
+        """
+        conditions = []
+        params: list[Any] = []
+
+        if severity:
+            conditions.append("severity = ?")
+            params.append(severity)
+        if event_type:
+            conditions.append("event_type = ?")
+            params.append(event_type)
+        if strategy_name:
+            conditions.append("strategy_name = ?")
+            params.append(strategy_name)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+
+        rows = self._db.fetch_all(
+            f"SELECT * FROM risk_events {where} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )
+
+        results = []
+        for row in rows:
+            data = dict(row)
+            if data.get("details_json"):
+                data["details"] = json.loads(data["details_json"])
+            results.append(data)
+        return results

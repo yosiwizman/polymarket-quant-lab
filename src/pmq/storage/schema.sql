@@ -214,3 +214,47 @@ CREATE TABLE IF NOT EXISTS backtest_manifests (
 
 CREATE INDEX IF NOT EXISTS idx_manifests_run ON backtest_manifests(run_id);
 CREATE INDEX IF NOT EXISTS idx_manifests_strategy ON backtest_manifests(strategy);
+
+-- =============================================================================
+-- Phase 3: Strategy Approval + Risk Governance
+-- =============================================================================
+
+-- Strategy approvals: formal approval registry for strategies
+CREATE TABLE IF NOT EXISTS strategy_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    strategy_name TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    window_from TEXT NOT NULL,
+    window_to TEXT NOT NULL,
+    run_id TEXT,  -- backtest run ID used for approval
+    git_sha TEXT,
+    config_hash TEXT,
+    score REAL DEFAULT 0.0,
+    status TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING, APPROVED, REJECTED, REVOKED
+    reasons_json TEXT,  -- JSON array of pass/fail reasons
+    limits_json TEXT,  -- JSON with risk limits (notional, trades/hr, etc.)
+    approved_by TEXT,
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    FOREIGN KEY (run_id) REFERENCES backtest_runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_strategy ON strategy_approvals(strategy_name, strategy_version);
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON strategy_approvals(status);
+CREATE INDEX IF NOT EXISTS idx_approvals_created ON strategy_approvals(created_at DESC);
+
+-- Risk events: audit log for risk-related events
+CREATE TABLE IF NOT EXISTS risk_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    severity TEXT NOT NULL DEFAULT 'INFO',  -- INFO, WARN, CRITICAL
+    event_type TEXT NOT NULL,  -- LIMIT_BREACH, APPROVAL_CHECK, KILL_TRIGGERED, etc.
+    strategy_name TEXT,
+    message TEXT NOT NULL,
+    details_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_risk_events_severity ON risk_events(severity);
+CREATE INDEX IF NOT EXISTS idx_risk_events_type ON risk_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_risk_events_created ON risk_events(created_at DESC);

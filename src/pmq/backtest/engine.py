@@ -272,7 +272,9 @@ class BacktestEngine:
         """
         return {
             "balance": self.balance,
-            "position_count": len([p for p in self.positions.values() if p.yes_quantity > 0 or p.no_quantity > 0]),
+            "position_count": len(
+                [p for p in self.positions.values() if p.yes_quantity > 0 or p.no_quantity > 0]
+            ),
             "trade_count": len(self.trades),
             "total_notional": sum(t.notional for t in self.trades),
         }

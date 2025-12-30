@@ -77,13 +77,15 @@ class BacktestRunner:
         run_id = str(uuid.uuid4())
 
         # Store config for reproducibility
-        config_json = json.dumps({
-            "strategy": "arb",
-            "quantity": quantity,
-            "threshold": arb_config.threshold,
-            "min_liquidity": arb_config.min_liquidity,
-            "initial_balance": self._initial_balance,
-        })
+        config_json = json.dumps(
+            {
+                "strategy": "arb",
+                "quantity": quantity,
+                "threshold": arb_config.threshold,
+                "min_liquidity": arb_config.min_liquidity,
+                "initial_balance": self._initial_balance,
+            }
+        )
 
         # Create run record
         self._dao.create_backtest_run(
@@ -106,15 +108,20 @@ class BacktestRunner:
 
             if not snapshot_times:
                 logger.warning(f"No snapshots found for {start_date} to {end_date}")
-                self._dao.complete_backtest_run(
-                    run_id, self._initial_balance, status="failed"
-                )
+                self._dao.complete_backtest_run(run_id, self._initial_balance, status="failed")
                 # Return empty metrics
                 metrics = BacktestMetrics(
-                    total_pnl=0, max_drawdown=0, win_rate=0, sharpe_ratio=0,
-                    total_trades=0, trades_per_day=0, capital_utilization=0,
-                    total_notional=0, final_balance=self._initial_balance,
-                    peak_equity=self._initial_balance, lowest_equity=self._initial_balance,
+                    total_pnl=0,
+                    max_drawdown=0,
+                    win_rate=0,
+                    sharpe_ratio=0,
+                    total_trades=0,
+                    trades_per_day=0,
+                    capital_utilization=0,
+                    total_notional=0,
+                    final_balance=self._initial_balance,
+                    peak_equity=self._initial_balance,
+                    lowest_equity=self._initial_balance,
                 )
                 return run_id, metrics
 
@@ -178,9 +185,7 @@ class BacktestRunner:
                 self._engine.record_equity(market_prices)
 
             # Calculate metrics
-            metrics = self._metrics_calc.calculate(
-                self._engine, start_date, end_date
-            )
+            metrics = self._metrics_calc.calculate(self._engine, start_date, end_date)
 
             # Save metrics
             self._dao.save_backtest_metrics(
@@ -201,9 +206,7 @@ class BacktestRunner:
             )
 
             # Complete run
-            self._dao.complete_backtest_run(
-                run_id, metrics.final_balance, status="completed"
-            )
+            self._dao.complete_backtest_run(run_id, metrics.final_balance, status="completed")
 
             logger.info(
                 f"Backtest {run_id} completed: "
@@ -215,8 +218,9 @@ class BacktestRunner:
         except Exception as e:
             logger.error(f"Backtest failed: {e}")
             self._dao.complete_backtest_run(
-                run_id, self._engine.balance if self._engine else self._initial_balance,
-                status="failed"
+                run_id,
+                self._engine.balance if self._engine else self._initial_balance,
+                status="failed",
             )
             raise
 
@@ -246,12 +250,14 @@ class BacktestRunner:
         run_id = str(uuid.uuid4())
 
         # Store config
-        config_json = json.dumps({
-            "strategy": "statarb",
-            "quantity": quantity,
-            "pairs_config": pairs_config,
-            "initial_balance": self._initial_balance,
-        })
+        config_json = json.dumps(
+            {
+                "strategy": "statarb",
+                "quantity": quantity,
+                "pairs_config": pairs_config,
+                "initial_balance": self._initial_balance,
+            }
+        )
 
         # Create run record
         self._dao.create_backtest_run(
@@ -276,14 +282,19 @@ class BacktestRunner:
 
             if not scanner.pairs:
                 logger.warning("No stat-arb pairs configured")
-                self._dao.complete_backtest_run(
-                    run_id, self._initial_balance, status="failed"
-                )
+                self._dao.complete_backtest_run(run_id, self._initial_balance, status="failed")
                 metrics = BacktestMetrics(
-                    total_pnl=0, max_drawdown=0, win_rate=0, sharpe_ratio=0,
-                    total_trades=0, trades_per_day=0, capital_utilization=0,
-                    total_notional=0, final_balance=self._initial_balance,
-                    peak_equity=self._initial_balance, lowest_equity=self._initial_balance,
+                    total_pnl=0,
+                    max_drawdown=0,
+                    win_rate=0,
+                    sharpe_ratio=0,
+                    total_trades=0,
+                    trades_per_day=0,
+                    capital_utilization=0,
+                    total_notional=0,
+                    final_balance=self._initial_balance,
+                    peak_equity=self._initial_balance,
+                    lowest_equity=self._initial_balance,
                 )
                 return run_id, metrics
 
@@ -298,14 +309,19 @@ class BacktestRunner:
 
             if not snapshot_times:
                 logger.warning(f"No snapshots found for {start_date} to {end_date}")
-                self._dao.complete_backtest_run(
-                    run_id, self._initial_balance, status="failed"
-                )
+                self._dao.complete_backtest_run(run_id, self._initial_balance, status="failed")
                 metrics = BacktestMetrics(
-                    total_pnl=0, max_drawdown=0, win_rate=0, sharpe_ratio=0,
-                    total_trades=0, trades_per_day=0, capital_utilization=0,
-                    total_notional=0, final_balance=self._initial_balance,
-                    peak_equity=self._initial_balance, lowest_equity=self._initial_balance,
+                    total_pnl=0,
+                    max_drawdown=0,
+                    win_rate=0,
+                    sharpe_ratio=0,
+                    total_trades=0,
+                    trades_per_day=0,
+                    capital_utilization=0,
+                    total_notional=0,
+                    final_balance=self._initial_balance,
+                    peak_equity=self._initial_balance,
+                    lowest_equity=self._initial_balance,
                 )
                 return run_id, metrics
 
@@ -368,9 +384,7 @@ class BacktestRunner:
                 self._engine.record_equity(market_prices)
 
             # Calculate metrics
-            metrics = self._metrics_calc.calculate(
-                self._engine, start_date, end_date
-            )
+            metrics = self._metrics_calc.calculate(self._engine, start_date, end_date)
 
             # Save metrics
             self._dao.save_backtest_metrics(
@@ -385,9 +399,7 @@ class BacktestRunner:
             )
 
             # Complete run
-            self._dao.complete_backtest_run(
-                run_id, metrics.final_balance, status="completed"
-            )
+            self._dao.complete_backtest_run(run_id, metrics.final_balance, status="completed")
 
             logger.info(
                 f"Backtest {run_id} completed: "
@@ -399,8 +411,9 @@ class BacktestRunner:
         except Exception as e:
             logger.error(f"Backtest failed: {e}")
             self._dao.complete_backtest_run(
-                run_id, self._engine.balance if self._engine else self._initial_balance,
-                status="failed"
+                run_id,
+                self._engine.balance if self._engine else self._initial_balance,
+                status="failed",
             )
             raise
 

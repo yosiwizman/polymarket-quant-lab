@@ -230,7 +230,7 @@ class TestMetricsCalculator:
         equity_curve = [
             ("2024-01-01T00:00:00", 1000.0),
             ("2024-01-01T01:00:00", 1100.0),  # Peak
-            ("2024-01-01T02:00:00", 990.0),   # Drawdown
+            ("2024-01-01T02:00:00", 990.0),  # Drawdown
             ("2024-01-01T03:00:00", 1050.0),
         ]
 
@@ -245,9 +245,7 @@ class TestMetricsCalculator:
         """Test trades per day calculation."""
         calc = MetricsCalculator()
 
-        trades_per_day = calc._calculate_trades_per_day(
-            "2024-01-01", "2024-01-08", total_trades=14
-        )
+        trades_per_day = calc._calculate_trades_per_day("2024-01-01", "2024-01-08", total_trades=14)
 
         # 7 days, 14 trades = 2 trades/day
         assert trades_per_day == 2.0
@@ -355,7 +353,9 @@ class TestBacktestRunner:
     def test_run_arb_backtest_with_snapshots(self, dao):
         """Test backtest with snapshots produces trades."""
         # Create market and snapshots
-        dao.upsert_market(create_test_market("arb_m", yes_price=0.45, no_price=0.45, liquidity=500.0))
+        dao.upsert_market(
+            create_test_market("arb_m", yes_price=0.45, no_price=0.45, liquidity=500.0)
+        )
 
         # Save snapshots with arb opportunity (YES+NO < 0.99)
         dao.save_snapshot("arb_m", 0.45, 0.45, 500.0, 5000.0, "2024-01-01T12:00:00")
@@ -375,7 +375,9 @@ class TestBacktestRunner:
     def test_deterministic_backtest_results(self, dao):
         """Test that running same backtest twice produces identical results."""
         # Setup
-        dao.upsert_market(create_test_market("det_m", yes_price=0.45, no_price=0.45, liquidity=500.0))
+        dao.upsert_market(
+            create_test_market("det_m", yes_price=0.45, no_price=0.45, liquidity=500.0)
+        )
         dao.save_snapshot("det_m", 0.45, 0.45, 500.0, 5000.0, "2024-01-01T12:00:00")
 
         # Run 1
@@ -402,7 +404,9 @@ class TestBacktestRunner:
 
     def test_get_run_report(self, dao):
         """Test getting backtest run report."""
-        dao.upsert_market(create_test_market("rep_m", yes_price=0.45, no_price=0.45, liquidity=500.0))
+        dao.upsert_market(
+            create_test_market("rep_m", yes_price=0.45, no_price=0.45, liquidity=500.0)
+        )
         dao.save_snapshot("rep_m", 0.45, 0.45, 500.0, 5000.0, "2024-01-01T12:00:00")
 
         runner = BacktestRunner(dao=dao, initial_balance=10000.0)
@@ -421,7 +425,9 @@ class TestBacktestRunner:
 
     def test_list_runs(self, dao):
         """Test listing backtest runs."""
-        dao.upsert_market(create_test_market("list_m", yes_price=0.45, no_price=0.45, liquidity=500.0))
+        dao.upsert_market(
+            create_test_market("list_m", yes_price=0.45, no_price=0.45, liquidity=500.0)
+        )
         dao.save_snapshot("list_m", 0.45, 0.45, 500.0, 5000.0, "2024-01-01T12:00:00")
 
         runner = BacktestRunner(dao=dao, initial_balance=10000.0)

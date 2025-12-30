@@ -124,7 +124,9 @@ def sync(
             if snapshot:
                 snapshot_time = datetime.now(UTC).isoformat()
                 snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time)
-                console.print(f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]")
+                console.print(
+                    f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                )
 
             # Show summary
             active_count = sum(1 for m in markets if m.active and not m.closed)
@@ -271,7 +273,7 @@ def scan(
                 console.print(table)
         else:
             console.print(
-                "\n[dim]No stat-arb pairs configured. " "Add pairs to config/pairs.yml[/dim]"
+                "\n[dim]No stat-arb pairs configured. Add pairs to config/pairs.yml[/dim]"
             )
 
 
@@ -354,7 +356,7 @@ def paper_run(
                     if dry_run:
                         console.print(
                             f"[dim]DRY RUN: Would trade {signal.market_id[:16]}... "
-                            f"(profit: {signal.profit_potential*100:.2f}%)[/dim]"
+                            f"(profit: {signal.profit_potential * 100:.2f}%)[/dim]"
                         )
                     else:
                         try:
@@ -561,7 +563,7 @@ def report() -> None:
             sig_table.add_row(
                 sig["type"],
                 market_ids,
-                f"{sig['profit_potential']*100:.2f}%",
+                f"{sig['profit_potential'] * 100:.2f}%",
                 sig["created_at"][:19],
             )
 
@@ -951,9 +953,7 @@ def backtest_run(
 
             console.print(table)
 
-            console.print(
-                f"\n[dim]View details: pmq backtest report --run-id {run_id}[/dim]"
-            )
+            console.print(f"\n[dim]View details: pmq backtest report --run-id {run_id}[/dim]")
 
         except Exception as e:
             console.print(f"[red]Backtest failed: {e}[/red]")
@@ -1056,9 +1056,7 @@ def backtest_report(
         if report["trade_count"] > 50:
             console.print(f"[dim]... and {report['trade_count'] - 50} more trades[/dim]")
 
-    console.print(
-        "\n[dim]Note: Backtest results are not guarantees of future performance.[/dim]"
-    )
+    console.print("\n[dim]Note: Backtest results are not guarantees of future performance.[/dim]")
 
 
 @backtest_app.command("list")
@@ -1163,14 +1161,16 @@ def backtest_export(
             console.print(f"[green]✓ Exported {len(trades)} trades to {filename}[/green]")
 
         # Export summary
-        summary = [{
-            "run_id": run_id,
-            "strategy": report["run"]["strategy"],
-            "start_date": report["run"]["start_date"],
-            "end_date": report["run"]["end_date"],
-            "status": report["run"]["status"],
-            **(report["metrics"] or {}),
-        }]
+        summary = [
+            {
+                "run_id": run_id,
+                "strategy": report["run"]["strategy"],
+                "start_date": report["run"]["start_date"],
+                "end_date": report["run"]["end_date"],
+                "status": report["run"]["status"],
+                **(report["metrics"] or {}),
+            }
+        ]
         summary_file = output_dir / f"backtest_summary_{run_id[:8]}_{timestamp}.csv"
         _write_csv(summary_file, summary)
         console.print(f"[green]✓ Exported summary to {summary_file}[/green]")

@@ -80,6 +80,8 @@ class StatArbScanner:
         """Load pairs from configuration file."""
         pairs_data = load_pairs_config(self._config.pairs_file)
         pairs = []
+        if not pairs_data:
+            return pairs
         for data in pairs_data:
             try:
                 pair = StatArbPair.from_dict(data)

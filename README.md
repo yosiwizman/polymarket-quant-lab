@@ -559,6 +559,46 @@ poetry run pmq statarb explain --from 2024-12-30 --to 2024-12-30 --pairs config/
 poetry run pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml --last-times 30
 ```
 
+### StatArb Pair Discovery (Phase 4.2)
+
+For more sophisticated pair discovery using correlation analysis:
+
+```powershell
+# Discover pairs using correlation of YES prices (deterministic, no live API calls)
+poetry run pmq statarb discover --from 2024-12-01 --to 2024-12-30 --top 20
+
+# Save discovered pairs to config file
+poetry run pmq statarb discover --from 2024-12-01 --to 2024-12-30 --out config/pairs.yml
+
+# Customize discovery parameters
+poetry run pmq statarb discover --from 2024-12-01 --to 2024-12-30 \
+  --top 50 \
+  --min-overlap 10 \
+  --min-corr 0.5 \
+  --out config/pairs.yml
+```
+
+#### Validate Pairs Against Snapshot Data
+
+```powershell
+# Check that pairs have sufficient overlap in a date range
+poetry run pmq statarb validate --from 2024-12-01 --to 2024-12-30 --pairs config/pairs.yml
+
+# With custom minimum overlap requirement
+poetry run pmq statarb validate --from 2024-12-01 --to 2024-12-30 --pairs config/pairs.yml --min-overlap 20
+```
+
+#### Discovery vs Suggest
+
+| Command | Method | Best For |
+|---------|--------|----------|
+| `statarb pairs suggest` | Slug-based grouping | Quick pairs from related events |
+| `statarb discover` | Correlation analysis | Finding statistically correlated pairs |
+
+The `discover` command computes Pearson correlation between YES prices across overlapping snapshot times. Results are deterministic: same inputs always produce the same output.
+
+> ⚠️ **PAPER ONLY**: All statarb trading is paper-only. No wallets, no live orders, no private keys.
+
 ## Project Structure
 
 ```
@@ -708,13 +748,20 @@ poetry run mypy src
 - [x] Dashboard evaluations section
 - [x] API endpoints (`/api/evals`)
 
-### Phase 4.1 (Current) ✅
+### Phase 4.1 ✅
 - [x] StatArb pairs config validation + schema
 - [x] `pmq statarb pairs suggest` - Generate pairs from snapshots
-- [x] `pmq statarb pairs validate` - Validate pairs config
+- [x] `pmq statarb pairs validate` - Validate pairs config file
 - [x] `pmq statarb explain` - Debug 0 trades issues
 - [x] Evaluation pipeline integration (`--pairs` flag)
 - [x] Pairs config artifacts in evaluation reports
+
+### Phase 4.2 (Current) ✅
+- [x] `pmq statarb discover` - Correlation-based pair discovery
+- [x] `pmq statarb validate` - Validate overlap in date range
+- [x] Deterministic discovery output (same inputs → same outputs)
+- [x] Discovery tests (correlation, overlap, determinism)
+- [x] Documentation: StatArb Quickstart
 
 ### Phase 5 (Future)
 - [ ] Authenticated CLOB integration

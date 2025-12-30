@@ -2536,7 +2536,7 @@ def statarb_pairs(
         except PairsConfigError as e:
             console.print("[red]✗ Invalid pairs configuration[/red]")
             console.print(f"[red]{e}[/red]")
-            raise typer.Exit(1) from None
+            raise typer.Exit(1) from e
 
     elif action == "suggest":
         # Suggest pairs from snapshot data (DB-only, no live API)

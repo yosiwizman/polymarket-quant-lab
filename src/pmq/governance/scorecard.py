@@ -158,7 +158,9 @@ def compute_scorecard(
     # --- Drawdown Score (20 points) ---
     if max_drawdown > thresholds["max_drawdown"]:
         scores["drawdown"] = 0
-        reasons.append(f"FAIL: Max drawdown too high ({max_drawdown:.1%} > {thresholds['max_drawdown']:.1%})")
+        reasons.append(
+            f"FAIL: Max drawdown too high ({max_drawdown:.1%} > {thresholds['max_drawdown']:.1%})"
+        )
     elif max_drawdown <= 0.05:
         scores["drawdown"] = SCORE_WEIGHTS["drawdown"]
     elif max_drawdown <= 0.10:
@@ -193,7 +195,9 @@ def compute_scorecard(
     # --- Sharpe Score (20 points) ---
     if sharpe_ratio < thresholds["sharpe"]:
         scores["sharpe"] = 0
-        reasons.append(f"FAIL: Sharpe ratio too low ({sharpe_ratio:.2f} < {thresholds['sharpe']:.2f})")
+        reasons.append(
+            f"FAIL: Sharpe ratio too low ({sharpe_ratio:.2f} < {thresholds['sharpe']:.2f})"
+        )
     elif sharpe_ratio >= 2.0:
         scores["sharpe"] = SCORE_WEIGHTS["sharpe"]
     elif sharpe_ratio >= 1.5:
@@ -230,7 +234,9 @@ def compute_scorecard(
     if data_quality_pct is not None:
         if data_quality_pct < thresholds["data_quality_pct"]:
             scores["data_quality"] = 0
-            reasons.append(f"FAIL: Data quality too low ({data_quality_pct:.1f}% < {thresholds['data_quality_pct']:.1f}%)")
+            reasons.append(
+                f"FAIL: Data quality too low ({data_quality_pct:.1f}% < {thresholds['data_quality_pct']:.1f}%)"
+            )
         elif data_quality_pct >= 95:
             scores["data_quality"] = SCORE_WEIGHTS["data_quality"]
         elif data_quality_pct >= 85:
@@ -246,7 +252,7 @@ def compute_scorecard(
             scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * 0.2 if validation_mode else 0
 
         if largest_gap_seconds > 3600 and not validation_mode:  # More than 1 hour gap
-            warnings.append(f"Large data gap detected: {largest_gap_seconds/60:.0f} minutes")
+            warnings.append(f"Large data gap detected: {largest_gap_seconds / 60:.0f} minutes")
     else:
         # No data quality info - partial score (or full in validation mode)
         scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * (0.8 if validation_mode else 0.5)

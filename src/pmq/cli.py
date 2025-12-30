@@ -976,7 +976,9 @@ def backtest_run(
                     end_date=to_date,
                 )
             else:
-                console.print(f"[red]Unknown strategy: {strategy}. Use: arb, statarb, observer[/red]")
+                console.print(
+                    f"[red]Unknown strategy: {strategy}. Use: arb, statarb, observer[/red]"
+                )
                 raise typer.Exit(1)
 
             # Display results

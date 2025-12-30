@@ -140,9 +140,7 @@ class EvaluationReporter:
             "summary",
         ]
 
-        values = [
-            str(eval_data.get(h, "")) for h in headers
-        ]
+        values = [str(eval_data.get(h, "")) for h in headers]
 
         return ",".join(headers) + "\n" + ",".join(values)
 
@@ -198,58 +196,70 @@ class EvaluationReporter:
         ]
 
         if result.backtest_run_id:
-            lines.extend([
-                "## Step 2: Backtest",
-                "",
-                f"- **Run ID:** `{result.backtest_run_id}`",
-                f"- **PnL:** ${result.backtest_pnl:.2f}",
-                f"- **Score:** {result.backtest_score:.1f}/100",
-                "",
-            ])
+            lines.extend(
+                [
+                    "## Step 2: Backtest",
+                    "",
+                    f"- **Run ID:** `{result.backtest_run_id}`",
+                    f"- **PnL:** ${result.backtest_pnl:.2f}",
+                    f"- **Score:** {result.backtest_score:.1f}/100",
+                    "",
+                ]
+            )
 
-        lines.extend([
-            "## Step 3: Approval",
-            "",
-            f"- **Status:** {result.approval_status}",
-            "",
-            "**Reasons:**",
-            "",
-        ])
+        lines.extend(
+            [
+                "## Step 3: Approval",
+                "",
+                f"- **Status:** {result.approval_status}",
+                "",
+                "**Reasons:**",
+                "",
+            ]
+        )
 
         for reason in result.approval_reasons:
             lines.append(f"- {reason}")
 
         if result.paper_run_id:
-            lines.extend([
-                "",
-                "## Step 4: Paper Trading",
-                "",
-                f"- **Run ID:** `{result.paper_run_id}`",
-                f"- **Trades:** {result.paper_trades_count}",
-                f"- **Errors:** {result.paper_errors_count}",
-                "",
-            ])
+            lines.extend(
+                [
+                    "",
+                    "## Step 4: Paper Trading",
+                    "",
+                    f"- **Run ID:** `{result.paper_run_id}`",
+                    f"- **Trades:** {result.paper_trades_count}",
+                    f"- **Errors:** {result.paper_errors_count}",
+                    "",
+                ]
+            )
 
         if result.commands:
-            lines.extend([
-                "---",
-                "",
-                "## Commands Executed",
-                "",
-                "```bash",
-            ])
+            lines.extend(
+                [
+                    "---",
+                    "",
+                    "## Commands Executed",
+                    "",
+                    "```bash",
+                ]
+            )
             for cmd in result.commands:
                 lines.append(cmd)
-            lines.extend([
-                "```",
-                "",
-            ])
+            lines.extend(
+                [
+                    "```",
+                    "",
+                ]
+            )
 
-        lines.extend([
-            "---",
-            "",
-            f"*Report generated at {datetime.now(UTC).isoformat()}*",
-        ])
+        lines.extend(
+            [
+                "---",
+                "",
+                f"*Report generated at {datetime.now(UTC).isoformat()}*",
+            ]
+        )
 
         return "\n".join(lines)
 
@@ -287,22 +297,26 @@ class EvaluationReporter:
 
         backtest_run_id = eval_data.get("backtest_run_id")
         if backtest_run_id:
-            lines.extend([
-                "## Step 2: Backtest",
-                "",
-                f"- **Run ID:** `{backtest_run_id}`",
-                f"- **PnL:** ${eval_data.get('backtest_pnl', 0):.2f}",
-                f"- **Score:** {eval_data.get('backtest_score', 0):.1f}/100",
-                "",
-            ])
+            lines.extend(
+                [
+                    "## Step 2: Backtest",
+                    "",
+                    f"- **Run ID:** `{backtest_run_id}`",
+                    f"- **PnL:** ${eval_data.get('backtest_pnl', 0):.2f}",
+                    f"- **Score:** {eval_data.get('backtest_score', 0):.1f}/100",
+                    "",
+                ]
+            )
 
         approval_status = eval_data.get("approval_status", "PENDING")
-        lines.extend([
-            "## Step 3: Approval",
-            "",
-            f"- **Status:** {approval_status}",
-            "",
-        ])
+        lines.extend(
+            [
+                "## Step 3: Approval",
+                "",
+                f"- **Status:** {approval_status}",
+                "",
+            ]
+        )
 
         approval_reasons = eval_data.get("approval_reasons_json")
         if approval_reasons:
@@ -319,41 +333,49 @@ class EvaluationReporter:
 
         paper_run_id = eval_data.get("paper_run_id")
         if paper_run_id:
-            lines.extend([
-                "## Step 4: Paper Trading",
-                "",
-                f"- **Run ID:** `{paper_run_id}`",
-                f"- **Trades:** {eval_data.get('paper_trades_count', 0)}",
-                f"- **Errors:** {eval_data.get('paper_errors_count', 0)}",
-                "",
-            ])
+            lines.extend(
+                [
+                    "## Step 4: Paper Trading",
+                    "",
+                    f"- **Run ID:** `{paper_run_id}`",
+                    f"- **Trades:** {eval_data.get('paper_trades_count', 0)}",
+                    f"- **Errors:** {eval_data.get('paper_errors_count', 0)}",
+                    "",
+                ]
+            )
 
         commands_json = eval_data.get("commands_json")
         if commands_json:
             try:
                 commands = json.loads(commands_json)
                 if commands:
-                    lines.extend([
-                        "---",
-                        "",
-                        "## Commands Executed",
-                        "",
-                        "```bash",
-                    ])
+                    lines.extend(
+                        [
+                            "---",
+                            "",
+                            "## Commands Executed",
+                            "",
+                            "```bash",
+                        ]
+                    )
                     for cmd in commands:
                         lines.append(cmd)
-                    lines.extend([
-                        "```",
-                        "",
-                    ])
+                    lines.extend(
+                        [
+                            "```",
+                            "",
+                        ]
+                    )
             except json.JSONDecodeError:
                 pass
 
-        lines.extend([
-            "---",
-            "",
-            f"*Report generated at {datetime.now(UTC).isoformat()}*",
-        ])
+        lines.extend(
+            [
+                "---",
+                "",
+                f"*Report generated at {datetime.now(UTC).isoformat()}*",
+            ]
+        )
 
         return "\n".join(lines)
 

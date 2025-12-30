@@ -2370,11 +2370,11 @@ def eval_report(
         if artifacts:
             console.print("\n[bold]Artifacts:[/bold]")
             for art in artifacts:
-                console.print(f"  • {art['kind']} ({len(art['content'])} bytes) @ {art['created_at'][:19]}")
+                console.print(
+                    f"  • {art['kind']} ({len(art['content'])} bytes) @ {art['created_at'][:19]}"
+                )
 
-    console.print(
-        f"\n[dim]Export: pmq eval export --id {eval_id} --format md|json|csv[/dim]"
-    )
+    console.print(f"\n[dim]Export: pmq eval export --id {eval_id} --format md|json|csv[/dim]")
 
 
 @eval_app.command("export")

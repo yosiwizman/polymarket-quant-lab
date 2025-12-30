@@ -9,9 +9,8 @@ Tests cover:
 
 import json
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -77,9 +76,9 @@ class TestEvaluationReporter:
     @pytest.fixture
     def temp_db(self) -> Database:
         """Create a temporary database for testing."""
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-        tmp.close()
-        db = Database(db_path=Path(tmp.name))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+            db_path = Path(tmp.name)
+        db = Database(db_path=db_path)
         db.initialize()
         return db
 
@@ -217,9 +216,9 @@ class TestEvaluationPipeline:
     @pytest.fixture
     def temp_db(self) -> Database:
         """Create a temporary database for testing."""
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-        tmp.close()
-        db = Database(db_path=Path(tmp.name))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+            db_path = Path(tmp.name)
+        db = Database(db_path=db_path)
         db.initialize()
         return db
 
@@ -352,9 +351,9 @@ class TestEvaluationDAO:
     @pytest.fixture
     def temp_db(self) -> Database:
         """Create a temporary database for testing."""
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-        tmp.close()
-        db = Database(db_path=Path(tmp.name))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+            db_path = Path(tmp.name)
+        db = Database(db_path=db_path)
         db.initialize()
         return db
 

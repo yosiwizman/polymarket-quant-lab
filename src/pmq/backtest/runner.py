@@ -5,7 +5,9 @@ and executes strategies via the BacktestEngine. It ensures determinism
 by processing data in a fixed order.
 """
 
+import hashlib
 import json
+import subprocess
 import uuid
 from typing import Any
 
@@ -17,6 +19,40 @@ from pmq.models import Outcome, Side
 from pmq.storage.dao import DAO
 
 logger = get_logger("backtest.runner")
+
+
+def _get_git_sha() -> str | None:
+    """Get current git commit SHA.
+
+    Returns:
+        SHA string or None if not in a git repo
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
+
+
+def _compute_config_hash(config: dict[str, Any]) -> str:
+    """Compute SHA256 hash of config for reproducibility.
+
+    Args:
+        config: Configuration dict
+
+    Returns:
+        Hex digest of config hash
+    """
+    # Sort keys for determinism
+    normalized = json.dumps(config, sort_keys=True)
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 class BacktestRunner:
@@ -207,6 +243,26 @@ class BacktestRunner:
 
             # Complete run
             self._dao.complete_backtest_run(run_id, metrics.final_balance, status="completed")
+
+            # Save manifest for reproducibility
+            config_for_hash = {
+                "strategy": "arb",
+                "quantity": quantity,
+                "threshold": arb_config.threshold,
+                "min_liquidity": arb_config.min_liquidity,
+                "initial_balance": self._initial_balance,
+            }
+            self._dao.save_backtest_manifest(
+                run_id=run_id,
+                strategy="arb",
+                window_from=start_date,
+                window_to=end_date,
+                config_hash=_compute_config_hash(config_for_hash),
+                code_git_sha=_get_git_sha(),
+                snapshot_count=len(snapshot_times),
+                first_snapshot_time=snapshot_times[0] if snapshot_times else None,
+                last_snapshot_time=snapshot_times[-1] if snapshot_times else None,
+            )
 
             logger.info(
                 f"Backtest {run_id} completed: "
@@ -406,6 +462,26 @@ class BacktestRunner:
 
             # Complete run
             self._dao.complete_backtest_run(run_id, metrics.final_balance, status="completed")
+
+            # Save manifest for reproducibility
+            config_for_hash = {
+                "strategy": "statarb",
+                "quantity": quantity,
+                "pairs_config": pairs_config,
+                "initial_balance": self._initial_balance,
+            }
+            self._dao.save_backtest_manifest(
+                run_id=run_id,
+                strategy="statarb",
+                window_from=start_date,
+                window_to=end_date,
+                config_hash=_compute_config_hash(config_for_hash),
+                code_git_sha=_get_git_sha(),
+                market_filter=list(pair_market_ids),
+                snapshot_count=len(snapshot_times),
+                first_snapshot_time=snapshot_times[0] if snapshot_times else None,
+                last_snapshot_time=snapshot_times[-1] if snapshot_times else None,
+            )
 
             logger.info(
                 f"Backtest {run_id} completed: "

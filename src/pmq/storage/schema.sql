@@ -169,3 +169,48 @@ CREATE TABLE IF NOT EXISTS backtest_metrics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backtest_metrics_run ON backtest_metrics(run_id);
+
+-- =============================================================================
+-- Phase 2.5: Snapshot Pipeline + Replay Hardening
+-- =============================================================================
+
+-- Snapshot quality reports: track data quality over time windows
+CREATE TABLE IF NOT EXISTS snapshot_quality_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    window_from TEXT NOT NULL,
+    window_to TEXT NOT NULL,
+    expected_interval_seconds INTEGER NOT NULL,
+    markets_seen INTEGER DEFAULT 0,
+    snapshots_written INTEGER DEFAULT 0,
+    missing_intervals INTEGER DEFAULT 0,
+    largest_gap_seconds REAL DEFAULT 0.0,
+    duplicate_count INTEGER DEFAULT 0,
+    stale_market_count INTEGER DEFAULT 0,
+    coverage_pct REAL DEFAULT 0.0,
+    notes_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_reports_window ON snapshot_quality_reports(window_from, window_to);
+CREATE INDEX IF NOT EXISTS idx_quality_reports_created ON snapshot_quality_reports(created_at DESC);
+
+-- Backtest manifests: full reproducibility record for each run
+CREATE TABLE IF NOT EXISTS backtest_manifests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    strategy TEXT NOT NULL,
+    window_from TEXT NOT NULL,
+    window_to TEXT NOT NULL,
+    snapshot_interval_seconds INTEGER,
+    market_filter_json TEXT,  -- JSON array of market IDs if filtered
+    config_hash TEXT,  -- SHA256 of normalized config
+    code_git_sha TEXT,  -- Git commit SHA at run time
+    snapshot_count INTEGER DEFAULT 0,
+    snapshot_time_range_json TEXT,  -- first/last snapshot times
+    notes TEXT,
+    FOREIGN KEY (run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifests_run ON backtest_manifests(run_id);
+CREATE INDEX IF NOT EXISTS idx_manifests_strategy ON backtest_manifests(strategy);

@@ -225,7 +225,7 @@ class TestScorecard:
     def test_validation_mode_lower_score_threshold(self) -> None:
         """Test validation mode requires 40 instead of 60."""
         # Score of 45 fails in standard mode
-        standard = compute_scorecard(
+        _standard = compute_scorecard(
             total_pnl=100.0,
             max_drawdown=0.15,
             win_rate=0.45,
@@ -238,7 +238,7 @@ class TestScorecard:
             validation_mode=False,
         )
         # Note: may or may not pass depending on exact score calculation
-        # The point is validation mode is more lenient
+        # The point is validation mode is more lenient (unused but kept for reference)
 
         # Same metrics in validation mode
         validation = compute_scorecard(

@@ -5,7 +5,7 @@ to ensure snapshot data is suitable for backtesting.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pmq.logging import get_logger
@@ -35,17 +35,17 @@ def _parse_iso_datetime(dt_str: str) -> datetime:
         dt = datetime.fromisoformat(normalized)
         # If naive (no timezone), assume UTC
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt
     except ValueError:
         # Fallback: try basic parsing and assume UTC
         try:
             dt = datetime.fromisoformat(dt_str.split("+")[0].replace("Z", ""))
-            return dt.replace(tzinfo=timezone.utc)
+            return dt.replace(tzinfo=UTC)
         except ValueError:
             # Last resort: return current time (shouldn't happen)
             logger.warning(f"Could not parse datetime: {dt_str}")
-            return datetime.now(timezone.utc)
+            return datetime.now(UTC)
 
 
 # Minimum distinct snapshot times required for meaningful analysis

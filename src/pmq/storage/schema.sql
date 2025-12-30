@@ -96,3 +96,76 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     value TEXT,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- =============================================================================
+-- Backtesting Tables (Phase 2)
+-- =============================================================================
+
+-- Market snapshots: immutable time-series data for backtesting
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id TEXT NOT NULL,
+    yes_price REAL NOT NULL,
+    no_price REAL NOT NULL,
+    liquidity REAL DEFAULT 0.0,
+    volume REAL DEFAULT 0.0,
+    snapshot_time TEXT NOT NULL,  -- UTC timestamp
+    FOREIGN KEY (market_id) REFERENCES markets(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_market ON market_snapshots(market_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_time ON market_snapshots(snapshot_time);
+CREATE INDEX IF NOT EXISTS idx_snapshots_market_time ON market_snapshots(market_id, snapshot_time);
+
+-- Backtest runs: metadata for each backtest execution
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id TEXT PRIMARY KEY,  -- UUID run_id
+    strategy TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    initial_balance REAL NOT NULL,
+    final_balance REAL,
+    config_json TEXT,  -- Strategy configuration
+    status TEXT DEFAULT 'pending',  -- pending, running, completed, failed
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy ON backtest_runs(strategy);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_status ON backtest_runs(status);
+
+-- Backtest trades: simulated trades during backtest
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    side TEXT NOT NULL,  -- BUY, SELL
+    outcome TEXT NOT NULL,  -- YES, NO
+    price REAL NOT NULL,
+    quantity REAL NOT NULL,
+    notional REAL NOT NULL,
+    trade_time TEXT NOT NULL,  -- Simulated time from snapshot
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_market ON backtest_trades(market_id);
+
+-- Backtest metrics: computed metrics for each run
+CREATE TABLE IF NOT EXISTS backtest_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    total_pnl REAL DEFAULT 0.0,
+    max_drawdown REAL DEFAULT 0.0,
+    win_rate REAL DEFAULT 0.0,
+    sharpe_ratio REAL DEFAULT 0.0,
+    total_trades INTEGER DEFAULT 0,
+    trades_per_day REAL DEFAULT 0.0,
+    capital_utilization REAL DEFAULT 0.0,
+    metrics_json TEXT,  -- Additional metrics as JSON
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_metrics_run ON backtest_metrics(run_id);

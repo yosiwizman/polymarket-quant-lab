@@ -82,14 +82,21 @@ def sync(
         bool,
         typer.Option("--clear-cache", help="Clear cache before syncing"),
     ] = False,
+    snapshot: Annotated[
+        bool,
+        typer.Option("--snapshot", help="Save immutable snapshot for backtesting"),
+    ] = False,
 ) -> None:
     """Fetch and cache market data from Gamma API.
 
     This command fetches market metadata and prices from the Polymarket
     Gamma API and stores them in the local SQLite database.
 
+    Use --snapshot to save time-series data for backtesting.
+
     Example:
         pmq sync --limit 100
+        pmq sync --snapshot  # Save snapshot for backtesting
     """
     with console.status("[bold green]Syncing market data..."):
         client = GammaClient()
@@ -113,6 +120,14 @@ def sync(
 
             console.print(f"[green]✓ Synced {count} markets[/green]")
 
+            # Save snapshot if requested
+            if snapshot:
+                snapshot_time = datetime.now(UTC).isoformat()
+                snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time)
+                console.print(
+                    f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                )
+
             # Show summary
             active_count = sum(1 for m in markets if m.active and not m.closed)
             total_liquidity = sum(m.liquidity for m in markets)
@@ -126,6 +141,8 @@ def sync(
             table.add_row("Active Markets", str(active_count))
             table.add_row("Total Liquidity", f"${total_liquidity:,.0f}")
             table.add_row("24h Volume", f"${total_volume:,.0f}")
+            if snapshot:
+                table.add_row("Snapshots Saved", str(snapshot_count))
 
             console.print(table)
 
@@ -256,7 +273,7 @@ def scan(
                 console.print(table)
         else:
             console.print(
-                "\n[dim]No stat-arb pairs configured. " "Add pairs to config/pairs.yml[/dim]"
+                "\n[dim]No stat-arb pairs configured. Add pairs to config/pairs.yml[/dim]"
             )
 
 
@@ -339,7 +356,7 @@ def paper_run(
                     if dry_run:
                         console.print(
                             f"[dim]DRY RUN: Would trade {signal.market_id[:16]}... "
-                            f"(profit: {signal.profit_potential*100:.2f}%)[/dim]"
+                            f"(profit: {signal.profit_potential * 100:.2f}%)[/dim]"
                         )
                     else:
                         try:
@@ -546,7 +563,7 @@ def report() -> None:
             sig_table.add_row(
                 sig["type"],
                 market_ids,
-                f"{sig['profit_potential']*100:.2f}%",
+                f"{sig['profit_potential'] * 100:.2f}%",
                 sig["created_at"][:19],
             )
 
@@ -832,6 +849,341 @@ def _write_csv(filepath: Path, data: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(flat_data)
+
+
+# =============================================================================
+# Backtest Commands
+# =============================================================================
+
+backtest_app = typer.Typer(help="Backtesting commands")
+app.add_typer(backtest_app, name="backtest")
+
+
+@backtest_app.command("run")
+def backtest_run(
+    strategy: Annotated[
+        str,
+        typer.Option("--strategy", "-s", help="Strategy to backtest: arb, statarb"),
+    ] = "arb",
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (YYYY-MM-DD)"),
+    ] = "2024-01-01",
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (YYYY-MM-DD)"),
+    ] = "2024-12-31",
+    balance: Annotated[
+        float,
+        typer.Option("--balance", "-b", help="Initial balance"),
+    ] = 10000.0,
+    quantity: Annotated[
+        float,
+        typer.Option("--quantity", "-q", help="Trade quantity per signal"),
+    ] = 10.0,
+    pairs_config: Annotated[
+        str | None,
+        typer.Option("--pairs", help="Pairs config file for statarb"),
+    ] = None,
+) -> None:
+    """Run a backtest on historical snapshot data.
+
+    Requires snapshots to be collected first via `pmq sync --snapshot`.
+    Results are deterministic - same inputs produce same outputs.
+
+    Example:
+        pmq backtest run --strategy arb --from 2024-01-01 --to 2024-01-07
+        pmq backtest run --strategy statarb --pairs config/pairs.yml
+    """
+    from pmq.backtest import BacktestRunner
+
+    dao = DAO()
+
+    # Check for snapshots
+    snapshot_count = dao.count_snapshots()
+    if snapshot_count == 0:
+        console.print(
+            "[red]No snapshots found. Run 'pmq sync --snapshot' to collect data first.[/red]"
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Found {snapshot_count} total snapshots[/cyan]")
+
+    runner = BacktestRunner(dao=dao, initial_balance=balance)
+
+    with console.status(f"[bold green]Running {strategy} backtest..."):
+        try:
+            if strategy == "arb":
+                run_id, metrics = runner.run_arb_backtest(
+                    start_date=from_date,
+                    end_date=to_date,
+                    quantity=quantity,
+                )
+            elif strategy == "statarb":
+                run_id, metrics = runner.run_statarb_backtest(
+                    start_date=from_date,
+                    end_date=to_date,
+                    pairs_config=pairs_config,
+                    quantity=quantity,
+                )
+            else:
+                console.print(f"[red]Unknown strategy: {strategy}[/red]")
+                raise typer.Exit(1)
+
+            # Display results
+            console.print("\n[bold green]Backtest Complete[/bold green]")
+            console.print(f"Run ID: [cyan]{run_id}[/cyan]")
+
+            table = Table(title="Backtest Results")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Value", justify="right")
+
+            pnl_color = "green" if metrics.total_pnl >= 0 else "red"
+            table.add_row("Strategy", strategy)
+            table.add_row("Period", f"{from_date} to {to_date}")
+            table.add_row("Initial Balance", f"${balance:,.2f}")
+            table.add_row("Final Balance", f"${metrics.final_balance:,.2f}")
+            table.add_row("Total PnL", f"[{pnl_color}]${metrics.total_pnl:,.2f}[/{pnl_color}]")
+            table.add_row("Max Drawdown", f"{metrics.max_drawdown:.2%}")
+            table.add_row("Win Rate", f"{metrics.win_rate:.2%}")
+            table.add_row("Sharpe Ratio", f"{metrics.sharpe_ratio:.2f}")
+            table.add_row("Total Trades", str(metrics.total_trades))
+            table.add_row("Trades/Day", f"{metrics.trades_per_day:.1f}")
+            table.add_row("Total Notional", f"${metrics.total_notional:,.2f}")
+
+            console.print(table)
+
+            console.print(f"\n[dim]View details: pmq backtest report --run-id {run_id}[/dim]")
+
+        except Exception as e:
+            console.print(f"[red]Backtest failed: {e}[/red]")
+            raise typer.Exit(1) from e
+
+
+@backtest_app.command("report")
+def backtest_report(
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", "-r", help="Backtest run ID"),
+    ],
+    show_trades: Annotated[
+        bool,
+        typer.Option("--trades", help="Show individual trades"),
+    ] = False,
+) -> None:
+    """Display detailed report for a backtest run.
+
+    Example:
+        pmq backtest report --run-id abc123
+        pmq backtest report --run-id abc123 --trades
+    """
+    from pmq.backtest import BacktestRunner
+
+    dao = DAO()
+    runner = BacktestRunner(dao=dao)
+
+    report = runner.get_run_report(run_id)
+
+    if not report:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+
+    run = report["run"]
+    metrics = report["metrics"]
+
+    # Run info
+    console.print(f"\n[bold]Backtest Report: {run_id}[/bold]\n")
+
+    info_table = Table(title="Run Info")
+    info_table.add_column("Field", style="cyan")
+    info_table.add_column("Value")
+
+    info_table.add_row("Strategy", run["strategy"])
+    info_table.add_row("Period", f"{run['start_date'][:10]} to {run['end_date'][:10]}")
+    info_table.add_row("Status", run["status"])
+    info_table.add_row("Initial Balance", f"${run['initial_balance']:,.2f}")
+    if run.get("final_balance"):
+        info_table.add_row("Final Balance", f"${run['final_balance']:,.2f}")
+    info_table.add_row("Created", run["created_at"][:19])
+    if run.get("completed_at"):
+        info_table.add_row("Completed", run["completed_at"][:19])
+
+    console.print(info_table)
+
+    # Metrics
+    if metrics:
+        metrics_table = Table(title="Performance Metrics")
+        metrics_table.add_column("Metric", style="cyan")
+        metrics_table.add_column("Value", justify="right")
+
+        pnl_color = "green" if metrics["total_pnl"] >= 0 else "red"
+        metrics_table.add_row(
+            "Total PnL", f"[{pnl_color}]${metrics['total_pnl']:,.2f}[/{pnl_color}]"
+        )
+        metrics_table.add_row("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
+        metrics_table.add_row("Win Rate", f"{metrics['win_rate']:.2%}")
+        metrics_table.add_row("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
+        metrics_table.add_row("Total Trades", str(metrics["total_trades"]))
+        metrics_table.add_row("Trades/Day", f"{metrics['trades_per_day']:.1f}")
+        metrics_table.add_row("Capital Utilization", f"{metrics['capital_utilization']:.2%}")
+
+        console.print(metrics_table)
+
+    # Trades
+    if show_trades and report["trades"]:
+        trades_table = Table(title=f"Trades ({report['trade_count']} total)")
+        trades_table.add_column("Time", style="dim")
+        trades_table.add_column("Market", max_width=20)
+        trades_table.add_column("Side")
+        trades_table.add_column("Outcome")
+        trades_table.add_column("Price", justify="right")
+        trades_table.add_column("Qty", justify="right")
+        trades_table.add_column("Notional", justify="right")
+
+        for trade in report["trades"][:50]:  # Limit display
+            trades_table.add_row(
+                trade["trade_time"][:19],
+                trade["market_id"][:20],
+                trade["side"],
+                trade["outcome"],
+                f"{trade['price']:.4f}",
+                f"{trade['quantity']:.1f}",
+                f"${trade['notional']:.2f}",
+            )
+
+        console.print(trades_table)
+
+        if report["trade_count"] > 50:
+            console.print(f"[dim]... and {report['trade_count'] - 50} more trades[/dim]")
+
+    console.print("\n[dim]Note: Backtest results are not guarantees of future performance.[/dim]")
+
+
+@backtest_app.command("list")
+def backtest_list(
+    strategy: Annotated[
+        str | None,
+        typer.Option("--strategy", "-s", help="Filter by strategy"),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum runs to show"),
+    ] = 20,
+) -> None:
+    """List recent backtest runs.
+
+    Example:
+        pmq backtest list
+        pmq backtest list --strategy arb
+    """
+    from pmq.backtest import BacktestRunner
+
+    dao = DAO()
+    runner = BacktestRunner(dao=dao)
+
+    runs = runner.list_runs(strategy=strategy, limit=limit)
+
+    if not runs:
+        console.print("[dim]No backtest runs found[/dim]")
+        return
+
+    table = Table(title="Backtest Runs")
+    table.add_column("Run ID", style="cyan", max_width=12)
+    table.add_column("Strategy")
+    table.add_column("Period")
+    table.add_column("Status")
+    table.add_column("PnL", justify="right")
+    table.add_column("Created")
+
+    for run in runs:
+        run_id_short = run["id"][:8] + "..."
+        period = f"{run['start_date'][:10]} to {run['end_date'][:10]}"
+        pnl = ""
+        if run.get("final_balance") and run.get("initial_balance"):
+            pnl_val = run["final_balance"] - run["initial_balance"]
+            pnl_color = "green" if pnl_val >= 0 else "red"
+            pnl = f"[{pnl_color}]${pnl_val:,.2f}[/{pnl_color}]"
+
+        table.add_row(
+            run_id_short,
+            run["strategy"],
+            period,
+            run["status"],
+            pnl,
+            run["created_at"][:19],
+        )
+
+    console.print(table)
+
+
+@backtest_app.command("export")
+def backtest_export(
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", "-r", help="Backtest run ID"),
+    ],
+    output_dir: Annotated[
+        Path,
+        typer.Option("--out", "-o", help="Output directory"),
+    ] = Path("exports"),
+    format_type: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Export format: csv, json"),
+    ] = "csv",
+) -> None:
+    """Export backtest results to file.
+
+    Example:
+        pmq backtest export --run-id abc123 --format csv --out exports/
+    """
+    import json as json_module
+
+    from pmq.backtest import BacktestRunner
+
+    dao = DAO()
+    runner = BacktestRunner(dao=dao)
+
+    report = runner.get_run_report(run_id)
+
+    if not report:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+
+    if format_type == "csv":
+        # Export trades
+        trades = report["trades"]
+        if trades:
+            filename = output_dir / f"backtest_trades_{run_id[:8]}_{timestamp}.csv"
+            _write_csv(filename, trades)
+            console.print(f"[green]✓ Exported {len(trades)} trades to {filename}[/green]")
+
+        # Export summary
+        summary = [
+            {
+                "run_id": run_id,
+                "strategy": report["run"]["strategy"],
+                "start_date": report["run"]["start_date"],
+                "end_date": report["run"]["end_date"],
+                "status": report["run"]["status"],
+                **(report["metrics"] or {}),
+            }
+        ]
+        summary_file = output_dir / f"backtest_summary_{run_id[:8]}_{timestamp}.csv"
+        _write_csv(summary_file, summary)
+        console.print(f"[green]✓ Exported summary to {summary_file}[/green]")
+
+    elif format_type == "json":
+        filename = output_dir / f"backtest_{run_id[:8]}_{timestamp}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json_module.dump(report, f, indent=2, default=str)
+        console.print(f"[green]✓ Exported to {filename}[/green]")
+
+    else:
+        console.print(f"[red]Unknown format: {format_type}[/red]")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

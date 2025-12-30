@@ -2077,6 +2077,10 @@ def eval_run(
         float,
         typer.Option("--balance", "-b", help="Initial balance for backtest"),
     ] = 10000.0,
+    pairs_config: Annotated[
+        str | None,
+        typer.Option("--pairs", "-p", help="Pairs config file (required for statarb)"),
+    ] = None,
 ) -> None:
     """Run automated evaluation pipeline.
 
@@ -2087,17 +2091,24 @@ def eval_run(
     4. Optional paper trading smoke test
     5. Generate report
 
+    For statarb strategy, --pairs is required. Generate with:
+        pmq statarb pairs suggest --out config/pairs.yml
+
     Example:
         pmq eval run --strategy arb --version v1 --last-times 30
+        pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml --last-times 30
         pmq eval run --strategy observer --version v1 --last-times 30 --paper-minutes 10
     """
     from pmq.evaluation import EvaluationPipeline, EvaluationReporter
 
+    # Print startup info
+    pairs_info = f"Pairs: {pairs_config}" if pairs_config else "Pairs: N/A"
     console.print(
         f"\n[bold green]Starting Evaluation Pipeline[/bold green]\n"
         f"Strategy: {strategy} v{version}\n"
         f"Quality Window: last {last_times} snapshots\n"
         f"Interval: {interval}s\n"
+        f"{pairs_info}\n"
         f"Paper Minutes: {paper_minutes if paper_minutes > 0 else 'skip'}\n"
     )
 
@@ -2105,20 +2116,25 @@ def eval_run(
     pipeline = EvaluationPipeline(dao=dao)
     reporter = EvaluationReporter(dao=dao)
 
-    with console.status("[bold green]Running evaluation pipeline..."):
-        result = pipeline.run(
-            strategy_name=strategy,
-            strategy_version=version,
-            window_mode="last_times",
-            window_value=last_times,
-            interval_seconds=interval,
-            paper_minutes=paper_minutes if paper_minutes > 0 else None,
-            quantity=quantity,
-            initial_balance=balance,
-        )
+    try:
+        with console.status("[bold green]Running evaluation pipeline..."):
+            result = pipeline.run(
+                strategy_name=strategy,
+                strategy_version=version,
+                window_mode="last_times",
+                window_value=last_times,
+                interval_seconds=interval,
+                paper_minutes=paper_minutes if paper_minutes > 0 else None,
+                quantity=quantity,
+                initial_balance=balance,
+                pairs_config=pairs_config,
+            )
 
-        # Save reports as artifacts
-        reporter.save_report_to_db(result.eval_id, result=result)
+            # Save reports as artifacts
+            reporter.save_report_to_db(result.eval_id, result=result)
+    except ValueError as e:
+        console.print(f"[red]Evaluation failed: {e}[/red]")
+        raise typer.Exit(1) from e
 
     # Display results
     status_color = "green" if result.final_status == "PASSED" else "red"

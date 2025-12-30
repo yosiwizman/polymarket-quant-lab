@@ -237,7 +237,7 @@ Backtests compute the following metrics:
 
 > ⚠️ **Warning**: Backtest results are not guarantees of future performance. Historical data may not reflect future market conditions.
 
-#### Snapshot Quality & Coverage (Phase 2.5)
+#### Snapshot Quality & Coverage (Phase 2.5/3.2)
 
 Check snapshot data quality before running backtests:
 
@@ -245,18 +245,35 @@ Check snapshot data quality before running backtests:
 # Check overall snapshot stats
 poetry run pmq snapshots summary
 
-# Analyze quality for a time window (detects gaps, duplicates)
+# Quality check with explicit time window
 poetry run pmq snapshots quality --from 2024-01-01 --to 2024-01-07 --interval 60
+
+# Rolling window: last N minutes (evaluates recent data quality)
+poetry run pmq snapshots quality --last-minutes 60 --interval 60
+
+# Last K distinct snapshot times (RECOMMENDED for new data)
+# Avoids penalizing for historical gaps
+poetry run pmq snapshots quality --last-times 30 --interval 60
 
 # View coverage by market
 poetry run pmq snapshots coverage --from 2024-01-01 --to 2024-01-07
 ```
 
+**Recommended Workflow for New Data Collection:**
+
+1. Start snapshot collection: `pmq snapshots run --interval 60 --duration-minutes 60`
+2. Check recent quality: `pmq snapshots quality --last-times 30 --interval 60`
+3. Wait until `ready_for_scorecard: Yes` before running backtests
+4. Run backtest when maturity score ≥ 70
+
 Quality metrics:
 - **Coverage %**: Percentage of expected intervals with data
+- **Distinct Times**: Actual unique snapshot timestamps captured
 - **Missing Intervals**: Gaps larger than 50% of expected interval
 - **Duplicates**: Same market+timestamp entries
-- **Status Badge**: healthy (≥95% coverage), degraded (≥80%), unhealthy (<80%)
+- **Maturity Score**: 0-100 readiness indicator (need 70+ for scorecard)
+- **Ready for Scorecard**: Boolean - whether data is mature enough for evaluation
+- **Status Badge**: healthy (≥95% coverage + ready), degraded (≥80%), unhealthy (<80%)
 
 #### Backtest Manifests
 

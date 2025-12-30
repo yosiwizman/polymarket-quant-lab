@@ -2841,5 +2841,276 @@ def statarb_explain(
         )
 
 
+@statarb_app.command("discover")
+def statarb_discover(
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (ISO format or YYYY-MM-DD)"),
+    ],
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (ISO format or YYYY-MM-DD)"),
+    ],
+    top: Annotated[
+        int,
+        typer.Option("--top", help="Maximum pairs to discover"),
+    ] = 50,
+    min_overlap: Annotated[
+        int,
+        typer.Option("--min-overlap", help="Minimum overlapping snapshot times"),
+    ] = 10,
+    min_correlation: Annotated[
+        float,
+        typer.Option("--min-corr", help="Minimum absolute correlation"),
+    ] = 0.3,
+    output: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="Output file path (default: stdout as YAML)"),
+    ] = None,
+    format_type: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format: yml, json"),
+    ] = "yml",
+) -> None:
+    """Discover pairs from snapshot data using correlation analysis.
+
+    Computes correlation of YES prices across overlapping snapshot times.
+    Results are deterministic: same inputs produce same output ordering.
+
+    This command does NOT call any live APIs - it only uses stored snapshot data.
+
+    Example:
+        pmq statarb discover --from 2024-12-01 --to 2024-12-30 --top 20
+        pmq statarb discover --from 2024-12-01 --to 2024-12-30 --out config/pairs.yml
+    """
+    from pmq.statarb import discover_pairs, generate_pairs_yaml
+
+    # Normalize dates
+    if len(from_date) == 10:
+        from_date = f"{from_date}T00:00:00"
+    if len(to_date) == 10:
+        to_date = f"{to_date}T23:59:59"
+
+    dao = DAO()
+
+    console.print(f"[cyan]Discovering pairs from {from_date[:10]} to {to_date[:10]}...[/cyan]")
+
+    # Get all snapshots in range
+    snapshots = dao.get_snapshots(from_date, to_date)
+    if not snapshots:
+        console.print(f"[red]No snapshots found in window {from_date} to {to_date}[/red]")
+        console.print("[dim]Run 'pmq sync --snapshot' to collect data first.[/dim]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Loaded {len(snapshots)} snapshots[/cyan]")
+
+    # Get market metadata for all markets in snapshots
+    market_ids = list({s["market_id"] for s in snapshots})
+    markets = {m["id"]: m for m in dao.get_markets_by_ids(market_ids)}
+    console.print(f"[cyan]Found {len(markets)} unique markets[/cyan]")
+
+    # Discover pairs
+    candidates = discover_pairs(
+        snapshots=snapshots,
+        markets=markets,
+        min_overlap=min_overlap,
+        top=top,
+        min_correlation=min_correlation,
+    )
+
+    if not candidates:
+        console.print(
+            f"[yellow]No pairs found with correlation >= {min_correlation} "
+            f"and overlap >= {min_overlap}.[/yellow]\n"
+            "Try:\n"
+            "  • Lowering --min-corr (e.g., 0.1)\n"
+            "  • Lowering --min-overlap (e.g., 5)\n"
+            "  • Collecting more snapshots\n"
+            "  • Widening the date range"
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓ Discovered {len(candidates)} pairs[/green]")
+
+    # Display table
+    table = Table(title="Discovered Pairs")
+    table.add_column("#", style="dim")
+    table.add_column("Market A", max_width=25)
+    table.add_column("Market B", max_width=25)
+    table.add_column("Corr", justify="right")
+    table.add_column("Overlap", justify="right")
+    table.add_column("Max |Spread|", justify="right")
+
+    for i, c in enumerate(candidates[:20], 1):
+        q_a = (
+            c.market_a_question[:22] + "..."
+            if len(c.market_a_question) > 25
+            else c.market_a_question
+        )
+        q_b = (
+            c.market_b_question[:22] + "..."
+            if len(c.market_b_question) > 25
+            else c.market_b_question
+        )
+        corr_color = "green" if c.correlation > 0 else "red"
+        table.add_row(
+            str(i),
+            q_a or c.market_a_id[:16],
+            q_b or c.market_b_id[:16],
+            f"[{corr_color}]{c.correlation:+.3f}[/{corr_color}]",
+            str(c.overlap_count),
+            f"{c.max_abs_spread:.4f}",
+        )
+
+    console.print(table)
+    if len(candidates) > 20:
+        console.print(f"[dim]... and {len(candidates) - 20} more pairs[/dim]")
+
+    # Generate output
+    pair_configs = [c.to_pair_config() for c in candidates]
+    timestamp = datetime.now(UTC).isoformat()[:19]
+
+    if output:
+        if format_type == "json":
+            import json
+
+            content = json.dumps(
+                {"pairs": [p.__dict__ for p in pair_configs]},
+                indent=2,
+            )
+        else:
+            content = generate_pairs_yaml(
+                pair_configs,
+                header_comment=f"Discovered from snapshots {from_date[:10]} to {to_date[:10]} on {timestamp}",
+            )
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(content)
+        console.print(f"[green]✓ Saved to {output}[/green]")
+    else:
+        # Print YAML to stdout
+        content = generate_pairs_yaml(
+            pair_configs,
+            header_comment=f"Discovered from snapshots {from_date[:10]} to {to_date[:10]} on {timestamp}",
+        )
+        console.print("\n[bold]Generated pairs config:[/bold]")
+        console.print(content)
+
+
+@statarb_app.command("validate")
+def statarb_validate(
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (ISO format or YYYY-MM-DD)"),
+    ],
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (ISO format or YYYY-MM-DD)"),
+    ],
+    pairs_config: Annotated[
+        Path,
+        typer.Option("--pairs", "-p", help="Path to pairs config file"),
+    ] = Path("config/pairs.yml"),
+    min_overlap: Annotated[
+        int,
+        typer.Option("--min-overlap", help="Minimum required overlapping snapshots"),
+    ] = 10,
+) -> None:
+    """Validate pairs config against snapshot data.
+
+    Checks that each pair has sufficient overlapping snapshot coverage
+    in the specified date range.
+
+    Example:
+        pmq statarb validate --from 2024-12-01 --to 2024-12-30 --pairs config/pairs.yml
+    """
+    from pmq.statarb import PairsConfigError, load_validated_pairs_config, validate_pair_overlap
+
+    # Normalize dates
+    if len(from_date) == 10:
+        from_date = f"{from_date}T00:00:00"
+    if len(to_date) == 10:
+        to_date = f"{to_date}T23:59:59"
+
+    # Load pairs config
+    try:
+        pairs_result = load_validated_pairs_config(pairs_config)
+    except PairsConfigError as e:
+        console.print(f"[red]Failed to load pairs config: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    dao = DAO()
+
+    console.print(f"[cyan]Validating {len(pairs_result.enabled_pairs)} pairs...[/cyan]")
+
+    # Get snapshots for all market IDs in pairs
+    all_market_ids = set()
+    for p in pairs_result.enabled_pairs:
+        all_market_ids.add(p.market_a_id)
+        all_market_ids.add(p.market_b_id)
+
+    snapshots = dao.get_snapshots(from_date, to_date, list(all_market_ids))
+
+    if not snapshots:
+        console.print("[red]No snapshots found for any pair markets in window[/red]")
+        console.print("[dim]Run 'pmq sync --snapshot' to collect data first.[/dim]")
+        raise typer.Exit(1)
+
+    # Validate each pair
+    valid_count = 0
+    invalid_count = 0
+    results: list[tuple[str, dict[str, Any]]] = []
+
+    for pair in pairs_result.enabled_pairs:
+        result = validate_pair_overlap(pair, snapshots, min_overlap)
+        results.append((pair.name, result))
+        if result["valid"]:
+            valid_count += 1
+        else:
+            invalid_count += 1
+
+    # Display results
+    table = Table(title="Pair Validation Results")
+    table.add_column("Pair", style="cyan", max_width=30)
+    table.add_column("A Snaps", justify="right")
+    table.add_column("B Snaps", justify="right")
+    table.add_column("Overlap", justify="right")
+    table.add_column("Status")
+    table.add_column("Reason", max_width=30)
+
+    for name, result in results:
+        status = "[green]✓ Valid[/green]" if result["valid"] else "[red]✗ Invalid[/red]"
+        overlap_color = "green" if result["overlap_count"] >= min_overlap else "red"
+        table.add_row(
+            name[:30],
+            str(result["a_count"]),
+            str(result["b_count"]),
+            f"[{overlap_color}]{result['overlap_count']}[/{overlap_color}]",
+            status,
+            result["reason"] or "—",
+        )
+
+    console.print(table)
+
+    # Summary
+    console.print("\n[bold]Summary[/bold]")
+    console.print(f"  Valid pairs: [green]{valid_count}[/green]")
+    console.print(f"  Invalid pairs: [red]{invalid_count}[/red]")
+    console.print(f"  Min overlap required: {min_overlap}")
+
+    if invalid_count > 0:
+        console.print(
+            "\n[yellow]Some pairs have insufficient data coverage.[/yellow]\n"
+            "Try:\n"
+            "  • Collecting more snapshots (pmq sync --snapshot)\n"
+            "  • Using 'pmq statarb discover' to find pairs with better coverage\n"
+            "  • Disabling invalid pairs in config (enabled: false)"
+        )
+        raise typer.Exit(1)
+
+    console.print("\n[green]✓ All pairs have sufficient overlap for the date range.[/green]")
+
+
 if __name__ == "__main__":
     app()

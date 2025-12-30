@@ -178,9 +178,7 @@ def scan(
             markets_data = dao.get_active_markets(limit=500)
 
             if not markets_data:
-                console.print(
-                    "[yellow]No cached markets found. Run 'pmq sync' first.[/yellow]"
-                )
+                console.print("[yellow]No cached markets found. Run 'pmq sync' first.[/yellow]")
                 raise typer.Exit(1)
 
             console.print(f"[cyan]Scanning {len(markets_data)} cached markets...[/cyan]")
@@ -202,7 +200,11 @@ def scan(
             table.add_column("Liquidity", justify="right")
 
             for i, sig in enumerate(arb_signals, 1):
-                question = sig.market_question[:47] + "..." if len(sig.market_question) > 50 else sig.market_question
+                question = (
+                    sig.market_question[:47] + "..."
+                    if len(sig.market_question) > 50
+                    else sig.market_question
+                )
                 table.add_row(
                     str(i),
                     question,
@@ -225,9 +227,7 @@ def scan(
         # Scan stat-arb (if pairs configured)
         statarb_scanner = StatArbScanner()
         if statarb_scanner.pairs:
-            console.print(
-                f"\n[cyan]Scanning {len(statarb_scanner.pairs)} stat-arb pairs...[/cyan]"
-            )
+            console.print(f"\n[cyan]Scanning {len(statarb_scanner.pairs)} stat-arb pairs...[/cyan]")
             if from_api:
                 statarb_signals = statarb_scanner.scan_pairs(markets)
             else:
@@ -249,8 +249,7 @@ def scan(
                 console.print(table)
         else:
             console.print(
-                "\n[dim]No stat-arb pairs configured. "
-                "Add pairs to config/pairs.yml[/dim]"
+                "\n[dim]No stat-arb pairs configured. " "Add pairs to config/pairs.yml[/dim]"
             )
 
 
@@ -392,7 +391,11 @@ def paper_positions() -> None:
     table.add_column("Realized PnL", justify="right", style="green")
 
     for pos in positions:
-        question = pos.market_question[:37] + "..." if len(pos.market_question) > 40 else pos.market_question
+        question = (
+            pos.market_question[:37] + "..."
+            if len(pos.market_question) > 40
+            else pos.market_question
+        )
         table.add_row(
             question,
             f"{pos.yes_quantity:.2f}",
@@ -429,7 +432,11 @@ def paper_trades(
     table.add_column("Notional", justify="right")
 
     for trade in trades:
-        question = trade.market_question[:27] + "..." if len(trade.market_question) > 30 else trade.market_question
+        question = (
+            trade.market_question[:27] + "..."
+            if len(trade.market_question) > 30
+            else trade.market_question
+        )
         table.add_row(
             str(trade.id),
             trade.strategy,
@@ -538,9 +545,7 @@ def report() -> None:
 
         console.print(sig_table)
 
-    console.print(
-        "\n[dim]Note: All trades are simulated. No real money involved.[/dim]"
-    )
+    console.print("\n[dim]Note: All trades are simulated. No real money involved.[/dim]")
 
 
 if __name__ == "__main__":

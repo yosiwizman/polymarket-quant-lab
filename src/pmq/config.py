@@ -29,9 +29,7 @@ class ArbitrageConfig(BaseSettings):
     threshold: float = Field(
         default=0.99, description="YES + NO price threshold for arbitrage signal"
     )
-    min_liquidity: float = Field(
-        default=100.0, description="Minimum liquidity required in USD"
-    )
+    min_liquidity: float = Field(default=100.0, description="Minimum liquidity required in USD")
 
 
 class StatArbConfig(BaseSettings):
@@ -39,12 +37,8 @@ class StatArbConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="PMQ_STATARB_")
 
-    entry_threshold: float = Field(
-        default=0.10, description="Spread threshold to enter position"
-    )
-    exit_threshold: float = Field(
-        default=0.02, description="Spread threshold to exit position"
-    )
+    entry_threshold: float = Field(default=0.10, description="Spread threshold to enter position")
+    exit_threshold: float = Field(default=0.02, description="Spread threshold to exit position")
     pairs_file: Path = Field(
         default=Path("config/pairs.yml"), description="Path to pairs configuration file"
     )

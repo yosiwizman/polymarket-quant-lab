@@ -1,6 +1,5 @@
 """Tests for signal detection strategies."""
 
-
 import pytest
 from pydantic import ValidationError
 
@@ -85,9 +84,7 @@ class TestArbitrageScanner:
         """Test that inactive markets are skipped."""
         scanner = ArbitrageScanner(config=arb_config)
 
-        market = create_market(
-            "inactive_market", yes_price=0.40, no_price=0.40, active=False
-        )
+        market = create_market("inactive_market", yes_price=0.40, no_price=0.40, active=False)
 
         signal = scanner.scan_market(market)
 
@@ -97,9 +94,7 @@ class TestArbitrageScanner:
         """Test that closed markets are skipped."""
         scanner = ArbitrageScanner(config=arb_config)
 
-        market = create_market(
-            "closed_market", yes_price=0.40, no_price=0.40, closed=True
-        )
+        market = create_market("closed_market", yes_price=0.40, no_price=0.40, closed=True)
 
         signal = scanner.scan_market(market)
 
@@ -109,9 +104,7 @@ class TestArbitrageScanner:
         """Test that low liquidity markets are skipped."""
         scanner = ArbitrageScanner(config=arb_config)
 
-        market = create_market(
-            "low_liq_market", yes_price=0.40, no_price=0.40, liquidity=50.0
-        )
+        market = create_market("low_liq_market", yes_price=0.40, no_price=0.40, liquidity=50.0)
 
         signal = scanner.scan_market(market)
 

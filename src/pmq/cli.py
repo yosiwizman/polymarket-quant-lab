@@ -1414,12 +1414,15 @@ def snapshots_quality(
 
     with console.status("[bold green]Analyzing snapshot quality..."):
         if rolling_mode:
+            assert last_minutes is not None
             result = checker.check_last_minutes(last_minutes, interval)
             window_desc = f"Last {last_minutes} minutes"
         elif times_mode:
+            assert last_times is not None
             result = checker.check_last_times(last_times, interval)
             window_desc = f"Last {last_times} snapshot times"
         else:
+            assert from_date is not None and to_date is not None
             result = reporter.generate_report(
                 start_time=from_date,
                 end_time=to_date,

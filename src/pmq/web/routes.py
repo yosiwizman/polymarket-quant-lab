@@ -220,7 +220,7 @@ def get_latest_quality_report(
         }
     else:
         # Default: return latest stored report
-        report = dao.get_latest_quality_report()
+        report = dao.get_latest_quality_report()  # type: ignore[assignment]
 
     # Determine status badge
     if report:
@@ -229,9 +229,9 @@ def get_latest_quality_report(
         missing = report.get("missing_intervals", 0)
         duplicates = report.get("duplicate_count", 0)
 
-        if ready and coverage_pct >= 95 and missing <= 5 and duplicates == 0:
+        if ready and coverage_pct >= 95 and missing <= 5 and duplicates == 0:  # type: ignore[operator]
             status = "healthy"
-        elif coverage_pct >= 80 and missing <= 20:
+        elif coverage_pct >= 80 and missing <= 20:  # type: ignore[operator]
             status = "degraded"
         else:
             status = "unhealthy"

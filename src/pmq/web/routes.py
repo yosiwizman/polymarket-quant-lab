@@ -171,7 +171,7 @@ def get_latest_quality_report(
     Returns:
         Quality report with status, maturity, and readiness
     """
-    from pmq.quality import QualityChecker, MATURITY_READY_THRESHOLD
+    from pmq.quality import QualityChecker
 
     dao = get_dao()
 
@@ -220,7 +220,6 @@ def get_latest_quality_report(
 
     # Determine status badge
     if report:
-        maturity = report.get("maturity_score", 0)
         ready = report.get("ready_for_scorecard", False)
         coverage_pct = report.get("coverage_pct", 0)
         missing = report.get("missing_intervals", 0)

@@ -1391,7 +1391,7 @@ def snapshots_quality(
         pmq snapshots quality --last-minutes 60 --interval 60
         pmq snapshots quality --last-times 30 --interval 60
     """
-    from pmq.quality import QualityChecker, QualityReporter, WindowMode
+    from pmq.quality import QualityChecker, QualityReporter
 
     # Validate arguments - exactly one window mode must be specified
     explicit_mode = from_date is not None and to_date is not None

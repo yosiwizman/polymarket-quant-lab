@@ -1,9 +1,7 @@
 """Pydantic v2 data models for Polymarket data structures."""
 
 from datetime import datetime
-from decimal import Decimal
 from enum import Enum
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 

@@ -8,7 +8,7 @@ Signal: YES_price + NO_price < threshold (default 0.99)
 Profit potential: 1.0 - (YES_price + NO_price)
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pmq.config import ArbitrageConfig, get_settings
@@ -92,7 +92,7 @@ class ArbitrageScanner:
                 combined_price=combined_price,
                 profit_potential=profit_potential,
                 liquidity=market.liquidity,
-                detected_at=datetime.now(timezone.utc),
+                detected_at=datetime.now(UTC),
             )
 
             log_trade_event(
@@ -182,7 +182,7 @@ class ArbitrageScanner:
                     combined_price=combined_price,
                     profit_potential=1.0 - combined_price,
                     liquidity=liquidity,
-                    detected_at=datetime.now(timezone.utc),
+                    detected_at=datetime.now(UTC),
                 )
                 signals.append(signal)
 

@@ -4,14 +4,13 @@ Simulates trades and tracks virtual positions without real money.
 Includes safety mechanisms: position limits, notional caps, rate limits, kill switch.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pmq.config import SafetyConfig, get_settings
 from pmq.logging import get_logger, log_trade_event
 from pmq.models import ArbitrageSignal, Outcome, PaperPosition, PaperTrade, Side
 from pmq.storage.dao import DAO
-from pmq.storage.db import get_database
 
 logger = get_logger("strategies.paper")
 
@@ -73,9 +72,7 @@ class SafetyGuard:
                 "POSITION_LIMIT_BLOCKED",
                 details={"current": current, "max": self._config.max_positions},
             )
-            raise SafetyError(
-                f"Position limit reached: {current}/{self._config.max_positions}"
-            )
+            raise SafetyError(f"Position limit reached: {current}/{self._config.max_positions}")
 
     def check_notional_limit(self, market_id: str, additional_notional: float) -> None:
         """Check if notional limit for market would be exceeded.
@@ -212,7 +209,7 @@ class PaperLedger:
             price=price,
             quantity=quantity,
             notional=notional,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
 
         # Save trade
@@ -288,8 +285,7 @@ class PaperLedger:
                 new_qty = position.no_quantity + trade.quantity
                 if new_qty > 0:
                     position.avg_price_no = (
-                        position.avg_price_no * position.no_quantity
-                        + trade.price * trade.quantity
+                        position.avg_price_no * position.no_quantity + trade.price * trade.quantity
                     ) / new_qty
                 position.no_quantity = new_qty
             else:
@@ -301,7 +297,7 @@ class PaperLedger:
                     position.realized_pnl += pnl
                 position.no_quantity = max(0, position.no_quantity - trade.quantity)
 
-        position.updated_at = datetime.now(timezone.utc)
+        position.updated_at = datetime.now(UTC)
         self._dao.upsert_position(position)
 
     def execute_arb_trade(

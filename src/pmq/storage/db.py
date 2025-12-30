@@ -121,7 +121,8 @@ class Database:
             Row or None
         """
         cursor = self.execute(sql, params)
-        return cursor.fetchone()
+        result: sqlite3.Row | None = cursor.fetchone()
+        return result
 
     def fetch_all(
         self,

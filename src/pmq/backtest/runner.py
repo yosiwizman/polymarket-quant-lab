@@ -499,6 +499,163 @@ class BacktestRunner:
             )
             raise
 
+    def run_observer_backtest(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> tuple[str, BacktestMetrics]:
+        """Run observer (noop) strategy backtest for validation.
+
+        This strategy observes the market without executing any trades.
+        It's useful for testing the approval workflow when real trading
+        signals are sparse, or for establishing baseline metrics.
+
+        The observer strategy:
+        - Processes all snapshots in the time window
+        - Records equity curve (remains flat at initial_balance)
+        - Produces metrics with 0 trades
+        - Can be used with validation_mode=True for approval testing
+
+        Args:
+            start_date: Start date (ISO format or YYYY-MM-DD)
+            end_date: End date (ISO format or YYYY-MM-DD)
+
+        Returns:
+            Tuple of (run_id, metrics)
+        """
+        # Normalize dates
+        start_date = self._normalize_date(start_date, start=True)
+        end_date = self._normalize_date(end_date, start=False)
+
+        # Generate run ID
+        run_id = str(uuid.uuid4())
+
+        # Store config
+        config_json = json.dumps(
+            {
+                "strategy": "observer",
+                "initial_balance": self._initial_balance,
+                "description": "Baseline validation strategy - no trades executed",
+            }
+        )
+
+        # Create run record
+        self._dao.create_backtest_run(
+            run_id=run_id,
+            strategy="observer",
+            start_date=start_date,
+            end_date=end_date,
+            initial_balance=self._initial_balance,
+            config_json=config_json,
+        )
+
+        logger.info(f"Starting backtest {run_id}: observer from {start_date} to {end_date}")
+
+        # Initialize engine
+        self._engine = BacktestEngine(initial_balance=self._initial_balance)
+
+        try:
+            # Load snapshots
+            snapshot_times = self._dao.get_snapshot_times(start_date, end_date)
+
+            if not snapshot_times:
+                logger.warning(f"No snapshots found for {start_date} to {end_date}")
+                self._dao.complete_backtest_run(run_id, self._initial_balance, status="completed")
+                # Return baseline metrics
+                metrics = BacktestMetrics(
+                    total_pnl=0,
+                    max_drawdown=0,
+                    win_rate=0,
+                    sharpe_ratio=0,
+                    total_trades=0,
+                    trades_per_day=0,
+                    capital_utilization=0,
+                    total_notional=0,
+                    final_balance=self._initial_balance,
+                    peak_equity=self._initial_balance,
+                    lowest_equity=self._initial_balance,
+                )
+                return run_id, metrics
+
+            logger.info(f"Found {len(snapshot_times)} snapshot times")
+
+            # Replay each snapshot time - observe only, no trades
+            for snapshot_time in snapshot_times:
+                self._engine.set_time(snapshot_time)
+
+                # Get all snapshots at this time for price tracking
+                snapshots = self._dao.get_snapshots(snapshot_time, snapshot_time)
+
+                # Build market prices dict for equity calculation
+                market_prices: dict[str, dict[str, float]] = {}
+                for snap in snapshots:
+                    market_prices[snap["market_id"]] = {
+                        "yes_price": snap["yes_price"],
+                        "no_price": snap["no_price"],
+                    }
+
+                # No trading logic - just observe
+                # Record equity at this time (will be flat since no positions)
+                self._engine.record_equity(market_prices)
+
+            # Calculate metrics (will show 0 trades, 0 PnL, 0 drawdown)
+            metrics = self._metrics_calc.calculate(self._engine, start_date, end_date)
+
+            # Save metrics
+            self._dao.save_backtest_metrics(
+                run_id=run_id,
+                total_pnl=metrics.total_pnl,
+                max_drawdown=metrics.max_drawdown,
+                win_rate=metrics.win_rate,
+                sharpe_ratio=metrics.sharpe_ratio,
+                total_trades=metrics.total_trades,
+                trades_per_day=metrics.trades_per_day,
+                capital_utilization=metrics.capital_utilization,
+                extra_metrics={
+                    "total_notional": metrics.total_notional,
+                    "final_balance": metrics.final_balance,
+                    "peak_equity": metrics.peak_equity,
+                    "lowest_equity": metrics.lowest_equity,
+                    "strategy_type": "validation",
+                },
+            )
+
+            # Complete run
+            self._dao.complete_backtest_run(run_id, metrics.final_balance, status="completed")
+
+            # Save manifest for reproducibility
+            config_for_hash = {
+                "strategy": "observer",
+                "initial_balance": self._initial_balance,
+            }
+            self._dao.save_backtest_manifest(
+                run_id=run_id,
+                strategy="observer",
+                window_from=start_date,
+                window_to=end_date,
+                config_hash=_compute_config_hash(config_for_hash),
+                code_git_sha=_get_git_sha(),
+                snapshot_count=len(snapshot_times),
+                first_snapshot_time=snapshot_times[0] if snapshot_times else None,
+                last_snapshot_time=snapshot_times[-1] if snapshot_times else None,
+            )
+
+            logger.info(
+                f"Observer backtest {run_id} completed: "
+                f"snapshots={len(snapshot_times)}, trades={metrics.total_trades}"
+            )
+
+            return run_id, metrics
+
+        except Exception as e:
+            logger.error(f"Observer backtest failed: {e}")
+            self._dao.complete_backtest_run(
+                run_id,
+                self._engine.balance if self._engine else self._initial_balance,
+                status="failed",
+            )
+            raise
+
     def get_run_report(self, run_id: str) -> dict[str, Any] | None:
         """Get full report for a backtest run.
 

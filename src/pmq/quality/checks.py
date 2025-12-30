@@ -5,13 +5,60 @@ to ensure snapshot data is suitable for backtesting.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pmq.logging import get_logger
 from pmq.storage.dao import DAO
 
 logger = get_logger("quality.checks")
+
+
+def _parse_iso_datetime(dt_str: str) -> datetime:
+    """Parse ISO datetime string to timezone-aware datetime.
+
+    Handles various ISO formats:
+    - 2025-01-01T00:00:00Z
+    - 2025-01-01T00:00:00+00:00
+    - 2025-01-01T00:00:00 (naive, assumed UTC)
+
+    Args:
+        dt_str: ISO datetime string
+
+    Returns:
+        Timezone-aware datetime (UTC)
+    """
+    # Normalize Z to +00:00
+    normalized = dt_str.replace("Z", "+00:00")
+
+    try:
+        dt = datetime.fromisoformat(normalized)
+        # If naive (no timezone), assume UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except ValueError:
+        # Fallback: try basic parsing and assume UTC
+        try:
+            dt = datetime.fromisoformat(dt_str.split("+")[0].replace("Z", ""))
+            return dt.replace(tzinfo=UTC)
+        except ValueError:
+            # Last resort: return current time (shouldn't happen)
+            logger.warning(f"Could not parse datetime: {dt_str}")
+            return datetime.now(UTC)
+
+
+# Minimum distinct snapshot times required for meaningful analysis
+MIN_SNAPSHOTS_FOR_QUALITY = 30
+
+
+class QualityStatus:
+    """Quality status constants."""
+
+    SUFFICIENT = "SUFFICIENT"  # Enough data for reliable analysis
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"  # Not enough snapshots
+    DEGRADED = "DEGRADED"  # Data available but quality issues
+    UNKNOWN = "UNKNOWN"  # Cannot determine
 
 
 @dataclass
@@ -38,9 +85,21 @@ class QualityResult:
     duplicate_count: int = 0
     stale_market_count: int = 0
     coverage_pct: float = 0.0
+    status: str = QualityStatus.UNKNOWN  # Quality status
     gaps: list[GapInfo] = field(default_factory=list)
     top_gap_markets: list[dict[str, Any]] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_sufficient(self) -> bool:
+        """Check if data is sufficient for analysis."""
+        return self.status == QualityStatus.SUFFICIENT
+
+    @property
+    def distinct_times(self) -> int:
+        """Get distinct snapshot times from notes."""
+        value = self.notes.get("distinct_snapshot_times", 0)
+        return int(value) if value is not None else 0
 
 
 class QualityChecker:
@@ -113,10 +172,28 @@ class QualityChecker:
         result.stale_market_count = self._count_stale_markets(end_time)
 
         # Add notes
+        distinct_times = coverage["distinct_times"]
         result.notes = {
-            "distinct_snapshot_times": coverage["distinct_times"],
+            "distinct_snapshot_times": distinct_times,
             "duplicate_entries": len(duplicates),
+            "min_snapshots_required": MIN_SNAPSHOTS_FOR_QUALITY,
         }
+
+        # Determine quality status
+        if distinct_times < MIN_SNAPSHOTS_FOR_QUALITY:
+            result.status = QualityStatus.INSUFFICIENT_DATA
+            # Adjust coverage to reflect insufficient data
+            # Coverage is technically correct but misleading without enough samples
+            result.notes["coverage_note"] = (
+                f"Only {distinct_times} snapshot times found, "
+                f"need at least {MIN_SNAPSHOTS_FOR_QUALITY} for reliable analysis"
+            )
+        elif result.coverage_pct >= 80 and result.duplicate_count == 0:
+            result.status = QualityStatus.SUFFICIENT
+        elif result.coverage_pct >= 50:
+            result.status = QualityStatus.DEGRADED
+        else:
+            result.status = QualityStatus.INSUFFICIENT_DATA
 
         return result
 
@@ -166,8 +243,8 @@ class QualityChecker:
             Coverage percentage (0-100)
         """
         try:
-            start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            start = _parse_iso_datetime(start_time)
+            end = _parse_iso_datetime(end_time)
             window_seconds = (end - start).total_seconds()
 
             if window_seconds <= 0:
@@ -204,8 +281,8 @@ class QualityChecker:
 
         # Find markets with fewer snapshots than expected
         try:
-            start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            start = _parse_iso_datetime(start_time)
+            end = _parse_iso_datetime(end_time)
             window_seconds = (end - start).total_seconds()
             expected_count = int(window_seconds / expected_interval_seconds) + 1
         except ValueError:
@@ -246,8 +323,8 @@ class QualityChecker:
             return 0
 
         try:
-            last = datetime.fromisoformat(last_snapshot.replace("Z", "+00:00"))
-            end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            last = _parse_iso_datetime(last_snapshot)
+            end = _parse_iso_datetime(end_time)
 
             # If last snapshot is more than 1 hour before end_time, consider stale
             if (end - last).total_seconds() > 3600:

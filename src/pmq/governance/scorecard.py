@@ -47,7 +47,7 @@ SCORE_WEIGHTS = {
     "data_quality": 10,
 }
 
-# Minimum thresholds for passing
+# Minimum thresholds for passing (standard mode)
 MIN_THRESHOLDS = {
     "pnl": 0.0,  # Must be non-negative
     "max_drawdown": 0.25,  # Max 25% drawdown
@@ -55,6 +55,17 @@ MIN_THRESHOLDS = {
     "sharpe": 0.5,  # Sharpe-like ratio >= 0.5
     "min_trades": 5,  # At least 5 trades
     "data_quality_pct": 70.0,  # At least 70% coverage
+}
+
+# Relaxed thresholds for validation mode (baseline strategies)
+# These allow approval testing even with sparse data/signals
+VALIDATION_THRESHOLDS = {
+    "pnl": -1000.0,  # Allow small losses in validation
+    "max_drawdown": 0.50,  # More lenient drawdown
+    "win_rate": 0.0,  # No minimum (0 trades = 0% win rate)
+    "sharpe": -1.0,  # Allow negative sharpe in validation
+    "min_trades": 0,  # No minimum trades for validation
+    "data_quality_pct": 0.0,  # No minimum coverage for validation
 }
 
 
@@ -70,6 +81,8 @@ def compute_scorecard(
     data_quality_pct: float | None = None,
     _missing_intervals: int = 0,  # Reserved for future use
     largest_gap_seconds: float = 0.0,
+    validation_mode: bool = False,
+    data_quality_status: str | None = None,
 ) -> StrategyScorecard:
     """Compute a scorecard from backtest metrics.
 
@@ -85,6 +98,8 @@ def compute_scorecard(
         data_quality_pct: Data coverage percentage (optional)
         missing_intervals: Number of missing data intervals
         largest_gap_seconds: Largest gap in data
+        validation_mode: If True, use relaxed thresholds for baseline validation
+        data_quality_status: Quality status (SUFFICIENT, INSUFFICIENT_DATA, etc.)
 
     Returns:
         StrategyScorecard with score, pass/fail, and recommendations
@@ -92,6 +107,20 @@ def compute_scorecard(
     reasons: list[str] = []
     warnings: list[str] = []
     scores: dict[str, float] = {}
+
+    # Select thresholds based on mode
+    thresholds = VALIDATION_THRESHOLDS if validation_mode else MIN_THRESHOLDS
+
+    if validation_mode:
+        warnings.append("Running in VALIDATION MODE with relaxed thresholds")
+
+    # Handle INSUFFICIENT_DATA status
+    if data_quality_status == "INSUFFICIENT_DATA":
+        warnings.append("Data quality: INSUFFICIENT_DATA - results may not be reliable")
+        if not validation_mode:
+            # In standard mode, insufficient data is a warning but not blocking
+            # The coverage_pct will still be evaluated normally
+            pass
 
     # Track metrics used
     metrics_used = {
@@ -103,13 +132,15 @@ def compute_scorecard(
         "trades_per_day": trades_per_day,
         "capital_utilization": capital_utilization,
         "data_quality_pct": data_quality_pct,
+        "validation_mode": validation_mode,
+        "data_quality_status": data_quality_status,
     }
 
     # --- PnL Score (25 points) ---
     pnl_pct = (total_pnl / initial_balance) * 100 if initial_balance > 0 else 0
-    if total_pnl < MIN_THRESHOLDS["pnl"]:
+    if total_pnl < thresholds["pnl"]:
         scores["pnl"] = 0
-        reasons.append(f"FAIL: Negative PnL (${total_pnl:.2f})")
+        reasons.append(f"FAIL: PnL below threshold (${total_pnl:.2f} < ${thresholds['pnl']:.2f})")
     elif pnl_pct >= 20:
         scores["pnl"] = SCORE_WEIGHTS["pnl"]
     elif pnl_pct >= 10:
@@ -118,14 +149,18 @@ def compute_scorecard(
         scores["pnl"] = SCORE_WEIGHTS["pnl"] * 0.6
     elif pnl_pct >= 0:
         scores["pnl"] = SCORE_WEIGHTS["pnl"] * 0.4
-        warnings.append(f"Low PnL return: {pnl_pct:.1f}%")
+        if not validation_mode:
+            warnings.append(f"Low PnL return: {pnl_pct:.1f}%")
     else:
-        scores["pnl"] = 0
+        # Negative PnL but above threshold (validation mode)
+        scores["pnl"] = SCORE_WEIGHTS["pnl"] * 0.2 if validation_mode else 0
 
     # --- Drawdown Score (20 points) ---
-    if max_drawdown > MIN_THRESHOLDS["max_drawdown"]:
+    if max_drawdown > thresholds["max_drawdown"]:
         scores["drawdown"] = 0
-        reasons.append(f"FAIL: Max drawdown too high ({max_drawdown:.1%})")
+        reasons.append(
+            f"FAIL: Max drawdown too high ({max_drawdown:.1%} > {thresholds['max_drawdown']:.1%})"
+        )
     elif max_drawdown <= 0.05:
         scores["drawdown"] = SCORE_WEIGHTS["drawdown"]
     elif max_drawdown <= 0.10:
@@ -134,86 +169,112 @@ def compute_scorecard(
         scores["drawdown"] = SCORE_WEIGHTS["drawdown"] * 0.6
     elif max_drawdown <= 0.20:
         scores["drawdown"] = SCORE_WEIGHTS["drawdown"] * 0.4
-        warnings.append(f"High drawdown: {max_drawdown:.1%}")
+        if not validation_mode:
+            warnings.append(f"High drawdown: {max_drawdown:.1%}")
     else:
         scores["drawdown"] = SCORE_WEIGHTS["drawdown"] * 0.2
-        warnings.append(f"Very high drawdown: {max_drawdown:.1%}")
+        if not validation_mode:
+            warnings.append(f"Very high drawdown: {max_drawdown:.1%}")
 
     # --- Win Rate Score (15 points) ---
-    if win_rate < MIN_THRESHOLDS["win_rate"]:
+    if win_rate < thresholds["win_rate"]:
         scores["win_rate"] = 0
-        reasons.append(f"FAIL: Win rate too low ({win_rate:.1%})")
+        reasons.append(f"FAIL: Win rate too low ({win_rate:.1%} < {thresholds['win_rate']:.1%})")
     elif win_rate >= 0.70:
         scores["win_rate"] = SCORE_WEIGHTS["win_rate"]
     elif win_rate >= 0.60:
         scores["win_rate"] = SCORE_WEIGHTS["win_rate"] * 0.8
     elif win_rate >= 0.50:
         scores["win_rate"] = SCORE_WEIGHTS["win_rate"] * 0.6
-    else:
+    elif win_rate >= 0.40:
         scores["win_rate"] = SCORE_WEIGHTS["win_rate"] * 0.4
+    else:
+        # Below 40% but above threshold (validation mode allows 0%)
+        scores["win_rate"] = SCORE_WEIGHTS["win_rate"] * 0.2 if validation_mode else 0
 
     # --- Sharpe Score (20 points) ---
-    if sharpe_ratio < MIN_THRESHOLDS["sharpe"]:
+    if sharpe_ratio < thresholds["sharpe"]:
         scores["sharpe"] = 0
-        reasons.append(f"FAIL: Sharpe ratio too low ({sharpe_ratio:.2f})")
+        reasons.append(
+            f"FAIL: Sharpe ratio too low ({sharpe_ratio:.2f} < {thresholds['sharpe']:.2f})"
+        )
     elif sharpe_ratio >= 2.0:
         scores["sharpe"] = SCORE_WEIGHTS["sharpe"]
     elif sharpe_ratio >= 1.5:
         scores["sharpe"] = SCORE_WEIGHTS["sharpe"] * 0.8
     elif sharpe_ratio >= 1.0:
         scores["sharpe"] = SCORE_WEIGHTS["sharpe"] * 0.6
-    else:
+    elif sharpe_ratio >= 0.5:
         scores["sharpe"] = SCORE_WEIGHTS["sharpe"] * 0.4
+    else:
+        # Below 0.5 but above threshold (validation mode allows -1)
+        scores["sharpe"] = SCORE_WEIGHTS["sharpe"] * 0.2 if validation_mode else 0
 
     # --- Trades/Day Score (10 points) ---
-    if total_trades < MIN_THRESHOLDS["min_trades"]:
+    if total_trades < thresholds["min_trades"]:
         scores["trades_per_day"] = 0
-        reasons.append(f"FAIL: Too few trades ({total_trades})")
+        reasons.append(f"FAIL: Too few trades ({total_trades} < {thresholds['min_trades']})")
     elif trades_per_day >= 5:
         scores["trades_per_day"] = SCORE_WEIGHTS["trades_per_day"]
     elif trades_per_day >= 2:
         scores["trades_per_day"] = SCORE_WEIGHTS["trades_per_day"] * 0.7
     elif trades_per_day >= 1:
         scores["trades_per_day"] = SCORE_WEIGHTS["trades_per_day"] * 0.4
-    else:
+    elif total_trades > 0:
         scores["trades_per_day"] = SCORE_WEIGHTS["trades_per_day"] * 0.2
-        warnings.append(f"Low trading frequency: {trades_per_day:.1f}/day")
+        if not validation_mode:
+            warnings.append(f"Low trading frequency: {trades_per_day:.1f}/day")
+    else:
+        # 0 trades - only valid in validation mode
+        scores["trades_per_day"] = SCORE_WEIGHTS["trades_per_day"] * 0.1 if validation_mode else 0
+        if validation_mode:
+            warnings.append("No trades executed (acceptable in validation mode)")
 
     # --- Data Quality Score (10 points) ---
     if data_quality_pct is not None:
-        if data_quality_pct < MIN_THRESHOLDS["data_quality_pct"]:
+        if data_quality_pct < thresholds["data_quality_pct"]:
             scores["data_quality"] = 0
-            reasons.append(f"FAIL: Data quality too low ({data_quality_pct:.1f}%)")
+            reasons.append(
+                f"FAIL: Data quality too low ({data_quality_pct:.1f}% < {thresholds['data_quality_pct']:.1f}%)"
+            )
         elif data_quality_pct >= 95:
             scores["data_quality"] = SCORE_WEIGHTS["data_quality"]
         elif data_quality_pct >= 85:
             scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * 0.8
         elif data_quality_pct >= 75:
             scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * 0.6
-        else:
+        elif data_quality_pct >= 50:
             scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * 0.4
-            warnings.append(f"Low data quality: {data_quality_pct:.1f}%")
+            if not validation_mode:
+                warnings.append(f"Low data quality: {data_quality_pct:.1f}%")
+        else:
+            # Very low coverage but above threshold (validation mode allows 0%)
+            scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * 0.2 if validation_mode else 0
 
-        if largest_gap_seconds > 3600:  # More than 1 hour gap
-            warnings.append(f"Large data gap detected: {largest_gap_seconds/60:.0f} minutes")
+        if largest_gap_seconds > 3600 and not validation_mode:  # More than 1 hour gap
+            warnings.append(f"Large data gap detected: {largest_gap_seconds / 60:.0f} minutes")
     else:
-        # No data quality info - partial score
-        scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * 0.5
-        warnings.append("No data quality report available")
+        # No data quality info - partial score (or full in validation mode)
+        scores["data_quality"] = SCORE_WEIGHTS["data_quality"] * (0.8 if validation_mode else 0.5)
+        if not validation_mode:
+            warnings.append("No data quality report available")
 
     # --- Calculate Total Score ---
     total_score = sum(scores.values())
 
     # --- Determine Pass/Fail ---
-    # Must pass all critical thresholds AND score >= 60
+    # Must pass all critical thresholds AND score >= threshold
+    # Validation mode has lower score threshold (40 vs 60)
+    min_score = 40 if validation_mode else 60
     has_failures = any(r.startswith("FAIL:") for r in reasons)
-    passed = not has_failures and total_score >= 60
+    passed = not has_failures and total_score >= min_score
 
     if not passed and not has_failures:
-        reasons.append(f"FAIL: Score too low ({total_score:.0f}/100, need 60)")
+        reasons.append(f"FAIL: Score too low ({total_score:.0f}/100, need {min_score})")
 
     if passed:
-        reasons.insert(0, f"PASS: Score {total_score:.0f}/100")
+        mode_str = " (validation mode)" if validation_mode else ""
+        reasons.insert(0, f"PASS: Score {total_score:.0f}/100{mode_str}")
 
     # --- Calculate Recommended Limits ---
     limits = _compute_recommended_limits(

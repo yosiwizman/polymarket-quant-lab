@@ -1186,5 +1186,299 @@ def backtest_export(
         raise typer.Exit(1)
 
 
+# =============================================================================
+# Snapshots Commands (Phase 2.5)
+# =============================================================================
+
+snapshots_app = typer.Typer(help="Snapshot collection and quality commands")
+app.add_typer(snapshots_app, name="snapshots")
+
+
+@snapshots_app.command("run")
+def snapshots_run(
+    interval: Annotated[
+        int,
+        typer.Option("--interval", "-i", help="Snapshot interval in seconds"),
+    ] = 60,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Number of markets to fetch per cycle"),
+    ] = 200,
+    duration_minutes: Annotated[
+        int,
+        typer.Option("--duration-minutes", "-d", help="Total duration in minutes (0 = infinite)"),
+    ] = 60,
+) -> None:
+    """Run automated snapshot collection loop.
+
+    Collects market snapshots at regular intervals for backtesting.
+    Does NOT execute any trades - data capture only.
+
+    Example:
+        pmq snapshots run --interval 60 --limit 200 --duration-minutes 60
+    """
+    import os
+
+    settings = get_settings()
+
+    # Check kill switch
+    if settings.safety.kill_switch or os.environ.get("PMQ_SNAPSHOT_KILL", "").lower() == "true":
+        console.print("[red]Kill switch is active. Snapshot collection halted.[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[bold green]Starting snapshot collection[/bold green]\n"
+        f"Interval: {interval}s\n"
+        f"Limit: {limit} markets\n"
+        f"Duration: {'infinite' if duration_minutes == 0 else f'{duration_minutes} minutes'}\n"
+    )
+
+    dao = DAO()
+    client = GammaClient()
+
+    start_time = time.time()
+    end_time = start_time + (duration_minutes * 60) if duration_minutes > 0 else float("inf")
+    cycle_count = 0
+    backoff = 1
+    max_backoff = 300
+
+    try:
+        while time.time() < end_time:
+            cycle_count += 1
+            now = datetime.now(UTC).isoformat()
+
+            # Check kill switch each cycle
+            if os.environ.get("PMQ_SNAPSHOT_KILL", "").lower() == "true":
+                console.print("[red]Kill switch activated. Stopping.[/red]")
+                break
+
+            console.print(f"\n[cyan]Cycle {cycle_count} @ {now[:19]}[/cyan]")
+
+            try:
+                # Fetch markets
+                console.print(f"[dim]Fetching {limit} markets...[/dim]")
+                markets = client.list_markets(limit=limit)
+
+                # Upsert market data
+                dao.upsert_markets(markets)
+
+                # Save snapshots
+                snapshot_time = datetime.now(UTC).isoformat()
+                snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time)
+
+                console.print(
+                    f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                )
+
+                # Update runtime state
+                dao.set_runtime_state("last_snapshot_at", snapshot_time)
+                dao.set_runtime_state("snapshot_cycle_count", str(cycle_count))
+
+                # Reset backoff on success
+                backoff = 1
+
+            except GammaClientError as e:
+                dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
+                console.print(f"[red]API error: {e}[/red]")
+                console.print(f"[yellow]Backing off {backoff}s...[/yellow]")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+
+            except Exception as e:
+                dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
+                console.print(f"[red]Error: {e}[/red]")
+
+            # Wait for next cycle
+            if time.time() < end_time:
+                time.sleep(interval)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+    finally:
+        client.close()
+
+    elapsed = int((time.time() - start_time) / 60)
+    console.print(f"\n[bold]Completed {cycle_count} cycles in {elapsed} minutes[/bold]")
+
+
+@snapshots_app.command("quality")
+def snapshots_quality(
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (YYYY-MM-DD or ISO)"),
+    ],
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (YYYY-MM-DD or ISO)"),
+    ],
+    interval: Annotated[
+        int,
+        typer.Option("--interval", "-i", help="Expected interval in seconds"),
+    ] = 60,
+) -> None:
+    """Analyze snapshot data quality for a time window.
+
+    Checks for gaps, duplicates, and coverage issues.
+    Saves a quality report to the database.
+
+    Example:
+        pmq snapshots quality --from 2024-01-01 --to 2024-01-07 --interval 60
+    """
+    from pmq.quality import QualityReporter
+
+    reporter = QualityReporter()
+
+    with console.status("[bold green]Analyzing snapshot quality..."):
+        result = reporter.generate_report(
+            start_time=from_date,
+            end_time=to_date,
+            expected_interval_seconds=interval,
+            save=True,
+        )
+
+    # Display results
+    status = reporter.get_status_badge(result)
+    status_color = {"healthy": "green", "degraded": "yellow", "unhealthy": "red"}.get(
+        status, "dim"
+    )
+
+    console.print(f"\n[bold]Quality Report: [{status_color}]{status.upper()}[/{status_color}][/bold]")
+
+    table = Table(title="Quality Metrics")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+
+    table.add_row("Window", f"{from_date} to {to_date}")
+    table.add_row("Expected Interval", f"{interval}s")
+    table.add_row("Total Snapshots", str(result.snapshots_written))
+    table.add_row("Markets Covered", str(result.markets_seen))
+    table.add_row("Coverage", f"{result.coverage_pct:.1f}%")
+    table.add_row("Missing Intervals", str(result.missing_intervals))
+    table.add_row("Largest Gap", f"{result.largest_gap_seconds:.0f}s")
+    table.add_row("Duplicates", str(result.duplicate_count))
+
+    console.print(table)
+
+    # Show top gaps if any
+    if result.gaps:
+        console.print(f"\n[yellow]Found {len(result.gaps)} gaps (>50% of expected interval)[/yellow]")
+        for gap in result.gaps[:5]:
+            console.print(
+                f"  Gap: {gap.gap_start[:19]} to {gap.gap_end[:19]} "
+                f"({gap.gap_seconds:.0f}s, expected {gap.expected_seconds}s)"
+            )
+
+
+@snapshots_app.command("coverage")
+def snapshots_coverage(
+    from_date: Annotated[
+        str,
+        typer.Option("--from", help="Start date (YYYY-MM-DD or ISO)"),
+    ],
+    to_date: Annotated[
+        str,
+        typer.Option("--to", help="End date (YYYY-MM-DD or ISO)"),
+    ],
+) -> None:
+    """Show snapshot coverage summary for a time window.
+
+    Displays market-level coverage statistics.
+
+    Example:
+        pmq snapshots coverage --from 2024-01-01 --to 2024-01-07
+    """
+    from pmq.quality import QualityReporter
+
+    reporter = QualityReporter()
+
+    with console.status("[bold green]Calculating coverage..."):
+        summary = reporter.get_coverage_summary(from_date, to_date)
+
+    console.print(f"\n[bold]Snapshot Coverage: {from_date} to {to_date}[/bold]")
+
+    table = Table(title="Coverage Summary")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+
+    table.add_row("Total Snapshots", str(summary["total_snapshots"]))
+    table.add_row("Distinct Times", str(summary["distinct_times"]))
+    table.add_row("Markets Covered", str(summary["markets_covered"]))
+
+    overall = summary.get("overall_stats", {})
+    if overall:
+        table.add_row("Overall Total", str(overall.get("total_snapshots", 0)))
+        table.add_row("Last 24h Count", str(overall.get("last_24h_count", 0)))
+        if overall.get("first_snapshot"):
+            table.add_row("First Snapshot", overall["first_snapshot"][:19])
+        if overall.get("last_snapshot"):
+            table.add_row("Last Snapshot", overall["last_snapshot"][:19])
+
+    console.print(table)
+
+    # Top markets
+    top_markets = summary.get("top_markets", [])
+    if top_markets:
+        markets_table = Table(title="Top Markets by Snapshot Count")
+        markets_table.add_column("Market ID", style="cyan", max_width=16)
+        markets_table.add_column("Snapshots", justify="right")
+        markets_table.add_column("First", style="dim")
+        markets_table.add_column("Last", style="dim")
+
+        for m in top_markets[:10]:
+            markets_table.add_row(
+                m["market_id"][:16] + "...",
+                str(m["snapshot_count"]),
+                m.get("first", "")[:10] if m.get("first") else "",
+                m.get("last", "")[:10] if m.get("last") else "",
+            )
+
+        console.print(markets_table)
+
+
+@snapshots_app.command("summary")
+def snapshots_summary() -> None:
+    """Show overall snapshot statistics.
+
+    Example:
+        pmq snapshots summary
+    """
+    dao = DAO()
+    summary = dao.get_snapshot_summary()
+
+    console.print("\n[bold]Snapshot Summary[/bold]")
+
+    table = Table()
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+
+    table.add_row("Total Snapshots", str(summary["total_snapshots"]))
+    table.add_row("Unique Markets", str(summary["unique_markets"]))
+    table.add_row("Last 24h", str(summary["last_24h_count"]))
+
+    if summary.get("first_snapshot"):
+        table.add_row("First Snapshot", summary["first_snapshot"][:19])
+    if summary.get("last_snapshot"):
+        table.add_row("Last Snapshot", summary["last_snapshot"][:19])
+
+    console.print(table)
+
+    # Show latest quality report if exists
+    latest_report = dao.get_latest_quality_report()
+    if latest_report:
+        console.print("\n[bold]Latest Quality Report[/bold]")
+        q_table = Table()
+        q_table.add_column("Metric", style="cyan")
+        q_table.add_column("Value", justify="right")
+
+        q_table.add_row("Window", f"{latest_report['window_from'][:10]} to {latest_report['window_to'][:10]}")
+        q_table.add_row("Coverage", f"{latest_report['coverage_pct']:.1f}%")
+        q_table.add_row("Missing Intervals", str(latest_report["missing_intervals"]))
+        q_table.add_row("Duplicates", str(latest_report["duplicate_count"]))
+        q_table.add_row("Created", latest_report["created_at"][:19])
+
+        console.print(q_table)
+
+
 if __name__ == "__main__":
     app()

@@ -111,6 +111,83 @@ def get_summary() -> dict[str, Any]:
 
 
 # =============================================================================
+# Snapshot Endpoints (Phase 2.5)
+# =============================================================================
+
+
+@router.get("/api/snapshots/summary")
+def get_snapshots_summary() -> dict[str, Any]:
+    """Get overall snapshot statistics.
+
+    Returns:
+        Summary with snapshot counts and time range
+    """
+    dao = get_dao()
+    summary = dao.get_snapshot_summary()
+    return {
+        "summary": summary,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+@router.get("/api/snapshots/coverage")
+def get_snapshots_coverage(
+    from_time: str = Query(alias="from"),
+    to_time: str = Query(alias="to"),
+) -> dict[str, Any]:
+    """Get snapshot coverage for a time window.
+
+    Args:
+        from_time: Start time (ISO or YYYY-MM-DD)
+        to_time: End time (ISO or YYYY-MM-DD)
+
+    Returns:
+        Coverage stats for the window
+    """
+    dao = get_dao()
+    # Normalize dates
+    if "T" not in from_time:
+        from_time = f"{from_time}T00:00:00+00:00"
+    if "T" not in to_time:
+        to_time = f"{to_time}T23:59:59+00:00"
+
+    coverage = dao.get_snapshot_coverage(from_time, to_time)
+    return {"coverage": coverage}
+
+
+@router.get("/api/snapshots/quality/latest")
+def get_latest_quality_report() -> dict[str, Any]:
+    """Get the most recent quality report.
+
+    Returns:
+        Latest quality report or empty if none exists
+    """
+    dao = get_dao()
+    report = dao.get_latest_quality_report()
+
+    # Determine status badge
+    if report:
+        coverage_pct = report.get("coverage_pct", 0)
+        missing = report.get("missing_intervals", 0)
+        duplicates = report.get("duplicate_count", 0)
+
+        if coverage_pct >= 95 and missing <= 5 and duplicates == 0:
+            status = "healthy"
+        elif coverage_pct >= 80 and missing <= 20:
+            status = "degraded"
+        else:
+            status = "unhealthy"
+    else:
+        status = "unknown"
+
+    return {
+        "report": report,
+        "status": status,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
+# =============================================================================
 # Dashboard (HTML)
 # =============================================================================
 
@@ -134,6 +211,24 @@ def dashboard(request: Request) -> HTMLResponse:
     recent_trades = dao.get_trades_for_export(limit=10)
     positions = dao.get_positions_for_export()
 
+    # Snapshot data (Phase 2.5)
+    snapshot_summary = dao.get_snapshot_summary()
+    quality_report = dao.get_latest_quality_report()
+
+    # Compute quality status
+    if quality_report:
+        coverage_pct = quality_report.get("coverage_pct", 0)
+        missing = quality_report.get("missing_intervals", 0)
+        duplicates = quality_report.get("duplicate_count", 0)
+        if coverage_pct >= 95 and missing <= 5 and duplicates == 0:
+            quality_status = "healthy"
+        elif coverage_pct >= 80 and missing <= 20:
+            quality_status = "degraded"
+        else:
+            quality_status = "unhealthy"
+    else:
+        quality_status = "unknown"
+
     templates = request.app.state.templates
     response: HTMLResponse = templates.TemplateResponse(
         request,
@@ -145,6 +240,9 @@ def dashboard(request: Request) -> HTMLResponse:
             "signals": recent_signals,
             "trades": recent_trades,
             "positions": positions,
+            "snapshot_summary": snapshot_summary,
+            "quality_report": quality_report,
+            "quality_status": quality_status,
             "now": datetime.now(UTC).isoformat(),
         },
     )

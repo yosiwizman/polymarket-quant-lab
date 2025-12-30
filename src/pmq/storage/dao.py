@@ -1068,3 +1068,366 @@ class DAO:
                 data["extra_metrics"] = json.loads(data["metrics_json"])
             return data
         return None
+
+    # =========================================================================
+    # Snapshot Quality Reports (Phase 2.5)
+    # =========================================================================
+
+    def save_quality_report(
+        self,
+        window_from: str,
+        window_to: str,
+        expected_interval_seconds: int,
+        markets_seen: int,
+        snapshots_written: int,
+        missing_intervals: int,
+        largest_gap_seconds: float,
+        duplicate_count: int,
+        stale_market_count: int,
+        coverage_pct: float,
+        notes: dict[str, Any] | None = None,
+    ) -> int:
+        """Save a snapshot quality report.
+
+        Args:
+            window_from: Start of analysis window
+            window_to: End of analysis window
+            expected_interval_seconds: Expected time between snapshots
+            markets_seen: Number of distinct markets
+            snapshots_written: Total snapshots in window
+            missing_intervals: Count of missing expected intervals
+            largest_gap_seconds: Largest gap between snapshots
+            duplicate_count: Number of duplicate timestamp entries
+            stale_market_count: Markets with no recent data
+            coverage_pct: Overall coverage percentage
+            notes: Additional notes as dict
+
+        Returns:
+            Report ID
+        """
+        notes_json = json.dumps(notes) if notes else None
+        cursor = self._db.execute(
+            """
+            INSERT INTO snapshot_quality_reports
+            (window_from, window_to, expected_interval_seconds, markets_seen,
+             snapshots_written, missing_intervals, largest_gap_seconds,
+             duplicate_count, stale_market_count, coverage_pct, notes_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                window_from,
+                window_to,
+                expected_interval_seconds,
+                markets_seen,
+                snapshots_written,
+                missing_intervals,
+                largest_gap_seconds,
+                duplicate_count,
+                stale_market_count,
+                coverage_pct,
+                notes_json,
+            ),
+        )
+        return cursor.lastrowid or 0
+
+    def get_latest_quality_report(self) -> dict[str, Any] | None:
+        """Get most recent quality report.
+
+        Returns:
+            Report dict or None
+        """
+        row = self._db.fetch_one(
+            "SELECT * FROM snapshot_quality_reports ORDER BY created_at DESC LIMIT 1"
+        )
+        if row:
+            data = dict(row)
+            if data.get("notes_json"):
+                data["notes"] = json.loads(data["notes_json"])
+            return data
+        return None
+
+    def get_quality_reports(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get recent quality reports.
+
+        Args:
+            limit: Maximum results
+
+        Returns:
+            List of report dicts
+        """
+        rows = self._db.fetch_all(
+            "SELECT * FROM snapshot_quality_reports ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        results = []
+        for row in rows:
+            data = dict(row)
+            if data.get("notes_json"):
+                data["notes"] = json.loads(data["notes_json"])
+            results.append(data)
+        return results
+
+    # =========================================================================
+    # Snapshot Coverage/Statistics (Phase 2.5)
+    # =========================================================================
+
+    def get_snapshot_summary(self) -> dict[str, Any]:
+        """Get overall snapshot summary stats.
+
+        Returns:
+            Summary dict with counts and time range
+        """
+        total_row = self._db.fetch_one(
+            "SELECT COUNT(*) as count FROM market_snapshots"
+        )
+        total_snapshots = total_row["count"] if total_row else 0
+
+        markets_row = self._db.fetch_one(
+            "SELECT COUNT(DISTINCT market_id) as count FROM market_snapshots"
+        )
+        unique_markets = markets_row["count"] if markets_row else 0
+
+        range_row = self._db.fetch_one(
+            """
+            SELECT MIN(snapshot_time) as first, MAX(snapshot_time) as last
+            FROM market_snapshots
+            """
+        )
+        first_snapshot = range_row["first"] if range_row else None
+        last_snapshot = range_row["last"] if range_row else None
+
+        # Last 24h stats
+        recent_row = self._db.fetch_one(
+            """
+            SELECT COUNT(*) as count FROM market_snapshots
+            WHERE snapshot_time > datetime('now', '-24 hours')
+            """
+        )
+        last_24h = recent_row["count"] if recent_row else 0
+
+        return {
+            "total_snapshots": total_snapshots,
+            "unique_markets": unique_markets,
+            "first_snapshot": first_snapshot,
+            "last_snapshot": last_snapshot,
+            "last_24h_count": last_24h,
+        }
+
+    def get_snapshot_coverage(
+        self,
+        start_time: str,
+        end_time: str,
+    ) -> dict[str, Any]:
+        """Get snapshot coverage stats for a time window.
+
+        Args:
+            start_time: Start of window
+            end_time: End of window
+
+        Returns:
+            Coverage stats including per-market counts
+        """
+        # Total snapshots in window
+        total_row = self._db.fetch_one(
+            """
+            SELECT COUNT(*) as count FROM market_snapshots
+            WHERE snapshot_time >= ? AND snapshot_time <= ?
+            """,
+            (start_time, end_time),
+        )
+        total_snapshots = total_row["count"] if total_row else 0
+
+        # Distinct times
+        times_row = self._db.fetch_one(
+            """
+            SELECT COUNT(DISTINCT snapshot_time) as count FROM market_snapshots
+            WHERE snapshot_time >= ? AND snapshot_time <= ?
+            """,
+            (start_time, end_time),
+        )
+        distinct_times = times_row["count"] if times_row else 0
+
+        # Per-market breakdown
+        market_rows = self._db.fetch_all(
+            """
+            SELECT market_id, COUNT(*) as snapshot_count,
+                   MIN(snapshot_time) as first, MAX(snapshot_time) as last
+            FROM market_snapshots
+            WHERE snapshot_time >= ? AND snapshot_time <= ?
+            GROUP BY market_id
+            ORDER BY snapshot_count DESC
+            LIMIT 100
+            """,
+            (start_time, end_time),
+        )
+        markets = [dict(row) for row in market_rows]
+
+        return {
+            "window_from": start_time,
+            "window_to": end_time,
+            "total_snapshots": total_snapshots,
+            "distinct_times": distinct_times,
+            "markets_covered": len(markets),
+            "markets": markets,
+        }
+
+    def get_snapshot_gaps(
+        self,
+        start_time: str,
+        end_time: str,
+        expected_interval_seconds: int,
+    ) -> list[dict[str, Any]]:
+        """Find gaps in snapshot data.
+
+        Args:
+            start_time: Start of window
+            end_time: End of window
+            expected_interval_seconds: Expected interval between snapshots
+
+        Returns:
+            List of gaps with start/end times and duration
+        """
+        # Get distinct snapshot times
+        times = self.get_snapshot_times(start_time, end_time)
+        if len(times) < 2:
+            return []
+
+        gaps = []
+        threshold = expected_interval_seconds * 1.5  # 50% tolerance
+
+        for i in range(1, len(times)):
+            prev_time = datetime.fromisoformat(times[i - 1].replace("Z", "+00:00"))
+            curr_time = datetime.fromisoformat(times[i].replace("Z", "+00:00"))
+            gap_seconds = (curr_time - prev_time).total_seconds()
+
+            if gap_seconds > threshold:
+                gaps.append(
+                    {
+                        "gap_start": times[i - 1],
+                        "gap_end": times[i],
+                        "gap_seconds": gap_seconds,
+                        "expected_seconds": expected_interval_seconds,
+                    }
+                )
+
+        return gaps
+
+    def get_duplicate_snapshots(
+        self,
+        start_time: str,
+        end_time: str,
+    ) -> list[dict[str, Any]]:
+        """Find duplicate snapshots (same market + time).
+
+        Args:
+            start_time: Start of window
+            end_time: End of window
+
+        Returns:
+            List of duplicate entries
+        """
+        rows = self._db.fetch_all(
+            """
+            SELECT market_id, snapshot_time, COUNT(*) as dup_count
+            FROM market_snapshots
+            WHERE snapshot_time >= ? AND snapshot_time <= ?
+            GROUP BY market_id, snapshot_time
+            HAVING COUNT(*) > 1
+            ORDER BY dup_count DESC
+            LIMIT 100
+            """,
+            (start_time, end_time),
+        )
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Backtest Manifests (Phase 2.5)
+    # =========================================================================
+
+    def save_backtest_manifest(
+        self,
+        run_id: str,
+        strategy: str,
+        window_from: str,
+        window_to: str,
+        config_hash: str,
+        code_git_sha: str | None = None,
+        snapshot_interval_seconds: int | None = None,
+        market_filter: list[str] | None = None,
+        snapshot_count: int = 0,
+        first_snapshot_time: str | None = None,
+        last_snapshot_time: str | None = None,
+        notes: str | None = None,
+    ) -> int:
+        """Save a backtest manifest for reproducibility.
+
+        Args:
+            run_id: Backtest run ID
+            strategy: Strategy name
+            window_from: Backtest start date
+            window_to: Backtest end date
+            config_hash: SHA256 hash of config
+            code_git_sha: Git commit SHA
+            snapshot_interval_seconds: Expected snapshot interval
+            market_filter: List of market IDs if filtered
+            snapshot_count: Number of snapshots used
+            first_snapshot_time: First snapshot timestamp
+            last_snapshot_time: Last snapshot timestamp
+            notes: Optional notes
+
+        Returns:
+            Manifest ID
+        """
+        market_filter_json = json.dumps(market_filter) if market_filter else None
+        time_range_json = None
+        if first_snapshot_time or last_snapshot_time:
+            time_range_json = json.dumps(
+                {"first": first_snapshot_time, "last": last_snapshot_time}
+            )
+
+        cursor = self._db.execute(
+            """
+            INSERT INTO backtest_manifests
+            (run_id, strategy, window_from, window_to, snapshot_interval_seconds,
+             market_filter_json, config_hash, code_git_sha, snapshot_count,
+             snapshot_time_range_json, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                strategy,
+                window_from,
+                window_to,
+                snapshot_interval_seconds,
+                market_filter_json,
+                config_hash,
+                code_git_sha,
+                snapshot_count,
+                time_range_json,
+                notes,
+            ),
+        )
+        logger.info(f"Saved manifest for run {run_id} (hash: {config_hash[:12]}...)")
+        return cursor.lastrowid or 0
+
+    def get_backtest_manifest(self, run_id: str) -> dict[str, Any] | None:
+        """Get manifest for a backtest run.
+
+        Args:
+            run_id: Backtest run ID
+
+        Returns:
+            Manifest dict or None
+        """
+        row = self._db.fetch_one(
+            "SELECT * FROM backtest_manifests WHERE run_id = ?",
+            (run_id,),
+        )
+        if row:
+            data = dict(row)
+            if data.get("market_filter_json"):
+                data["market_filter"] = json.loads(data["market_filter_json"])
+            if data.get("snapshot_time_range_json"):
+                data["snapshot_time_range"] = json.loads(data["snapshot_time_range_json"])
+            return data
+        return None

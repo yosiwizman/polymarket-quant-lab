@@ -266,13 +266,15 @@ class EvaluationPipeline:
             self._dao.save_evaluation_artifact(
                 evaluation_id=eval_id,
                 kind="PAIRS_CONFIG_JSON",
-                content=json.dumps({
-                    "path": pairs_config_result.config_path,
-                    "hash": pairs_config_result.config_hash,
-                    "enabled_pairs": len(pairs_config_result.enabled_pairs),
-                    "disabled_pairs": len(pairs_config_result.disabled_pairs),
-                    "pairs": [p.to_dict() for p in pairs_config_result.enabled_pairs],
-                }),
+                content=json.dumps(
+                    {
+                        "path": pairs_config_result.config_path,
+                        "hash": pairs_config_result.config_hash,
+                        "enabled_pairs": len(pairs_config_result.enabled_pairs),
+                        "disabled_pairs": len(pairs_config_result.disabled_pairs),
+                        "pairs": [p.to_dict() for p in pairs_config_result.enabled_pairs],
+                    }
+                ),
             )
 
         result.backtest_run_id = backtest_result["run_id"]

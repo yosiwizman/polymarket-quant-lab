@@ -2556,7 +2556,7 @@ def statarb_pairs(
         snapshots = dao.get_snapshots(start_time, end_time)
 
         # Group snapshots by market
-        market_snapshots: dict[str, list[dict]] = {}
+        market_snapshots: dict[str, list[dict[str, Any]]] = {}
         for snap in snapshots:
             mid = snap["market_id"]
             if mid not in market_snapshots:
@@ -2611,8 +2611,8 @@ def statarb_pairs(
                     if a_snapshots < 5 or b_snapshots < 5:
                         continue
 
-                    q_a = market_a.get('question', '')[:30]
-                    q_b = market_b.get('question', '')[:30]
+                    q_a = market_a.get("question", "")[:30]
+                    q_b = market_b.get("question", "")[:30]
                     name = f"{prefix}: {q_a} vs {q_b}"
                     suggested_pairs.append(
                         PairConfig(
@@ -2698,7 +2698,7 @@ def statarb_explain(
         pairs_result = load_validated_pairs_config(pairs_config)
     except PairsConfigError as e:
         console.print(f"[red]Failed to load pairs config: {e}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
     dao = DAO()
     settings = get_settings()
@@ -2723,7 +2723,7 @@ def statarb_explain(
     console.print(f"  Enabled pairs: {len(pairs_result.enabled_pairs)}")
 
     # Analyze each pair
-    pair_stats: list[dict] = []
+    pair_stats: list[dict[str, Any]] = []
 
     for pair in pairs_result.enabled_pairs:
         stats: dict[str, Any] = {

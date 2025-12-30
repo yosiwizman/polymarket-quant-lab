@@ -83,10 +83,11 @@ class StatArbScanner:
 
         Args:
             config: Stat-arb configuration
-            pairs: List of pairs to monitor (loads from config file if not provided)
+            pairs: List of pairs to monitor (loads from config file if None)
         """
         self._config = config or get_settings().statarb
-        self._pairs = pairs or self._load_pairs()
+        # Explicitly check for None to allow passing an empty list
+        self._pairs = pairs if pairs is not None else self._load_pairs()
         logger.debug(
             f"StatArbScanner initialized: entry={self._config.entry_threshold}, "
             f"exit={self._config.exit_threshold}, pairs={len(self._pairs)}"

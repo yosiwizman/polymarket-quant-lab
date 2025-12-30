@@ -215,7 +215,8 @@ def validate_pairs_config(data: dict[str, Any]) -> tuple[list[PairConfig], list[
             continue
 
         # Check for duplicates (order-independent)
-        pair_key = tuple(sorted([pair.market_a_id, pair.market_b_id]))
+        sorted_ids = sorted([pair.market_a_id, pair.market_b_id])
+        pair_key: tuple[str, str] = (sorted_ids[0], sorted_ids[1])
         if pair_key in seen_ids:
             errors.append(
                 f"Pair {i + 1}: Duplicate pair - markets {pair.market_a_id[:16]}... "

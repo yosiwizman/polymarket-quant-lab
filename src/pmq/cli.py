@@ -2477,10 +2477,10 @@ def statarb_pairs(
         int,
         typer.Option("--last-times", help="For suggest: use last K snapshot times"),
     ] = 30,
-    interval: Annotated[
+    _interval: Annotated[
         int,
         typer.Option("--interval", "-i", help="For suggest: expected snapshot interval seconds"),
-    ] = 60,
+    ] = 60,  # noqa: ARG001 - reserved for future use
     output: Annotated[
         Path | None,
         typer.Option("--out", "-o", help="For suggest: output file path"),
@@ -2536,7 +2536,7 @@ def statarb_pairs(
         except PairsConfigError as e:
             console.print("[red]✗ Invalid pairs configuration[/red]")
             console.print(f"[red]{e}[/red]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from None
 
     elif action == "suggest":
         # Suggest pairs from snapshot data (DB-only, no live API)

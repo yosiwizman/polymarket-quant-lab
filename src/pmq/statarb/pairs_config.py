@@ -125,7 +125,7 @@ def _validate_pair(data: dict[str, Any], index: int) -> tuple[PairConfig | None,
 
     # Correlation (optional, default 1.0)
     correlation = data.get("correlation", 1.0)
-    if not isinstance(correlation, (int, float)):
+    if not isinstance(correlation, int | float):
         errors.append(f"Pair {index + 1}: correlation must be a number")
         correlation = 1.0
     elif correlation < -1.0 or correlation > 1.0:
@@ -139,12 +139,12 @@ def _validate_pair(data: dict[str, Any], index: int) -> tuple[PairConfig | None,
 
     # Optional constraints
     min_liquidity = data.get("min_liquidity")
-    if min_liquidity is not None and not isinstance(min_liquidity, (int, float)):
+    if min_liquidity is not None and not isinstance(min_liquidity, int | float):
         errors.append(f"Pair {index + 1}: min_liquidity must be a number")
         min_liquidity = None
 
     max_spread = data.get("max_spread")
-    if max_spread is not None and not isinstance(max_spread, (int, float)):
+    if max_spread is not None and not isinstance(max_spread, int | float):
         errors.append(f"Pair {index + 1}: max_spread must be a number")
         max_spread = None
 

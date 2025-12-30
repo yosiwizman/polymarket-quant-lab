@@ -470,3 +470,184 @@ class TestEvaluationPipelineIntegration:
             )
 
         assert "Invalid pairs config" in str(exc_info.value)
+
+
+class TestDiscoveryModule:
+    """Tests for the pair discovery module."""
+
+    def test_compute_correlation_positive(self):
+        """Test correlation computation for positively correlated series."""
+        from pmq.statarb.discovery import compute_correlation
+
+        # Perfect positive correlation
+        prices_a = [0.5, 0.6, 0.7, 0.8, 0.9]
+        prices_b = [0.5, 0.6, 0.7, 0.8, 0.9]
+        corr = compute_correlation(prices_a, prices_b)
+        assert corr == pytest.approx(1.0, abs=0.001)
+
+    def test_compute_correlation_negative(self):
+        """Test correlation computation for negatively correlated series."""
+        from pmq.statarb.discovery import compute_correlation
+
+        # Perfect negative correlation
+        prices_a = [0.5, 0.6, 0.7, 0.8, 0.9]
+        prices_b = [0.9, 0.8, 0.7, 0.6, 0.5]
+        corr = compute_correlation(prices_a, prices_b)
+        assert corr == pytest.approx(-1.0, abs=0.001)
+
+    def test_compute_correlation_insufficient_data(self):
+        """Test correlation returns 0 for insufficient data."""
+        from pmq.statarb.discovery import compute_correlation
+
+        # Less than 3 data points
+        prices_a = [0.5, 0.6]
+        prices_b = [0.5, 0.6]
+        corr = compute_correlation(prices_a, prices_b)
+        assert corr == 0.0
+
+    def test_compute_correlation_constant_prices(self):
+        """Test correlation returns 0 for constant prices."""
+        from pmq.statarb.discovery import compute_correlation
+
+        # Constant prices (zero variance)
+        prices_a = [0.5, 0.5, 0.5, 0.5]
+        prices_b = [0.6, 0.7, 0.8, 0.9]
+        corr = compute_correlation(prices_a, prices_b)
+        assert corr == 0.0
+
+    def test_discover_pairs_deterministic(self):
+        """Test that discover_pairs produces deterministic output."""
+        from pmq.statarb.discovery import discover_pairs
+
+        # Create snapshot data with known correlation
+        snapshots = [
+            {"market_id": "A", "snapshot_time": "t1", "yes_price": 0.5},
+            {"market_id": "A", "snapshot_time": "t2", "yes_price": 0.6},
+            {"market_id": "A", "snapshot_time": "t3", "yes_price": 0.7},
+            {"market_id": "A", "snapshot_time": "t4", "yes_price": 0.8},
+            {"market_id": "A", "snapshot_time": "t5", "yes_price": 0.9},
+            {"market_id": "B", "snapshot_time": "t1", "yes_price": 0.5},
+            {"market_id": "B", "snapshot_time": "t2", "yes_price": 0.6},
+            {"market_id": "B", "snapshot_time": "t3", "yes_price": 0.7},
+            {"market_id": "B", "snapshot_time": "t4", "yes_price": 0.8},
+            {"market_id": "B", "snapshot_time": "t5", "yes_price": 0.9},
+        ]
+        markets = {
+            "A": {"question": "Market A?"},
+            "B": {"question": "Market B?"},
+        }
+
+        # Run twice and ensure same output
+        result1 = discover_pairs(snapshots, markets, min_overlap=3, top=10, min_correlation=0.3)
+        result2 = discover_pairs(snapshots, markets, min_overlap=3, top=10, min_correlation=0.3)
+
+        assert len(result1) == len(result2)
+        for c1, c2 in zip(result1, result2, strict=True):
+            assert c1.market_a_id == c2.market_a_id
+            assert c1.market_b_id == c2.market_b_id
+            assert c1.correlation == c2.correlation
+
+    def test_discover_pairs_respects_min_overlap(self):
+        """Test that discover_pairs respects min_overlap requirement."""
+        from pmq.statarb.discovery import discover_pairs
+
+        # Only 3 overlapping times
+        snapshots = [
+            {"market_id": "A", "snapshot_time": "t1", "yes_price": 0.5},
+            {"market_id": "A", "snapshot_time": "t2", "yes_price": 0.6},
+            {"market_id": "A", "snapshot_time": "t3", "yes_price": 0.7},
+            {"market_id": "B", "snapshot_time": "t1", "yes_price": 0.5},
+            {"market_id": "B", "snapshot_time": "t2", "yes_price": 0.6},
+            {"market_id": "B", "snapshot_time": "t3", "yes_price": 0.7},
+        ]
+        markets = {"A": {}, "B": {}}
+
+        # min_overlap=5 should find nothing
+        result = discover_pairs(snapshots, markets, min_overlap=5, top=10, min_correlation=0.3)
+        assert len(result) == 0
+
+        # min_overlap=3 should find the pair
+        result = discover_pairs(snapshots, markets, min_overlap=3, top=10, min_correlation=0.3)
+        assert len(result) == 1
+
+    def test_validate_pair_overlap_valid(self):
+        """Test validate_pair_overlap returns valid for sufficient overlap."""
+        from pmq.statarb.discovery import validate_pair_overlap
+
+        pair = PairConfig(
+            market_a_id="A",
+            market_b_id="B",
+            name="Test",
+        )
+        snapshots = [
+            {"market_id": "A", "snapshot_time": "t1"},
+            {"market_id": "A", "snapshot_time": "t2"},
+            {"market_id": "A", "snapshot_time": "t3"},
+            {"market_id": "B", "snapshot_time": "t1"},
+            {"market_id": "B", "snapshot_time": "t2"},
+            {"market_id": "B", "snapshot_time": "t3"},
+        ]
+
+        result = validate_pair_overlap(pair, snapshots, min_overlap=3)
+        assert result["valid"] is True
+        assert result["overlap_count"] == 3
+
+    def test_validate_pair_overlap_insufficient(self):
+        """Test validate_pair_overlap returns invalid for insufficient overlap."""
+        from pmq.statarb.discovery import validate_pair_overlap
+
+        pair = PairConfig(
+            market_a_id="A",
+            market_b_id="B",
+            name="Test",
+        )
+        snapshots = [
+            {"market_id": "A", "snapshot_time": "t1"},
+            {"market_id": "A", "snapshot_time": "t2"},
+            {"market_id": "B", "snapshot_time": "t3"},  # Different time
+            {"market_id": "B", "snapshot_time": "t4"},  # Different time
+        ]
+
+        result = validate_pair_overlap(pair, snapshots, min_overlap=3)
+        assert result["valid"] is False
+        assert "Insufficient overlap" in result["reason"]
+
+    def test_validate_pair_overlap_missing_market(self):
+        """Test validate_pair_overlap returns invalid for missing market."""
+        from pmq.statarb.discovery import validate_pair_overlap
+
+        pair = PairConfig(
+            market_a_id="A",
+            market_b_id="C",  # Market C not in snapshots
+            name="Test",
+        )
+        snapshots = [
+            {"market_id": "A", "snapshot_time": "t1"},
+            {"market_id": "B", "snapshot_time": "t1"},
+        ]
+
+        result = validate_pair_overlap(pair, snapshots, min_overlap=1)
+        assert result["valid"] is False
+        assert "no snapshots" in result["reason"]
+
+    def test_candidate_pair_to_pair_config(self):
+        """Test CandidatePair conversion to PairConfig."""
+        from pmq.statarb.discovery import CandidatePair
+
+        candidate = CandidatePair(
+            market_a_id="123",
+            market_b_id="456",
+            market_a_question="Question A?",
+            market_b_question="Question B?",
+            correlation=0.85,
+            overlap_count=20,
+            avg_spread=0.05,
+            max_abs_spread=0.15,
+        )
+
+        pair_config = candidate.to_pair_config()
+
+        assert pair_config.market_a_id == "123"
+        assert pair_config.market_b_id == "456"
+        assert pair_config.correlation == 0.85
+        assert pair_config.enabled is True

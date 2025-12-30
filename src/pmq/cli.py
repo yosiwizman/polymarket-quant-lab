@@ -5,10 +5,16 @@ Commands:
     pmq scan        - Scan for arbitrage and stat-arb signals
     pmq paper run   - Run paper trading strategy loop
     pmq report      - Generate PnL and trading report
+    pmq serve       - Start local operator web console
+    pmq run         - Run continuous operator loop (sync+scan)
+    pmq export      - Export data to CSV files
 """
 
+import csv
 import time
-from typing import Annotated
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated, Any
 
 import typer
 from rich import print as rprint
@@ -17,8 +23,9 @@ from rich.table import Table
 
 from pmq import __version__
 from pmq.config import get_settings
-from pmq.gamma_client import GammaClient
+from pmq.gamma_client import GammaClient, GammaClientError
 from pmq.logging import setup_logging
+from pmq.models import SignalType
 from pmq.storage import DAO
 from pmq.strategies import ArbitrageScanner, PaperLedger, StatArbScanner
 from pmq.strategies.paper import SafetyError
@@ -546,6 +553,285 @@ def report() -> None:
         console.print(sig_table)
 
     console.print("\n[dim]Note: All trades are simulated. No real money involved.[/dim]")
+
+
+# =============================================================================
+# Serve Command (Web Console)
+# =============================================================================
+
+
+@app.command()
+def serve(
+    host: Annotated[
+        str,
+        typer.Option("--host", "-h", help="Host to bind to"),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", "-p", help="Port to bind to"),
+    ] = 8080,
+) -> None:
+    """Start local operator web console.
+
+    Launches a read-only web dashboard at http://HOST:PORT
+    showing signals, trades, positions, and statistics.
+
+    Example:
+        pmq serve --port 8080
+    """
+    import uvicorn
+
+    from pmq.web import create_app
+
+    console.print(f"[bold green]Starting operator console at http://{host}:{port}[/bold green]")
+    console.print("[dim]Press Ctrl+C to stop[/dim]\n")
+
+    web_app = create_app()
+    uvicorn.run(web_app, host=host, port=port, log_level="info")
+
+
+# =============================================================================
+# Run Command (Operator Loop)
+# =============================================================================
+
+
+@app.command("run")
+def operator_run(
+    interval: Annotated[
+        int,
+        typer.Option("--interval", "-i", help="Sync/scan interval in seconds"),
+    ] = 60,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Number of markets to fetch per cycle"),
+    ] = 200,
+    cycles: Annotated[
+        int,
+        typer.Option("--cycles", "-c", help="Number of cycles (0 = infinite)"),
+    ] = 0,
+    paper: Annotated[
+        bool,
+        typer.Option("--paper", help="Execute paper trades on signals"),
+    ] = False,
+    quantity: Annotated[
+        float,
+        typer.Option("--quantity", "-q", help="Trade quantity per signal (if --paper)"),
+    ] = 10.0,
+) -> None:
+    """Run continuous operator loop (sync -> scan -> optional paper trade).
+
+    This is the main operator command for unattended operation.
+    It loops: fetch data, scan signals, optionally execute paper trades.
+
+    Uses exponential backoff on API errors.
+    Respects kill switch.
+
+    Example:
+        pmq run --interval 60 --limit 100
+        pmq run --interval 30 --paper --quantity 5
+    """
+    settings = get_settings()
+
+    if settings.safety.kill_switch:
+        console.print("[red]Kill switch is active. Operator loop halted.[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[bold green]Starting operator loop[/bold green]\n"
+        f"Interval: {interval}s\n"
+        f"Limit: {limit} markets\n"
+        f"Cycles: {'infinite' if cycles == 0 else cycles}\n"
+        f"Paper trading: {paper}\n"
+    )
+
+    dao = DAO()
+    arb_scanner = ArbitrageScanner()
+    ledger = PaperLedger(dao=dao) if paper else None
+    client = GammaClient()
+
+    cycle_count = 0
+    backoff = 1  # Exponential backoff starting point
+    max_backoff = 300  # Max 5 minutes
+
+    try:
+        while cycles == 0 or cycle_count < cycles:
+            cycle_count += 1
+            now = datetime.now(UTC).isoformat()
+
+            # Check kill switch each cycle
+            settings = get_settings()
+            if settings.safety.kill_switch:
+                console.print("[red]Kill switch activated. Stopping.[/red]")
+                break
+
+            console.print(f"\n[cyan]Cycle {cycle_count} @ {now[:19]}[/cyan]")
+
+            try:
+                # Sync
+                console.print(f"[dim]Syncing {limit} markets...[/dim]")
+                markets = client.list_markets(limit=limit)
+                dao.upsert_markets(markets)
+                dao.set_runtime_state("last_sync_at", now)
+                console.print(f"[green]✓ Synced {len(markets)} markets[/green]")
+
+                # Scan
+                signals = arb_scanner.scan_markets(markets, top_n=10)
+                dao.set_runtime_state("last_scan_at", now)
+                if signals:
+                    console.print(f"[green]Found {len(signals)} signals[/green]")
+                    for sig in signals:
+                        dao.save_arb_signal(sig)
+                else:
+                    console.print("[dim]No signals found[/dim]")
+
+                # Paper trade if enabled
+                if paper and ledger and signals:
+                    for sig in signals[:3]:  # Max 3 per cycle
+                        try:
+                            ledger.execute_arb_trade(sig, quantity=quantity)
+                            console.print(f"[green]✓ Paper trade: {sig.market_id[:16]}...[/green]")
+                        except SafetyError as e:
+                            console.print(f"[yellow]Safety blocked: {e}[/yellow]")
+                    dao.set_runtime_state("last_paper_at", now)
+
+                # Reset backoff on success
+                backoff = 1
+
+            except GammaClientError as e:
+                dao.set_runtime_state("last_error", f"{now}: {e}")
+                console.print(f"[red]API error: {e}[/red]")
+                console.print(f"[yellow]Backing off {backoff}s...[/yellow]")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+
+            except Exception as e:
+                dao.set_runtime_state("last_error", f"{now}: {e}")
+                console.print(f"[red]Error: {e}[/red]")
+
+            # Wait for next cycle
+            if cycles == 0 or cycle_count < cycles:
+                time.sleep(interval)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+    finally:
+        client.close()
+
+    console.print(f"\n[bold]Completed {cycle_count} cycles[/bold]")
+
+
+# =============================================================================
+# Export Command
+# =============================================================================
+
+
+@app.command()
+def export(
+    data_type: Annotated[
+        str,
+        typer.Argument(help="Data to export: signals, trades, positions, all"),
+    ] = "all",
+    output_dir: Annotated[
+        Path,
+        typer.Option("--out", "-o", help="Output directory"),
+    ] = Path("exports"),
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum rows to export"),
+    ] = 1000,
+    signal_type: Annotated[
+        str | None,
+        typer.Option("--type", "-t", help="Signal type filter (ARBITRAGE, STAT_ARB)"),
+    ] = None,
+) -> None:
+    """Export data to CSV files.
+
+    Exports signals, trades, and/or positions to CSV format.
+    Files are timestamped for easy organization.
+
+    Example:
+        pmq export signals --out exports/ --limit 500
+        pmq export all
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    dao = DAO()
+
+    exported_files: list[str] = []
+
+    # Export signals
+    if data_type in ("signals", "all"):
+        type_filter = None
+        if signal_type:
+            try:
+                type_filter = SignalType(signal_type.upper())
+            except ValueError:
+                console.print(f"[yellow]Unknown signal type: {signal_type}[/yellow]")
+
+        signals = dao.get_signals_for_export(signal_type=type_filter, limit=limit)
+        if signals:
+            filename = output_dir / f"signals_{timestamp}.csv"
+            _write_csv(filename, signals)
+            exported_files.append(str(filename))
+            console.print(f"[green]✓ Exported {len(signals)} signals to {filename}[/green]")
+        else:
+            console.print("[dim]No signals to export[/dim]")
+
+    # Export trades
+    if data_type in ("trades", "all"):
+        trades = dao.get_trades_for_export(limit=limit)
+        if trades:
+            filename = output_dir / f"trades_{timestamp}.csv"
+            _write_csv(filename, trades)
+            exported_files.append(str(filename))
+            console.print(f"[green]✓ Exported {len(trades)} trades to {filename}[/green]")
+        else:
+            console.print("[dim]No trades to export[/dim]")
+
+    # Export positions
+    if data_type in ("positions", "all"):
+        positions = dao.get_positions_for_export()
+        if positions:
+            filename = output_dir / f"positions_{timestamp}.csv"
+            _write_csv(filename, positions)
+            exported_files.append(str(filename))
+            console.print(f"[green]✓ Exported {len(positions)} positions to {filename}[/green]")
+        else:
+            console.print("[dim]No positions to export[/dim]")
+
+    if exported_files:
+        console.print(f"\n[bold]Exported {len(exported_files)} file(s) to {output_dir}/[/bold]")
+    else:
+        console.print("[yellow]No data exported[/yellow]")
+
+
+def _write_csv(filepath: Path, data: list[dict[str, Any]]) -> None:
+    """Write data to CSV file.
+
+    Args:
+        filepath: Output file path
+        data: List of dicts to write
+    """
+    if not data:
+        return
+
+    # Flatten any nested lists/dicts to strings
+    flat_data = []
+    for row in data:
+        flat_row = {}
+        for k, v in row.items():
+            if isinstance(v, list | dict):
+                flat_row[k] = str(v)
+            else:
+                flat_row[k] = v
+        flat_data.append(flat_row)
+
+    fieldnames = list(flat_data[0].keys())
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(flat_data)
 
 
 if __name__ == "__main__":

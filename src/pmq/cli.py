@@ -929,7 +929,7 @@ def backtest_run(
                 raise typer.Exit(1)
 
             # Display results
-            console.print(f"\n[bold green]Backtest Complete[/bold green]")
+            console.print("\n[bold green]Backtest Complete[/bold green]")
             console.print(f"Run ID: [cyan]{run_id}[/cyan]")
 
             table = Table(title="Backtest Results")

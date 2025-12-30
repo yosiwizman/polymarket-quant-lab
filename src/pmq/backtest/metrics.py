@@ -132,7 +132,7 @@ class MetricsCalculator:
         wins = 0
         total = 0
 
-        for market_id, market_trades_list in market_trades.items():
+        for _market_id, market_trades_list in market_trades.items():
             # Get all buys
             buys = [t for t in market_trades_list if t.side == Side.BUY]
             if not buys:
@@ -190,7 +190,7 @@ class MetricsCalculator:
     def _calculate_sharpe(
         self,
         equity_curve: list[tuple[str, float]],
-        initial_balance: float,
+        _initial_balance: float,
     ) -> float:
         """Calculate simplified Sharpe-like ratio.
 

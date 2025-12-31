@@ -199,9 +199,18 @@ class EvaluationReporter:
                 f"- **Maturity Score:** {result.maturity_score}/100",
                 f"- **Ready for Scorecard:** {'Yes' if result.ready_for_scorecard else 'No'}",
                 f"- **Window:** {result.window_from} → {result.window_to}",
-                "",
             ]
         )
+
+        # Add contiguous info (Phase 4.5)
+        if result.contiguous:
+            lines.append("- **Contiguous Mode:** Yes")
+            lines.append(f"- **Requested Times:** {result.requested_times}")
+            lines.append(f"- **Actual Times:** {result.actual_times}")
+            if result.gap_cutoff_time:
+                lines.append(f"- **Gap Cutoff:** {result.gap_cutoff_time}")
+
+        lines.append("")
 
         if result.backtest_run_id:
             if result.walk_forward:

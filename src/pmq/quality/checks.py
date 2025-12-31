@@ -105,6 +105,9 @@ class QualityResult:
     gaps: list[GapInfo] = field(default_factory=list)
     top_gap_markets: list[dict[str, Any]] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
+    # Contiguous window fields (Phase 4.5)
+    contiguous: bool = False  # Whether contiguous filtering was applied
+    gap_cutoff_time: str | None = None  # First time excluded due to gap
 
     @property
     def is_sufficient(self) -> bool:
@@ -468,6 +471,8 @@ class QualityChecker:
         self,
         limit: int = 30,
         expected_interval_seconds: int = 60,
+        contiguous: bool = True,
+        gap_factor: float = 2.5,
     ) -> QualityResult:
         """Check quality based on the last K distinct snapshot times.
 
@@ -478,12 +483,28 @@ class QualityChecker:
         Args:
             limit: Number of distinct snapshot times to analyze
             expected_interval_seconds: Expected interval between snapshots
+            contiguous: If True, stop at gaps (default True for last-times mode)
+            gap_factor: Multiplier for gap detection (gap > interval * factor)
 
         Returns:
             QualityResult based on actual captured data
         """
-        # Get the last N distinct snapshot times
-        times = self._dao.get_recent_snapshot_times(limit)
+        # Get snapshot times (contiguous or not)
+        gap_cutoff_time: str | None = None
+        total_available: int = 0
+
+        if contiguous:
+            result = self._dao.get_recent_snapshot_times_contiguous(
+                limit=limit,
+                interval_seconds=expected_interval_seconds,
+                gap_factor=gap_factor,
+            )
+            times = result.times
+            gap_cutoff_time = result.gap_cutoff_time
+            total_available = result.total_available
+        else:
+            times = self._dao.get_recent_snapshot_times(limit)
+            total_available = len(times)
 
         if not times:
             # No data at all
@@ -495,10 +516,14 @@ class QualityChecker:
                 status=QualityStatus.INSUFFICIENT_DATA,
                 maturity_score=0,
                 ready_for_scorecard=False,
+                contiguous=contiguous,
+                gap_cutoff_time=gap_cutoff_time,
                 notes={
                     "distinct_snapshot_times": 0,
                     "expected_times": limit,
                     "requested_times": limit,
+                    "total_available": total_available,
+                    "contiguous": contiguous,
                     "error": "No snapshot data available",
                 },
             )
@@ -537,6 +562,25 @@ class QualityChecker:
         # Calculate maturity
         maturity = self._calculate_maturity(distinct_times, coverage_pct, duplicate_count)
 
+        # Build notes
+        notes: dict[str, Any] = {
+            "distinct_snapshot_times": distinct_times,
+            "expected_times": limit,
+            "requested_times": limit,
+            "total_available": total_available,
+            "duplicate_entries": len(duplicates),
+            "min_snapshots_required": MIN_SNAPSHOTS_FOR_QUALITY,
+            "contiguous": contiguous,
+        }
+
+        # Add gap info if contiguous mode detected a gap
+        if contiguous and gap_cutoff_time:
+            notes["gap_cutoff_time"] = gap_cutoff_time
+            notes["contiguous_note"] = (
+                f"Stopped at gap before {gap_cutoff_time[:19]}. "
+                f"Using {distinct_times} of {total_available} available times."
+            )
+
         return QualityResult(
             window_from=start_time,
             window_to=end_time,
@@ -554,11 +598,7 @@ class QualityChecker:
             ready_for_scorecard=maturity >= MATURITY_READY_THRESHOLD,
             gaps=gaps,
             top_gap_markets=self._find_gap_markets(start_time, end_time, expected_interval_seconds),
-            notes={
-                "distinct_snapshot_times": distinct_times,
-                "expected_times": limit,
-                "requested_times": limit,
-                "duplicate_entries": len(duplicates),
-                "min_snapshots_required": MIN_SNAPSHOTS_FOR_QUALITY,
-            },
+            notes=notes,
+            contiguous=contiguous,
+            gap_cutoff_time=gap_cutoff_time,
         )

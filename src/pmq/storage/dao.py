@@ -1,6 +1,7 @@
 """Data Access Object layer for database operations."""
 
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,6 +19,23 @@ from pmq.models import (
 from pmq.storage.db import Database, get_database
 
 logger = get_logger("storage.dao")
+
+
+@dataclass
+class ContiguousTimesResult:
+    """Result of contiguous snapshot times query.
+
+    Attributes:
+        times: List of snapshot times in ascending order (contiguous block)
+        gap_cutoff_time: First time excluded due to gap (or None if no gap)
+        total_available: Total distinct times in DB before cutoff applied
+        contiguous: Whether contiguous filtering was applied
+    """
+
+    times: list[str]
+    gap_cutoff_time: str | None
+    total_available: int
+    contiguous: bool
 
 
 class DAO:
@@ -821,6 +839,115 @@ class DAO:
         )
         # Reverse to get ascending order
         return [row["snapshot_time"] for row in reversed(rows)]
+
+    def get_recent_snapshot_times_contiguous(
+        self,
+        limit: int = 30,
+        interval_seconds: int = 60,
+        gap_factor: float = 2.5,
+    ) -> ContiguousTimesResult:
+        """Get the N most recent distinct snapshot times, stopping at gaps.
+
+        This method identifies the most recent contiguous block of snapshot times.
+        It walks backwards from the newest time and stops when the delta between
+        consecutive times exceeds (interval_seconds * gap_factor).
+
+        This is useful for avoiding old session gaps that would penalize
+        data quality metrics.
+
+        Args:
+            limit: Maximum number of distinct times to return
+            interval_seconds: Expected interval between snapshots
+            gap_factor: Multiplier for gap detection (gap > interval * factor)
+
+        Returns:
+            ContiguousTimesResult with times, gap info, and total available
+        """
+        # Fetch more than needed to find gaps (safety cap)
+        fetch_limit = limit * 3
+        rows = self._db.fetch_all(
+            """
+            SELECT DISTINCT snapshot_time FROM market_snapshots
+            ORDER BY snapshot_time DESC
+            LIMIT ?
+            """,
+            (fetch_limit,),
+        )
+
+        if not rows:
+            return ContiguousTimesResult(
+                times=[],
+                gap_cutoff_time=None,
+                total_available=0,
+                contiguous=True,
+            )
+
+        # Parse times descending (newest first)
+        all_times_desc = [row["snapshot_time"] for row in rows]
+        total_available = len(all_times_desc)
+
+        # Calculate gap threshold
+        gap_threshold = interval_seconds * gap_factor
+
+        # Walk backwards from newest, find contiguous block
+        contiguous_times_desc: list[str] = [all_times_desc[0]]
+        gap_cutoff_time: str | None = None
+
+        for i in range(1, len(all_times_desc)):
+            curr_time_str = all_times_desc[i - 1]  # More recent
+            prev_time_str = all_times_desc[i]  # Older
+
+            # Parse times
+            try:
+                curr_dt = self._parse_snapshot_time(curr_time_str)
+                prev_dt = self._parse_snapshot_time(prev_time_str)
+                delta_seconds = (curr_dt - prev_dt).total_seconds()
+
+                if delta_seconds > gap_threshold:
+                    # Gap detected! Stop here
+                    gap_cutoff_time = prev_time_str
+                    break
+
+                contiguous_times_desc.append(prev_time_str)
+
+                # Stop if we have enough
+                if len(contiguous_times_desc) >= limit:
+                    break
+
+            except (ValueError, TypeError):
+                # If parsing fails, treat as gap
+                gap_cutoff_time = prev_time_str
+                break
+
+        # Reverse to ascending order, trim to limit
+        contiguous_times_asc = list(reversed(contiguous_times_desc[:limit]))
+
+        return ContiguousTimesResult(
+            times=contiguous_times_asc,
+            gap_cutoff_time=gap_cutoff_time,
+            total_available=total_available,
+            contiguous=True,
+        )
+
+    def _parse_snapshot_time(self, time_str: str) -> datetime:
+        """Parse snapshot time string to datetime.
+
+        Handles various ISO formats:
+        - 2025-01-01T00:00:00Z
+        - 2025-01-01T00:00:00+00:00
+        - 2025-01-01T00:00:00 (naive, assumed UTC)
+        """
+        # Normalize Z to +00:00
+        normalized = time_str.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return dt
+        except ValueError:
+            # Fallback: try basic parsing
+            dt = datetime.fromisoformat(time_str.split("+")[0].replace("Z", ""))
+            return dt.replace(tzinfo=UTC)
 
     def count_snapshots(self, start_time: str | None = None, end_time: str | None = None) -> int:
         """Count snapshots, optionally within a time range.

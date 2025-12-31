@@ -93,6 +93,12 @@ class EvaluationResult:
     backtest_max_drawdown: float = 0.0
     backtest_total_trades: int = 0
 
+    # Contiguous window fields (Phase 4.5)
+    contiguous: bool = False
+    gap_cutoff_time: str | None = None
+    requested_times: int = 0
+    actual_times: int = 0
+
     # Summary
     summary: str = ""
     commands: list[str] = field(default_factory=list)
@@ -219,17 +225,38 @@ class EvaluationPipeline:
         )
 
         # Step 1: Quality check
-        self._log_command(
-            f"pmq snapshots quality --{window_mode.replace('_', '-')} {window_value} "
+        # For walk-forward statarb, use contiguous mode and request train+test times
+        use_walk_forward_check = self._should_use_walk_forward(
+            strategy_name=strategy_name,
+            strategy_version=strategy_version,
+            walk_forward=walk_forward,
+            statarb_params_path=statarb_params_path,
+        )
+
+        # Determine how many times we need
+        if use_walk_forward_check and strategy_name == "statarb":
+            # For walk-forward, request train + test times
+            requested_times = train_times + test_times
+            use_contiguous = True
+        else:
+            requested_times = window_value
+            use_contiguous = window_mode == "last_times"  # Default contiguous for last-times
+
+        quality_cmd = (
+            f"pmq snapshots quality --{window_mode.replace('_', '-')} {requested_times} "
             f"--interval {interval_seconds}"
         )
+        if use_contiguous:
+            quality_cmd += " --contiguous"
+        self._log_command(quality_cmd)
 
         quality_result = self._check_quality(
             window_mode=window_mode,
-            window_value=window_value,
+            window_value=requested_times,
             interval_seconds=interval_seconds,
             window_from=window_from,
             window_to=window_to,
+            contiguous=use_contiguous,
         )
 
         result.quality_status = quality_result.status
@@ -237,6 +264,12 @@ class EvaluationPipeline:
         result.ready_for_scorecard = quality_result.ready_for_scorecard
         result.window_from = quality_result.window_from
         result.window_to = quality_result.window_to
+
+        # Store contiguous info
+        result.contiguous = quality_result.contiguous
+        result.gap_cutoff_time = quality_result.gap_cutoff_time
+        result.requested_times = requested_times
+        result.actual_times = quality_result.distinct_times
 
         # Update DB with quality results
         self._dao.update_evaluation_quality(
@@ -284,10 +317,25 @@ class EvaluationPipeline:
 
         if use_walk_forward and strategy_name == "statarb":
             # Walk-forward evaluation for statarb
+            # Scale train/test if we have fewer times than requested
+            actual_train_times = train_times
+            actual_test_times = test_times
+            total_available = quality_result.distinct_times
+
+            if total_available < train_times + test_times:
+                # Scale proportionally (preserve train > test)
+                train_ratio = train_times / (train_times + test_times)
+                actual_train_times = max(1, int(total_available * train_ratio))
+                actual_test_times = max(1, total_available - actual_train_times)
+                logger.info(
+                    f"Scaling train/test from {train_times}/{test_times} to "
+                    f"{actual_train_times}/{actual_test_times} (only {total_available} times available)"
+                )
+
             walkforward_cmd = (
                 f"pmq statarb walkforward "
                 f"--from {quality_result.window_from[:10]} --to {quality_result.window_to[:10]} "
-                f"--pairs {pairs_config} --train-times {train_times} --test-times {test_times}"
+                f"--pairs {pairs_config} --train-times {actual_train_times} --test-times {actual_test_times}"
             )
             if statarb_params_path:
                 walkforward_cmd += f" (params from {statarb_params_path})"
@@ -297,8 +345,8 @@ class EvaluationPipeline:
                 pairs_config_result=pairs_config_result,
                 quality_result=quality_result,
                 statarb_params_path=statarb_params_path,
-                train_times=train_times,
-                test_times=test_times,
+                train_times=actual_train_times,
+                test_times=actual_test_times,
                 quantity=quantity,
             )
 
@@ -367,11 +415,21 @@ class EvaluationPipeline:
             backtest_score=0.0,
         )
 
-        # Save backtest artifact (include walk-forward metadata if applicable)
+        # Save backtest artifact (include walk-forward and contiguous metadata)
         backtest_artifact: dict[str, Any] = {
             "run_id": backtest_result["run_id"],
             "metrics": backtest_result["metrics"].__dict__,
         }
+
+        # Add contiguous info (Phase 4.5)
+        if result.contiguous:
+            backtest_artifact["contiguous"] = {
+                "enabled": True,
+                "requested_times": result.requested_times,
+                "actual_times": result.actual_times,
+                "gap_cutoff_time": result.gap_cutoff_time,
+            }
+
         if result.walk_forward:
             backtest_artifact["walk_forward"] = {
                 "enabled": True,
@@ -507,12 +565,23 @@ class EvaluationPipeline:
         interval_seconds: int,
         window_from: str | None = None,
         window_to: str | None = None,
+        contiguous: bool = True,
     ) -> QualityResult:
-        """Check data quality based on window mode."""
+        """Check data quality based on window mode.
+
+        Args:
+            window_mode: Window mode (last_times, last_minutes, explicit)
+            window_value: N for last_times/last_minutes modes
+            interval_seconds: Expected snapshot interval
+            window_from: Explicit window start
+            window_to: Explicit window end
+            contiguous: Stop at gaps (default True for last_times mode)
+        """
         if window_mode == "last_times":
             return self._quality_checker.check_last_times(
                 limit=window_value,
                 expected_interval_seconds=interval_seconds,
+                contiguous=contiguous,
             )
         elif window_mode == "last_minutes":
             return self._quality_checker.check_last_minutes(

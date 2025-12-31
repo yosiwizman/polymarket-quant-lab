@@ -700,11 +700,104 @@ poetry run pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 \
   --pairs config/pairs.yml \
   --entry-z 2.0 --exit-z 0.5 --max-hold 60
 
-# 5. If scorecard metrics are acceptable, run eval pipeline
-poetry run pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml
+# 5. If scorecard metrics are acceptable, run eval pipeline (walk-forward)
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --walkforward
 ```
 
 > 📊 **Research Best Practice**: The scorecard still uses governance gates (PnL, Sharpe, win rate thresholds). Tune parameters to PASS the scorecard, don't bypass it.
+
+### Eval Pipeline Walk-Forward (Phase 4.4)
+
+Phase 4.4 integrates walk-forward evaluation into `pmq eval run` for statarb, ensuring the scorecard sees TEST-only metrics (no data leakage).
+
+#### Walk-Forward Auto-Detection
+
+Walk-forward is automatically enabled for statarb when:
+- `--walkforward` flag is set explicitly
+- `--statarb-params` is provided
+- Strategy version contains "zscore" or "walkforward"
+- `config/statarb_best.yml` exists (from tuning)
+
+#### New CLI Flags
+
+```powershell
+# Explicit walk-forward evaluation
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --walkforward --train-times 100 --test-times 50
+
+# Use tuned parameters from grid search
+poetry run pmq eval run --strategy statarb --version v1 \
+  --pairs config/pairs.yml --statarb-params config/statarb_best.yml
+
+# Disable walk-forward (use legacy backtest)
+poetry run pmq eval run --strategy statarb --version v1 \
+  --pairs config/pairs.yml --no-walkforward
+```
+
+#### Walk-Forward Eval Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--walkforward/--no-walkforward` | auto-detect | Enable/disable walk-forward |
+| `--statarb-params` | config/statarb_best.yml | Path to z-score params YAML |
+| `--train-times` | 100 | Snapshots for TRAIN segment |
+| `--test-times` | 50 | Snapshots for TEST segment |
+
+#### Walk-Forward Eval Output
+
+When walk-forward is enabled, the output shows:
+- **Mode**: Walk-Forward (TEST only)
+- **TRAIN/TEST Windows**: Chronological time ranges
+- **Fitted Pairs**: X/Y pairs successfully fitted
+- **TEST Metrics**: PnL, Sharpe, Win Rate, Trades (used for scorecard)
+
+```
+Evaluation Results
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Step                ┃ Result                        ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ Mode                │ Walk-Forward (TEST only)      │
+│ TRAIN Window        │ 2025-01-01T00:00 → T01:40     │
+│ TEST Window         │ 2025-01-01T01:41 → T02:30     │
+│ Fitted Pairs        │ 15/20                         │
+│ TEST PnL            │ $0.06                         │
+│ TEST Sharpe         │ 0.110                         │
+│ TEST Win Rate       │ 11.1%                         │
+│ TEST Trades         │ 9                             │
+│ Backtest Score      │ 34.0/100                      │
+│ Approval            │ FAILED                        │
+└─────────────────────┴───────────────────────────────┘
+
+Note: Scorecard evaluated on TEST only (walk-forward, no data leakage)
+```
+
+#### Complete Walk-Forward Workflow
+
+```powershell
+# 1. Collect sufficient snapshot data (train + test)
+poetry run pmq snapshots run --interval 60 --duration-minutes 300
+
+# 2. Check data quality
+poetry run pmq snapshots quality --last-times 200
+
+# 3. Discover correlated pairs
+poetry run pmq statarb discover --from 2024-12-01 --to 2024-12-30 \
+  --out config/pairs.yml
+
+# 4. (Optional) Tune parameters
+poetry run pmq statarb tune --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml --export-best config/statarb_best.yml
+
+# 5. Run evaluation with walk-forward (auto-detects best.yml)
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --last-times 200
+
+# 6. Export detailed report
+poetry run pmq eval export --id <eval-id> --format md
+```
+
+> ⚠️ **Why Walk-Forward?** Traditional backtests fit and evaluate on the same data, risking overfitting. Walk-forward splits data chronologically: TRAIN first, TEST second. Parameters are fitted only on TRAIN, and the scorecard sees only TEST metrics—this is the industry standard for research-grade evaluation.
 
 ## Project Structure
 

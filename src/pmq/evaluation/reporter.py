@@ -260,21 +260,51 @@ class EvaluationReporter:
                         ]
                     )
                     for key, value in result.statarb_params.items():
-                        lines.append(f"- **{key}:** {value}")
+                        # Skip fee/slippage in params since we show them in Cost Assumptions
+                        if key not in ("fee_bps", "slippage_bps"):
+                            lines.append(f"- **{key}:** {value}")
                     lines.append("")
 
-                    # Cost assumptions section (Phase 4.6)
-                    fee = result.statarb_params.get("fee_bps", 2.0)
-                    slip = result.statarb_params.get("slippage_bps", 5.0)
+                # Phase 4.8: Enhanced Cost Assumptions section
+                lines.extend(
+                    [
+                        "### Cost Assumptions",
+                        "",
+                        f"- **Fee:** {result.fee_bps} bps",
+                        f"- **Slippage:** {result.slippage_bps} bps",
+                        f"- **Total Round-Trip Cost:** {result.fee_bps + result.slippage_bps} bps",
+                        "",
+                    ]
+                )
+
+                # Phase 4.8: Constraint Filtering section
+                if result.constraints_applied or result.pairs_before_constraints > 0:
                     lines.extend(
                         [
-                            "### Cost Assumptions",
-                            "",
-                            f"- **Fee:** {fee} bps",
-                            f"- **Slippage:** {slip} bps",
+                            "### Constraint Filtering",
                             "",
                         ]
                     )
+                    lines.append(f"- **Pairs Before Filtering:** {result.pairs_before_constraints}")
+                    lines.append(f"- **Pairs After Filtering:** {result.pairs_after_constraints}")
+                    if result.pairs_filtered_low_liquidity > 0:
+                        lines.append(
+                            f"- **Filtered (Low Liquidity):** {result.pairs_filtered_low_liquidity}"
+                        )
+                    if result.pairs_filtered_high_spread > 0:
+                        lines.append(
+                            f"- **Filtered (High Spread):** {result.pairs_filtered_high_spread}"
+                        )
+                    if result.constraint_min_liquidity is not None:
+                        lines.append(
+                            f"- **Global Min Liquidity:** {result.constraint_min_liquidity}"
+                        )
+                    if result.constraint_max_spread is not None:
+                        lines.append(f"- **Global Max Spread:** {result.constraint_max_spread}")
+                    if not result.constraints_applied:
+                        lines.append("- **Note:** No constraints applied (all pairs passed)")
+                    lines.append("")
+
                 lines.append(
                     "*Note: Scorecard evaluated on TEST only (walk-forward, no data leakage)*"
                 )

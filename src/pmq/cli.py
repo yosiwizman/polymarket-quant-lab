@@ -2134,6 +2134,35 @@ def eval_run(
         int,
         typer.Option("--test-times", help="Number of snapshots for TEST segment (walk-forward)"),
     ] = 50,
+    # Realism parameters (Phase 4.8)
+    fee_bps: Annotated[
+        float | None,
+        typer.Option(
+            "--fee-bps",
+            help="Fee in basis points (overrides YAML; default 2.0 if not in YAML)",
+        ),
+    ] = None,
+    slippage_bps: Annotated[
+        float | None,
+        typer.Option(
+            "--slippage-bps",
+            help="Slippage in basis points (overrides YAML; default 5.0 if not in YAML)",
+        ),
+    ] = None,
+    min_liquidity: Annotated[
+        float | None,
+        typer.Option(
+            "--min-liquidity",
+            help="Global min liquidity threshold (overrides per-pair config)",
+        ),
+    ] = None,
+    max_spread: Annotated[
+        float | None,
+        typer.Option(
+            "--max-spread",
+            help="Global max spread threshold (overrides per-pair config)",
+        ),
+    ] = None,
 ) -> None:
     """Run automated evaluation pipeline.
 
@@ -2155,11 +2184,20 @@ def eval_run(
         - TEST segment: evaluate strategy (used for scorecard)
         This prevents data leakage and overfitting.
 
+    Realism parameters (Phase 4.8, statarb walk-forward only):
+        Cost assumptions and constraint filtering ensure evaluation reflects
+        realistic trading conditions. Precedence:
+        1. CLI flags (--fee-bps, --slippage-bps, --min-liquidity, --max-spread)
+        2. Values in statarb params YAML (if present)
+        3. Project defaults (fee=2.0, slippage=5.0; constraints unset unless per-pair)
+
     Example:
         pmq eval run --strategy arb --version v1 --last-times 30
         pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml --last-times 30
         pmq eval run --strategy statarb --version zscore-v1 --pairs config/pairs.yml --walkforward
         pmq eval run --strategy statarb --pairs config/pairs.yml --statarb-params config/statarb_best.yml
+        pmq eval run --strategy statarb --pairs config/pairs.yml --walkforward --fee-bps 3.0 --slippage-bps 8.0
+        pmq eval run --strategy statarb --pairs config/pairs.yml --walkforward --min-liquidity 500 --max-spread 0.03
         pmq eval run --strategy observer --version v1 --last-times 30 --paper-minutes 10
     """
     from pmq.evaluation import EvaluationPipeline, EvaluationReporter
@@ -2169,6 +2207,18 @@ def eval_run(
     walkforward_info = (
         f"Walk-forward: {walkforward}" if walkforward is not None else "Walk-forward: auto-detect"
     )
+    # Build realism info line for statarb
+    realism_parts = []
+    if fee_bps is not None:
+        realism_parts.append(f"fee={fee_bps}bps")
+    if slippage_bps is not None:
+        realism_parts.append(f"slip={slippage_bps}bps")
+    if min_liquidity is not None:
+        realism_parts.append(f"min_liq={min_liquidity}")
+    if max_spread is not None:
+        realism_parts.append(f"max_spread={max_spread}")
+    realism_info = f"Realism: {', '.join(realism_parts)}" if realism_parts else ""
+
     console.print(
         f"\n[bold green]Starting Evaluation Pipeline[/bold green]\n"
         f"Strategy: {strategy} v{version}\n"
@@ -2176,7 +2226,8 @@ def eval_run(
         f"Interval: {interval}s\n"
         f"{pairs_info}\n"
         f"{walkforward_info}\n"
-        f"Paper Minutes: {paper_minutes if paper_minutes > 0 else 'skip'}\n"
+        + (f"{realism_info}\n" if realism_info else "")
+        + f"Paper Minutes: {paper_minutes if paper_minutes > 0 else 'skip'}\n"
     )
 
     dao = DAO()
@@ -2199,6 +2250,11 @@ def eval_run(
                 statarb_params_path=statarb_params,
                 train_times=train_times,
                 test_times=test_times,
+                # Phase 4.8: Realism parameters
+                fee_bps_override=fee_bps,
+                slippage_bps_override=slippage_bps,
+                min_liquidity_override=min_liquidity,
+                max_spread_override=max_spread,
             )
 
             # Save reports as artifacts

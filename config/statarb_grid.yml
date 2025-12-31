@@ -1,0 +1,61 @@
+# Statistical Arbitrage Grid Search Configuration
+#
+# Define parameter ranges for grid search optimization.
+# The tuning command will test all combinations and rank by Sharpe ratio on TEST data.
+#
+# Usage:
+#   pmq statarb tune --from 2024-12-01 --to 2024-12-30 --grid config/statarb_grid.yml
+#
+# Note: More combinations = longer tuning time. Start small and expand.
+
+grid:
+  # Z-score lookback window (number of bars for rolling mean/std)
+  # Smaller = more responsive, larger = more stable
+  lookback:
+    - 20
+    - 30
+    - 50
+
+  # Entry z-score threshold (enter when |z| >= entry_z)
+  # Higher = fewer but higher-conviction trades
+  entry_z:
+    - 1.5
+    - 2.0
+    - 2.5
+
+  # Exit z-score threshold (exit when |z| <= exit_z)
+  # Lower = wait for more complete mean reversion
+  exit_z:
+    - 0.3
+    - 0.5
+    - 0.7
+
+  # Maximum bars to hold before forced exit
+  # Prevents holding positions indefinitely
+  max_hold_bars:
+    - 30
+    - 60
+    - 120
+
+  # Bars to wait after exit before new entry
+  # Prevents rapid re-entry after exit
+  cooldown_bars:
+    - 5
+
+  # Transaction costs (basis points)
+  # Set to 0 for initial testing, then add realistic values
+  fee_bps:
+    - 0.0
+
+  slippage_bps:
+    - 0.0
+
+# Example with transaction costs for realistic testing:
+# grid:
+#   lookback: [30]
+#   entry_z: [2.0]
+#   exit_z: [0.5]
+#   max_hold_bars: [60]
+#   cooldown_bars: [5]
+#   fee_bps: [0.0, 10.0, 25.0]
+#   slippage_bps: [0.0, 5.0, 10.0]

@@ -695,6 +695,243 @@ class BacktestRunner:
         """
         return self._dao.get_backtest_runs(strategy=strategy, limit=limit)
 
+    def run_walkforward_statarb(
+        self,
+        start_date: str,
+        end_date: str,
+        pairs_config: str | None = None,
+        train_count: int = 120,
+        test_count: int = 60,
+        lookback: int = 30,
+        entry_z: float = 2.0,
+        exit_z: float = 0.5,
+        max_hold_bars: int = 60,
+        cooldown_bars: int = 5,
+        fee_bps: float = 0.0,
+        slippage_bps: float = 0.0,
+        quantity: float = 10.0,
+    ) -> tuple[str, BacktestMetrics, dict[str, Any]]:
+        """Run walk-forward stat-arb strategy with z-score signals.
+
+        This method implements proper walk-forward evaluation:
+        1. Split snapshots into TRAIN and TEST segments
+        2. Fit OLS beta and spread parameters on TRAIN only
+        3. Generate z-score signals and compute metrics on TEST only
+        4. Return TEST metrics for scorecard evaluation
+
+        Args:
+            start_date: Start date (ISO format or YYYY-MM-DD)
+            end_date: End date (ISO format or YYYY-MM-DD)
+            pairs_config: Path to pairs config file
+            train_count: Number of snapshots for TRAIN segment
+            test_count: Number of snapshots for TEST segment
+            lookback: Z-score lookback (uses fitted mean/std)
+            entry_z: Z-score threshold to enter (|z| >= entry_z)
+            exit_z: Z-score threshold to exit (|z| <= exit_z)
+            max_hold_bars: Max bars before forced exit
+            cooldown_bars: Bars to wait after exit
+            fee_bps: Fee in basis points
+            slippage_bps: Slippage in basis points
+            quantity: Trade quantity per signal
+
+        Returns:
+            Tuple of (run_id, metrics, walk_forward_result_dict)
+        """
+        from pmq.statarb import PairsConfigError, load_validated_pairs_config
+        from pmq.statarb.walkforward import result_to_dict, run_walk_forward
+
+        # Normalize dates
+        start_date = self._normalize_date(start_date, start=True)
+        end_date = self._normalize_date(end_date, start=False)
+
+        # Generate run ID
+        run_id = str(uuid.uuid4())
+
+        # Store config
+        config_json = json.dumps(
+            {
+                "strategy": "statarb_walkforward",
+                "quantity": quantity,
+                "pairs_config": pairs_config,
+                "train_count": train_count,
+                "test_count": test_count,
+                "lookback": lookback,
+                "entry_z": entry_z,
+                "exit_z": exit_z,
+                "max_hold_bars": max_hold_bars,
+                "cooldown_bars": cooldown_bars,
+                "fee_bps": fee_bps,
+                "slippage_bps": slippage_bps,
+                "initial_balance": self._initial_balance,
+            }
+        )
+
+        # Create run record
+        self._dao.create_backtest_run(
+            run_id=run_id,
+            strategy="statarb_walkforward",
+            start_date=start_date,
+            end_date=end_date,
+            initial_balance=self._initial_balance,
+            config_json=config_json,
+        )
+
+        logger.info(
+            f"Starting walk-forward backtest {run_id}: statarb from {start_date} to {end_date}"
+        )
+
+        try:
+            # Load pairs config
+            settings = get_settings()
+            pairs_path = pairs_config or str(settings.statarb.pairs_file)
+
+            try:
+                pairs_result = load_validated_pairs_config(pairs_path)
+            except PairsConfigError as e:
+                logger.error(f"Failed to load pairs config: {e}")
+                self._dao.complete_backtest_run(run_id, self._initial_balance, status="failed")
+                metrics = self._empty_metrics()
+                return run_id, metrics, {"error": str(e)}
+
+            if not pairs_result.enabled_pairs:
+                logger.warning("No enabled pairs in config")
+                self._dao.complete_backtest_run(run_id, self._initial_balance, status="failed")
+                metrics = self._empty_metrics()
+                return run_id, metrics, {"error": "No enabled pairs"}
+
+            # Get market IDs from pairs
+            pair_market_ids = set()
+            for pair in pairs_result.enabled_pairs:
+                pair_market_ids.add(pair.market_a_id)
+                pair_market_ids.add(pair.market_b_id)
+
+            # Load all snapshots in range
+            snapshots = self._dao.get_snapshots(start_date, end_date, list(pair_market_ids))
+
+            if not snapshots:
+                logger.warning(f"No snapshots found for {start_date} to {end_date}")
+                self._dao.complete_backtest_run(run_id, self._initial_balance, status="failed")
+                metrics = self._empty_metrics()
+                return run_id, metrics, {"error": "No snapshots"}
+
+            logger.info(f"Loaded {len(snapshots)} snapshots for {len(pair_market_ids)} markets")
+
+            # Run walk-forward evaluation
+            wf_result = run_walk_forward(
+                snapshots=snapshots,
+                pairs=pairs_result.enabled_pairs,
+                train_count=train_count,
+                test_count=test_count,
+                lookback=lookback,
+                entry_z=entry_z,
+                exit_z=exit_z,
+                max_hold_bars=max_hold_bars,
+                cooldown_bars=cooldown_bars,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                quantity_per_trade=quantity,
+            )
+
+            # Convert TEST metrics to BacktestMetrics format
+            test_m = wf_result.test_metrics
+            metrics = BacktestMetrics(
+                total_pnl=test_m.total_pnl,
+                max_drawdown=test_m.max_drawdown,
+                win_rate=test_m.win_rate,
+                sharpe_ratio=test_m.sharpe_ratio,
+                total_trades=test_m.total_trades,
+                trades_per_day=test_m.avg_trades_per_pair,  # Approximate
+                capital_utilization=0.0,  # Not tracked in walk-forward
+                total_notional=0.0,  # Not tracked
+                final_balance=self._initial_balance + test_m.net_pnl,
+                peak_equity=self._initial_balance,
+                lowest_equity=self._initial_balance,
+            )
+
+            # Save metrics
+            self._dao.save_backtest_metrics(
+                run_id=run_id,
+                total_pnl=metrics.total_pnl,
+                max_drawdown=metrics.max_drawdown,
+                win_rate=metrics.win_rate,
+                sharpe_ratio=metrics.sharpe_ratio,
+                total_trades=metrics.total_trades,
+                trades_per_day=metrics.trades_per_day,
+                capital_utilization=metrics.capital_utilization,
+                extra_metrics={
+                    "train_count": wf_result.split.train_count,
+                    "test_count": wf_result.split.test_count,
+                    "first_train": wf_result.split.first_train,
+                    "last_train": wf_result.split.last_train,
+                    "first_test": wf_result.split.first_test,
+                    "last_test": wf_result.split.last_test,
+                    "entry_z": entry_z,
+                    "exit_z": exit_z,
+                    "net_pnl": test_m.net_pnl,
+                    "total_fees": test_m.total_fees,
+                },
+            )
+
+            # Complete run
+            self._dao.complete_backtest_run(run_id, metrics.final_balance, status="completed")
+
+            # Save manifest
+            config_for_hash = {
+                "strategy": "statarb_walkforward",
+                "train_count": train_count,
+                "test_count": test_count,
+                "lookback": lookback,
+                "entry_z": entry_z,
+                "exit_z": exit_z,
+                "max_hold_bars": max_hold_bars,
+                "pairs_config": pairs_config,
+            }
+            self._dao.save_backtest_manifest(
+                run_id=run_id,
+                strategy="statarb_walkforward",
+                window_from=start_date,
+                window_to=end_date,
+                config_hash=_compute_config_hash(config_for_hash),
+                code_git_sha=_get_git_sha(),
+                market_filter=list(pair_market_ids),
+                snapshot_count=len(snapshots),
+                first_snapshot_time=wf_result.split.first_train or start_date,
+                last_snapshot_time=wf_result.split.last_test or end_date,
+            )
+
+            logger.info(
+                f"Walk-forward backtest {run_id} completed: "
+                f"PnL=${metrics.total_pnl:.2f}, Sharpe={metrics.sharpe_ratio:.2f}, "
+                f"trades={metrics.total_trades}"
+            )
+
+            return run_id, metrics, result_to_dict(wf_result)
+
+        except Exception as e:
+            logger.error(f"Walk-forward backtest failed: {e}")
+            self._dao.complete_backtest_run(
+                run_id,
+                self._initial_balance,
+                status="failed",
+            )
+            raise
+
+    def _empty_metrics(self) -> BacktestMetrics:
+        """Return empty metrics for failed runs."""
+        return BacktestMetrics(
+            total_pnl=0,
+            max_drawdown=0,
+            win_rate=0,
+            sharpe_ratio=0,
+            total_trades=0,
+            trades_per_day=0,
+            capital_utilization=0,
+            total_notional=0,
+            final_balance=self._initial_balance,
+            peak_equity=self._initial_balance,
+            lowest_equity=self._initial_balance,
+        )
+
     def _normalize_date(self, date_str: str, start: bool = True) -> str:
         """Normalize date string to ISO format.
 

@@ -599,6 +599,113 @@ The `discover` command computes Pearson correlation between YES prices across ov
 
 > ⚠️ **PAPER ONLY**: All statarb trading is paper-only. No wallets, no live orders, no private keys.
 
+### StatArb Walk-Forward + Tuning (Phase 4.3)
+
+Phase 4.3 introduces research-grade tools for statarb:
+
+1. **Walk-Forward Evaluation**: Split data into TRAIN/TEST to prevent overfitting
+2. **Z-Score Mean Reversion**: OLS-fitted hedge ratios with z-score entry/exit signals
+3. **Parameter Tuning**: Grid search to find optimal parameters
+
+#### Z-Score Signal Model
+
+The z-score strategy computes:
+- **Beta (hedge ratio)**: OLS regression of price A on price B, fitted on TRAIN only
+- **Spread**: priceA - beta × priceB
+- **Z-score**: (spread - mean) / std, using TRAIN mean/std
+
+Signal logic:
+- **Enter Long** (long A, short B): when z ≤ -entry_z
+- **Enter Short** (short A, long B): when z ≥ entry_z
+- **Exit**: when |z| ≤ exit_z OR max_hold_bars reached
+
+#### Walk-Forward Evaluation
+
+```powershell
+# Single walk-forward run with custom parameters
+poetry run pmq statarb walkforward \
+  --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml \
+  --train-times 120 --test-times 60 \
+  --entry-z 2.0 --exit-z 0.5
+```
+
+Output shows:
+- **TRAIN Summary**: Fitted pairs, beta values, spread stats
+- **TEST Summary**: Scorecard metrics (PnL, Sharpe, win rate) computed on out-of-sample data only
+
+#### Parameter Tuning
+
+```powershell
+# Run grid search to find optimal parameters
+poetry run pmq statarb tune \
+  --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml \
+  --train-times 120 --test-times 60 \
+  --grid config/statarb_grid.yml \
+  --out results/statarb_tuning.csv \
+  --export-best config/statarb_best.yml
+
+# Or use default grid
+poetry run pmq statarb tune --from 2024-12-01 --to 2024-12-30 --pairs config/pairs.yml
+```
+
+Grid search:
+- Tests all parameter combinations defined in `config/statarb_grid.yml`
+- Ranks by Sharpe ratio on TEST data (prevents overfitting)
+- Outputs leaderboard to CSV and best config to YAML
+
+#### Grid Config Format
+
+```yaml
+# config/statarb_grid.yml
+grid:
+  lookback: [20, 30, 50]
+  entry_z: [1.5, 2.0, 2.5]
+  exit_z: [0.3, 0.5, 0.7]
+  max_hold_bars: [30, 60, 120]
+  cooldown_bars: [5]
+  fee_bps: [0.0]
+  slippage_bps: [0.0]
+```
+
+#### Z-Score Config Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PMQ_STATARB_LOOKBACK` | 30 | Rolling window for z-score |
+| `PMQ_STATARB_ENTRY_Z` | 2.0 | Entry when \|z\| >= entry_z |
+| `PMQ_STATARB_EXIT_Z` | 0.5 | Exit when \|z\| <= exit_z |
+| `PMQ_STATARB_MAX_HOLD_BARS` | 60 | Max bars before forced exit |
+| `PMQ_STATARB_COOLDOWN_BARS` | 5 | Bars to wait after exit |
+| `PMQ_STATARB_FEE_BPS` | 0.0 | Fee in basis points |
+| `PMQ_STATARB_SLIPPAGE_BPS` | 0.0 | Slippage in basis points |
+
+#### Walk-Forward Research Workflow
+
+```powershell
+# 1. Collect snapshot data
+poetry run pmq snapshots run --interval 60 --duration-minutes 180
+
+# 2. Discover correlated pairs
+poetry run pmq statarb discover --from 2024-12-01 --to 2024-12-30 --out config/pairs.yml
+
+# 3. Tune parameters (grid search)
+poetry run pmq statarb tune --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml \
+  --export-best config/statarb_best.yml
+
+# 4. Review best parameters and run walk-forward with them
+poetry run pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml \
+  --entry-z 2.0 --exit-z 0.5 --max-hold 60
+
+# 5. If scorecard metrics are acceptable, run eval pipeline
+poetry run pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml
+```
+
+> 📊 **Research Best Practice**: The scorecard still uses governance gates (PnL, Sharpe, win rate thresholds). Tune parameters to PASS the scorecard, don't bypass it.
+
 ## Project Structure
 
 ```

@@ -33,14 +33,59 @@ class ArbitrageConfig(BaseSettings):
 
 
 class StatArbConfig(BaseSettings):
-    """Configuration for statistical arbitrage detection."""
+    """Configuration for statistical arbitrage detection.
+
+    Supports z-score based mean-reversion strategy with configurable parameters.
+    """
 
     model_config = SettingsConfigDict(env_prefix="PMQ_STATARB_")
 
+    # Legacy thresholds (kept for backward compatibility)
     entry_threshold: float = Field(default=0.10, description="Spread threshold to enter position")
     exit_threshold: float = Field(default=0.02, description="Spread threshold to exit position")
     pairs_file: Path = Field(
         default=Path("config/pairs.yml"), description="Path to pairs configuration file"
+    )
+
+    # Z-score parameters
+    lookback: int = Field(default=30, description="Rolling lookback window for z-score calculation")
+    entry_z: float = Field(
+        default=2.0, description="Z-score threshold to enter position (|z| >= entry_z)"
+    )
+    exit_z: float = Field(
+        default=0.5, description="Z-score threshold to exit position (|z| <= exit_z)"
+    )
+    max_hold_bars: int = Field(default=60, description="Maximum bars to hold before forced exit")
+    cooldown_bars: int = Field(default=5, description="Bars to wait after exit before new entry")
+
+    # Position limits
+    max_open_pairs: int = Field(
+        default=10, description="Maximum number of simultaneously open pair positions"
+    )
+    max_position_per_pair: float = Field(
+        default=500.0, description="Maximum notional per pair position in USD"
+    )
+    max_notional_total: float = Field(
+        default=5000.0, description="Maximum total notional across all positions in USD"
+    )
+
+    # Data quality filters
+    min_liquidity: float = Field(default=100.0, description="Minimum liquidity per market in USD")
+    max_spread: float = Field(default=0.5, description="Maximum bid-ask spread (as fraction)")
+    min_overlap_points: int = Field(
+        default=30, description="Minimum overlapping data points for pair"
+    )
+
+    # Transaction costs
+    fee_bps: float = Field(default=0.0, description="Trading fee in basis points")
+    slippage_bps: float = Field(default=0.0, description="Expected slippage in basis points")
+
+    # Walk-forward defaults
+    default_train_count: int = Field(
+        default=120, description="Default TRAIN snapshot count for walk-forward"
+    )
+    default_test_count: int = Field(
+        default=60, description="Default TEST snapshot count for walk-forward"
     )
 
 

@@ -294,7 +294,6 @@ class EvaluationPipeline:
             self._log_command(walkforward_cmd)
 
             backtest_result = self._run_walkforward(
-                pairs_config=pairs_config,
                 pairs_config_result=pairs_config_result,
                 quality_result=quality_result,
                 statarb_params_path=statarb_params_path,
@@ -620,7 +619,6 @@ class EvaluationPipeline:
 
     def _run_walkforward(
         self,
-        _pairs_config: str | None,
         pairs_config_result: Any,
         quality_result: QualityResult,
         statarb_params_path: str | None,
@@ -648,7 +646,7 @@ class EvaluationPipeline:
         pairs = pairs_config_result.enabled_pairs if pairs_config_result else []
 
         # Get snapshots from quality window
-        snapshots = self._dao.get_snapshots_in_window(
+        snapshots = self._dao.get_snapshots(
             start_time=quality_result.window_from,
             end_time=quality_result.window_to,
         )
@@ -682,11 +680,10 @@ class EvaluationPipeline:
         # Save walk-forward manifest
         self._dao.create_backtest_run(
             run_id=run_id,
-            strategy_name="statarb_walkforward",
+            strategy="statarb_walkforward",
             start_date=quality_result.window_from,
             end_date=quality_result.window_to,
             initial_balance=10000.0,  # Not used for walk-forward
-            quantity=quantity,
         )
 
         return {

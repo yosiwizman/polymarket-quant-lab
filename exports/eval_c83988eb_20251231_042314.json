@@ -1,0 +1,84 @@
+{
+  "evaluation": {
+    "id": "c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35",
+    "created_at": "2025-12-31 04:22:46",
+    "strategy_name": "statarb",
+    "strategy_version": "zscore-v1",
+    "git_sha": "0cef8c3b5671acbcc34e09ad73a417fdea7e2ef5",
+    "config_hash": null,
+    "window_mode": "last_times",
+    "window_value": 200,
+    "window_from": "2025-12-30T16:53:18.974265+00:00",
+    "window_to": "2025-12-30T20:20:44.911905+00:00",
+    "interval_seconds": 60,
+    "quality_status": "INSUFFICIENT_DATA",
+    "maturity_score": 71,
+    "ready_for_scorecard": true,
+    "backtest_run_id": "wf_9b156bd7",
+    "backtest_pnl": 0.0566666666666682,
+    "backtest_score": 36.0,
+    "approval_status": "FAILED",
+    "approval_reasons_json": "[\"FAIL: Win rate too low (11.1% < 40.0%)\", \"FAIL: Sharpe ratio too low (0.11 < 0.50)\", \"FAIL: Data quality too low (46.5% < 70.0%)\"]",
+    "paper_run_id": null,
+    "paper_trades_count": 0,
+    "paper_errors_count": 0,
+    "final_status": "FAILED",
+    "summary": "Approval failed. Score: 36.0/100. Reasons: FAIL: Win rate too low (11.1% < 40.0%); FAIL: Sharpe ratio too low (0.11 < 0.50); FAIL: Data quality too low (46.5% < 70.0%)",
+    "commands_json": "[\"pmq snapshots quality --last-times 200 --interval 60\", \"pmq statarb walkforward --from 2025-12-30 --to 2025-12-30 --pairs config/discovered_pairs.yml --train-times 100 --test-times 50 (params from config/statarb_best.yml)\", \"pmq approve evaluate --run-id wf_9b156bd7\"]",
+    "approval_reasons": [
+      "FAIL: Win rate too low (11.1% < 40.0%)",
+      "FAIL: Sharpe ratio too low (0.11 < 0.50)",
+      "FAIL: Data quality too low (46.5% < 70.0%)"
+    ],
+    "commands": [
+      "pmq snapshots quality --last-times 200 --interval 60",
+      "pmq statarb walkforward --from 2025-12-30 --to 2025-12-30 --pairs config/discovered_pairs.yml --train-times 100 --test-times 50 (params from config/statarb_best.yml)",
+      "pmq approve evaluate --run-id wf_9b156bd7"
+    ]
+  },
+  "artifacts": [
+    {
+      "id": 24,
+      "evaluation_id": "c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35",
+      "kind": "QUALITY_JSON",
+      "content": "{\"window_from\": \"2025-12-30T16:53:18.974265+00:00\", \"window_to\": \"2025-12-30T20:20:44.911905+00:00\", \"window_mode\": \"last_times\", \"status\": \"INSUFFICIENT_DATA\", \"maturity_score\": 71, \"ready_for_scorecard\": true, \"coverage_pct\": 46.5, \"distinct_times\": 93, \"expected_times\": 200, \"missing_intervals\": 2, \"duplicate_count\": 0, \"largest_gap_seconds\": 3962.291751}",
+      "created_at": "2025-12-31 04:22:46"
+    },
+    {
+      "id": 25,
+      "evaluation_id": "c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35",
+      "kind": "PAIRS_CONFIG_JSON",
+      "content": "{\"path\": \"config\\\\discovered_pairs.yml\", \"hash\": \"3ad46728ea69892d\", \"enabled_pairs\": 20, \"disabled_pairs\": 0, \"pairs\": [{\"market_a_id\": \"589648\", \"market_b_id\": \"686122\", \"name\": \"Will the U.S. invade Vene vs Lighter market cap (FDV) \", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"1059787\", \"market_b_id\": \"540235\", \"name\": \"Spread: Celtics (-7.5) vs Will the Tampa Bay Buccan\", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"1059787\", \"market_b_id\": \"574072\", \"name\": \"Spread: Celtics (-7.5) vs Will Bitcoin reach $140,0\", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"540235\", \"market_b_id\": \"952928\", \"name\": \"Will the Tampa Bay Buccan vs Will Newcastle United FC \", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"574072\", \"market_b_id\": \"952928\", \"name\": \"Will Bitcoin reach $140,0 vs Will Newcastle United FC \", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"574072\", \"market_b_id\": \"952938\", \"name\": \"Will Bitcoin reach $140,0 vs Will Manchester United FC\", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"638492\", \"market_b_id\": \"645986\", \"name\": \"Will edgeX launch a token vs U.S. anti-cartel strike/o\", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"566663\", \"market_b_id\": \"574068\", \"name\": \"Will Matthew Stafford win vs Will Ethereum dip to $1,3\", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"566663\", \"market_b_id\": \"952937\", \"name\": \"Will Matthew Stafford win vs Will Aston Villa FC win o\", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"1059689\", \"market_b_id\": \"678296\", \"name\": \"Spread: Tennessee (-3.5) vs Will the G\\u00e4vle Goat burn \", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"516871\", \"market_b_id\": \"574072\", \"name\": \"Will Bitcoin dip to $70,0 vs Will Bitcoin reach $140,0\", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"553856\", \"market_b_id\": \"678296\", \"name\": \"Will the Oklahoma City Th vs Will the G\\u00e4vle Goat burn \", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"566663\", \"market_b_id\": \"952935\", \"name\": \"Will Matthew Stafford win vs Will Arsenal FC win on 20\", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"686122\", \"market_b_id\": \"965729\", \"name\": \"Lighter market cap (FDV)  vs Will DR Congo win on 2025\", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"1059787\", \"market_b_id\": \"952928\", \"name\": \"Spread: Celtics (-7.5) vs Will Newcastle United FC \", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"1059787\", \"market_b_id\": \"952938\", \"name\": \"Spread: Celtics (-7.5) vs Will Manchester United FC\", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"540235\", \"market_b_id\": \"574072\", \"name\": \"Will the Tampa Bay Buccan vs Will Bitcoin reach $140,0\", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"541585\", \"market_b_id\": \"663850\", \"name\": \"Will Emeka Egbuka be the  vs Maduro out by March 31, 2\", \"correlation\": 1.0, \"enabled\": true}, {\"market_a_id\": \"541585\", \"market_b_id\": \"916439\", \"name\": \"Will Emeka Egbuka be the  vs US x Venezuela military e\", \"correlation\": -1.0, \"enabled\": true}, {\"market_a_id\": \"572469\", \"market_b_id\": \"810168\", \"name\": \"Will Trump nominate Kevin vs Devils vs. Maple Leafs\", \"correlation\": 1.0, \"enabled\": true}]}",
+      "created_at": "2025-12-31 04:22:47"
+    },
+    {
+      "id": 26,
+      "evaluation_id": "c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35",
+      "kind": "BACKTEST_JSON",
+      "content": "{\"run_id\": \"wf_9b156bd7\", \"metrics\": {\"total_pnl\": 0.0566666666666682, \"max_drawdown\": 0.09000000000000008, \"win_rate\": 0.1111111111111111, \"sharpe_ratio\": 0.11043618632113497, \"total_trades\": 9, \"trades_per_day\": 418.06451612903226, \"capital_utilization\": 0.0, \"total_notional\": 90.0, \"final_balance\": 10000.056666666667, \"peak_equity\": 10000.056666666667, \"lowest_equity\": 10000.0}, \"walk_forward\": {\"enabled\": true, \"train_count\": 62, \"test_count\": 31, \"train_window\": \"2025-12-30T16:53:18.974265+00:00 to 2025-12-30T19:48:13.241185+00:00\", \"test_window\": \"2025-12-30T19:49:16.421719+00:00 to 2025-12-30T20:20:44.911905+00:00\", \"fitted_pairs\": \"14/20\", \"params\": {\"lookback\": 20, \"entry_z\": 2.5, \"exit_z\": 0.3, \"max_hold_bars\": 30, \"cooldown_bars\": 5, \"fee_bps\": 0.0, \"slippage_bps\": 0.0}, \"note\": \"Scorecard evaluated on TEST only (walk-forward, no data leakage)\"}}",
+      "created_at": "2025-12-31 04:22:47"
+    },
+    {
+      "id": 27,
+      "evaluation_id": "c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35",
+      "kind": "SCORECARD_TXT",
+      "content": "============================================================\nSTRATEGY SCORECARD\n============================================================\nScore: 36.0/100\nStatus: FAILED\n\nReasons:\n  - FAIL: Win rate too low (11.1% < 40.0%)\n  - FAIL: Sharpe ratio too low (0.11 < 0.50)\n  - FAIL: Data quality too low (46.5% < 70.0%)\n\nWarnings:\n  - Data quality: INSUFFICIENT_DATA - results may not be reliable\n  - Low PnL return: 0.0%\n\nMetrics Used:\n  total_pnl: 0.0566666666666682\n  max_drawdown: 0.09000000000000008\n  win_rate: 0.1111111111111111\n  sharpe_ratio: 0.11043618632113497\n  total_trades: 9\n  trades_per_day: 418.06451612903226\n  capital_utilization: 0.0\n  data_quality_pct: 46.5\n  validation_mode: False\n  data_quality_status: INSUFFICIENT_DATA\n  maturity_score: 71\n  ready_for_scorecard: True\n============================================================",
+      "created_at": "2025-12-31 04:22:47"
+    },
+    {
+      "id": 28,
+      "evaluation_id": "c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35",
+      "kind": "REPORT_MD",
+      "content": "# Evaluation Report \u274c\n\n**ID:** `c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35`\n**Strategy:** statarb vzscore-v1\n**Created:** 2025-12-31T04:22:46.877361+00:00\n**Final Status:** **FAILED**\n**Mode:** Walk-Forward (TEST only)\n\n---\n\n## Summary\n\nApproval failed. Score: 36.0/100. Reasons: FAIL: Win rate too low (11.1% < 40.0%); FAIL: Sharpe ratio too low (0.11 < 0.50); FAIL: Data quality too low (46.5% < 70.0%)\n\n---\n\n## Step 1: Data Quality\n\n- **Status:** INSUFFICIENT_DATA\n- **Maturity Score:** 71/100\n- **Ready for Scorecard:** Yes\n- **Window:** 2025-12-30T16:53:18.974265+00:00 \u2192 2025-12-30T20:20:44.911905+00:00\n\n## Step 2: Walk-Forward Evaluation\n\n- **Run ID:** `wf_9b156bd7`\n- **TRAIN Window:** 2025-12-30T16:53:18.974265+00:00 \u2192 2025-12-30T19:48:13.241185+00:00\n- **TEST Window:** 2025-12-30T19:49:16.421719+00:00 \u2192 2025-12-30T20:20:44.911905+00:00\n- **TRAIN Snapshots:** 62\n- **TEST Snapshots:** 31\n- **Fitted Pairs:** 14/20\n\n### TEST Metrics (used for Scorecard)\n\n- **PnL:** $0.06\n- **Sharpe:** 0.110\n- **Win Rate:** 11.1%\n- **Max Drawdown:** 9.00%\n- **Total Trades:** 9\n- **Score:** 36.0/100\n\n### Parameters Used\n\n- **lookback:** 20\n- **entry_z:** 2.5\n- **exit_z:** 0.3\n- **max_hold_bars:** 30\n- **cooldown_bars:** 5\n- **fee_bps:** 0.0\n- **slippage_bps:** 0.0\n\n*Note: Scorecard evaluated on TEST only (walk-forward, no data leakage)*\n\n## Step 3: Approval\n\n- **Status:** FAILED\n\n**Reasons:**\n\n- FAIL: Win rate too low (11.1% < 40.0%)\n- FAIL: Sharpe ratio too low (0.11 < 0.50)\n- FAIL: Data quality too low (46.5% < 70.0%)\n---\n\n## Commands Executed\n\n```bash\npmq snapshots quality --last-times 200 --interval 60\npmq statarb walkforward --from 2025-12-30 --to 2025-12-30 --pairs config/discovered_pairs.yml --train-times 100 --test-times 50 (params from config/statarb_best.yml)\npmq approve evaluate --run-id wf_9b156bd7\n```\n\n---\n\n*Report generated at 2025-12-31T04:22:47.151641+00:00*",
+      "created_at": "2025-12-31 04:22:47"
+    },
+    {
+      "id": 29,
+      "evaluation_id": "c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35",
+      "kind": "REPORT_JSON",
+      "content": "{\n  \"eval_id\": \"c83988eb-5f73-4bf4-8f8a-7fce1f3e3f35\",\n  \"strategy_name\": \"statarb\",\n  \"strategy_version\": \"zscore-v1\",\n  \"created_at\": \"2025-12-31T04:22:46.877361+00:00\",\n  \"final_status\": \"FAILED\",\n  \"quality_status\": \"INSUFFICIENT_DATA\",\n  \"maturity_score\": 71,\n  \"ready_for_scorecard\": true,\n  \"window_from\": \"2025-12-30T16:53:18.974265+00:00\",\n  \"window_to\": \"2025-12-30T20:20:44.911905+00:00\",\n  \"backtest_run_id\": \"wf_9b156bd7\",\n  \"backtest_pnl\": 0.0566666666666682,\n  \"backtest_score\": 36.0,\n  \"approval_status\": \"FAILED\",\n  \"approval_reasons\": [\n    \"FAIL: Win rate too low (11.1% < 40.0%)\",\n    \"FAIL: Sharpe ratio too low (0.11 < 0.50)\",\n    \"FAIL: Data quality too low (46.5% < 70.0%)\"\n  ],\n  \"paper_run_id\": null,\n  \"paper_trades_count\": 0,\n  \"paper_errors_count\": 0,\n  \"walk_forward\": true,\n  \"train_times_count\": 62,\n  \"test_times_count\": 31,\n  \"fitted_pairs_count\": 14,\n  \"total_pairs_count\": 20,\n  \"train_window_from\": \"2025-12-30T16:53:18.974265+00:00\",\n  \"train_window_to\": \"2025-12-30T19:48:13.241185+00:00\",\n  \"test_window_from\": \"2025-12-30T19:49:16.421719+00:00\",\n  \"test_window_to\": \"2025-12-30T20:20:44.911905+00:00\",\n  \"statarb_params\": {\n    \"lookback\": 20,\n    \"entry_z\": 2.5,\n    \"exit_z\": 0.3,\n    \"max_hold_bars\": 30,\n    \"cooldown_bars\": 5,\n    \"fee_bps\": 0.0,\n    \"slippage_bps\": 0.0\n  },\n  \"backtest_sharpe\": 0.11043618632113497,\n  \"backtest_win_rate\": 0.1111111111111111,\n  \"backtest_max_drawdown\": 0.09000000000000008,\n  \"backtest_total_trades\": 9,\n  \"summary\": \"Approval failed. Score: 36.0/100. Reasons: FAIL: Win rate too low (11.1% < 40.0%); FAIL: Sharpe ratio too low (0.11 < 0.50); FAIL: Data quality too low (46.5% < 70.0%)\",\n  \"commands\": [\n    \"pmq snapshots quality --last-times 200 --interval 60\",\n    \"pmq statarb walkforward --from 2025-12-30 --to 2025-12-30 --pairs config/discovered_pairs.yml --train-times 100 --test-times 50 (params from config/statarb_best.yml)\",\n    \"pmq approve evaluate --run-id wf_9b156bd7\"\n  ]\n}",
+      "created_at": "2025-12-31 04:22:47"
+    }
+  ],
+  "generated_at": "2025-12-31T04:23:14.533699+00:00"
+}

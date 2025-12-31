@@ -1375,6 +1375,13 @@ def snapshots_quality(
         int,
         typer.Option("--interval", "-i", help="Expected interval in seconds"),
     ] = 60,
+    contiguous: Annotated[
+        bool | None,
+        typer.Option(
+            "--contiguous/--no-contiguous",
+            help="Stop at gaps (default True for --last-times, ignored for other modes)",
+        ),
+    ] = None,
 ) -> None:
     """Analyze snapshot data quality.
 
@@ -1386,10 +1393,17 @@ def snapshots_quality(
     The --last-times mode is recommended for evaluating recent data quality
     without being penalized by historical gaps.
 
+    Gap-aware (contiguous) mode:
+    When --contiguous is enabled (default for --last-times), the analyzer
+    stops at gaps in the data to avoid penalizing recent healthy data due
+    to old session gaps. Use --no-contiguous to analyze all available times.
+
     Examples:
         pmq snapshots quality --from 2024-01-01 --to 2024-01-07 --interval 60
         pmq snapshots quality --last-minutes 60 --interval 60
         pmq snapshots quality --last-times 30 --interval 60
+        pmq snapshots quality --last-times 200 --interval 60 --contiguous
+        pmq snapshots quality --last-times 200 --interval 60 --no-contiguous
     """
     from pmq.quality import QualityChecker, QualityReporter
 
@@ -1412,6 +1426,9 @@ def snapshots_quality(
     checker = QualityChecker()
     reporter = QualityReporter()
 
+    # Determine contiguous mode: default True for last-times, False otherwise
+    use_contiguous = contiguous if contiguous is not None else times_mode
+
     with console.status("[bold green]Analyzing snapshot quality..."):
         if rolling_mode:
             assert last_minutes is not None
@@ -1419,8 +1436,10 @@ def snapshots_quality(
             window_desc = f"Last {last_minutes} minutes"
         elif times_mode:
             assert last_times is not None
-            result = checker.check_last_times(last_times, interval)
+            result = checker.check_last_times(last_times, interval, contiguous=use_contiguous)
             window_desc = f"Last {last_times} snapshot times"
+            if use_contiguous:
+                window_desc += " (contiguous)"
         else:
             assert from_date is not None and to_date is not None
             result = reporter.generate_report(
@@ -1462,6 +1481,14 @@ def snapshots_quality(
     table.add_row("Missing Intervals", str(result.missing_intervals))
     table.add_row("Largest Gap", f"{result.largest_gap_seconds:.0f}s")
     table.add_row("Duplicates", str(result.duplicate_count))
+
+    # Contiguous mode info (Phase 4.5)
+    if result.contiguous:
+        table.add_row("Contiguous Mode", "[green]Yes[/green]")
+        if result.gap_cutoff_time:
+            table.add_row("Gap Cutoff", result.gap_cutoff_time[:19])
+            total_avail = result.notes.get("total_available", 0)
+            table.add_row("Times Used", f"{result.distinct_times} of {total_avail} available")
 
     console.print(table)
 

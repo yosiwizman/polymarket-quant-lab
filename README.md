@@ -799,6 +799,93 @@ poetry run pmq eval export --id <eval-id> --format md
 
 > ⚠️ **Why Walk-Forward?** Traditional backtests fit and evaluate on the same data, risking overfitting. Walk-forward splits data chronologically: TRAIN first, TEST second. Parameters are fitted only on TRAIN, and the scorecard sees only TEST metrics—this is the industry standard for research-grade evaluation.
 
+### Gap-Aware Contiguous Windows (Phase 4.5)
+
+Phase 4.5 introduces gap-aware "contiguous" data windows that prevent old session gaps from penalizing recent healthy data.
+
+#### The Problem
+
+When the database contains old snapshot sessions with gaps between them (e.g., from multiple collection sessions), the default `--last-times` window selection spans those gaps. This causes:
+- Data quality coverage to drop artificially
+- Maturity score penalized even when recent data is healthy
+- Eval scorecard sees degraded quality metrics
+
+#### The Solution
+
+Contiguous mode (`--contiguous`) stops at gaps when selecting snapshot times, returning only the most recent contiguous block of data.
+
+```powershell
+# Default behavior: contiguous=True for last-times mode
+poetry run pmq snapshots quality --last-times 200 --interval 60
+
+# Explicit contiguous mode
+poetry run pmq snapshots quality --last-times 200 --interval 60 --contiguous
+
+# Disable contiguous (analyze all times, including across gaps)
+poetry run pmq snapshots quality --last-times 200 --interval 60 --no-contiguous
+```
+
+#### How It Works
+
+1. Fetches candidate snapshot times (descending from newest)
+2. Walks backwards from the newest time
+3. Stops when gap between consecutive times exceeds `interval × 2.5` (gap factor)
+4. Returns only the contiguous block
+
+#### Contiguous Mode Output
+
+When a gap is detected:
+
+```
+Quality Metrics
+┏━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Metric                ┃ Value                                          ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ Window Mode           │ last_times                                     │
+│ Window                │ Last 200 snapshot times (contiguous)           │
+│ Actual Range          │ 2025-01-01T12:00:00 to 2025-01-01T14:00:00     │
+│ Contiguous Mode       │ Yes                                            │
+│ Gap Cutoff            │ 2025-01-01T10:00:00                            │
+│ Times Used            │ 93 of 200 available                            │
+│ Coverage              │ 93.0%                                          │
+│ Maturity Score        │ 85/100                                         │
+└───────────────────────┴────────────────────────────────────────────────┘
+```
+
+#### Eval Pipeline Alignment
+
+The evaluation pipeline automatically uses contiguous mode for walk-forward evaluation:
+- Requests `train_times + test_times` in contiguous mode
+- If fewer times available than requested, scales train/test proportionally
+- Quality metrics and walk-forward use the SAME contiguous window
+- Reports show contiguous info (requested vs actual times, gap cutoff)
+
+```powershell
+# Walk-forward with contiguous windows (default)
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --walkforward --train-times 100 --test-times 50
+```
+
+#### Recommended Workflow
+
+```powershell
+# 1. Check data quality with contiguous mode (see actual usable window)
+poetry run pmq snapshots quality --last-times 200 --interval 60 --contiguous
+
+# 2. If gap detected, either:
+#    a) Collect more recent data to fill the contiguous window
+#    b) Reduce train/test requirements to fit available data
+
+# 3. Run eval - it will automatically use contiguous windows
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --last-times 200
+
+# 4. Review report - shows contiguous info and any scaling applied
+poetry run pmq eval export --id <eval-id> --format md
+```
+
+> 💡 **Why Contiguous?** Old snapshot sessions with gaps shouldn't penalize recent healthy data. Contiguous mode ensures quality metrics reflect the actual usable data window, preventing false "NOT READY" results.
+
 ## Project Structure
 
 ```

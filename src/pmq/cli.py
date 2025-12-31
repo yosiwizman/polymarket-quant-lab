@@ -2081,12 +2081,35 @@ def eval_run(
         str | None,
         typer.Option("--pairs", "-p", help="Pairs config file (required for statarb)"),
     ] = None,
+    # Walk-forward options (statarb only)
+    walkforward: Annotated[
+        bool | None,
+        typer.Option(
+            "--walkforward/--no-walkforward",
+            help="Use walk-forward evaluation for statarb (auto-detect if not set)",
+        ),
+    ] = None,
+    statarb_params: Annotated[
+        str | None,
+        typer.Option(
+            "--statarb-params",
+            help="Path to statarb z-score params YAML (default: config/statarb_best.yml)",
+        ),
+    ] = None,
+    train_times: Annotated[
+        int,
+        typer.Option("--train-times", help="Number of snapshots for TRAIN segment (walk-forward)"),
+    ] = 100,
+    test_times: Annotated[
+        int,
+        typer.Option("--test-times", help="Number of snapshots for TEST segment (walk-forward)"),
+    ] = 50,
 ) -> None:
     """Run automated evaluation pipeline.
 
     Executes end-to-end strategy validation:
     1. Check data quality (must be READY)
-    2. Run deterministic backtest
+    2. Run deterministic backtest (or walk-forward for statarb)
     3. Evaluate for approval
     4. Optional paper trading smoke test
     5. Generate report
@@ -2094,21 +2117,35 @@ def eval_run(
     For statarb strategy, --pairs is required. Generate with:
         pmq statarb pairs suggest --out config/pairs.yml
 
+    Walk-forward evaluation (statarb only):
+        When --walkforward is enabled or auto-detected (version contains 'zscore',
+        or --statarb-params provided, or config/statarb_best.yml exists), the
+        evaluation uses walk-forward methodology:
+        - TRAIN segment: fit z-score parameters
+        - TEST segment: evaluate strategy (used for scorecard)
+        This prevents data leakage and overfitting.
+
     Example:
         pmq eval run --strategy arb --version v1 --last-times 30
         pmq eval run --strategy statarb --version v1 --pairs config/pairs.yml --last-times 30
+        pmq eval run --strategy statarb --version zscore-v1 --pairs config/pairs.yml --walkforward
+        pmq eval run --strategy statarb --pairs config/pairs.yml --statarb-params config/statarb_best.yml
         pmq eval run --strategy observer --version v1 --last-times 30 --paper-minutes 10
     """
     from pmq.evaluation import EvaluationPipeline, EvaluationReporter
 
     # Print startup info
     pairs_info = f"Pairs: {pairs_config}" if pairs_config else "Pairs: N/A"
+    walkforward_info = (
+        f"Walk-forward: {walkforward}" if walkforward is not None else "Walk-forward: auto-detect"
+    )
     console.print(
         f"\n[bold green]Starting Evaluation Pipeline[/bold green]\n"
         f"Strategy: {strategy} v{version}\n"
         f"Quality Window: last {last_times} snapshots\n"
         f"Interval: {interval}s\n"
         f"{pairs_info}\n"
+        f"{walkforward_info}\n"
         f"Paper Minutes: {paper_minutes if paper_minutes > 0 else 'skip'}\n"
     )
 
@@ -2128,6 +2165,10 @@ def eval_run(
                 quantity=quantity,
                 initial_balance=balance,
                 pairs_config=pairs_config,
+                walk_forward=walkforward,
+                statarb_params_path=statarb_params,
+                train_times=train_times,
+                test_times=test_times,
             )
 
             # Save reports as artifacts
@@ -2155,10 +2196,30 @@ def eval_run(
     table.add_row("Maturity Score", f"{result.maturity_score}/100")
     table.add_row("Ready for Scorecard", "Yes" if result.ready_for_scorecard else "No")
 
-    # Backtest
+    # Backtest / Walk-forward
     if result.backtest_run_id:
+        if result.walk_forward:
+            table.add_row("Mode", "[magenta]Walk-Forward (TEST only)[/magenta]")
+            table.add_row(
+                "TRAIN Window",
+                f"{result.train_window_from[:19] if result.train_window_from else 'N/A'} → "
+                f"{result.train_window_to[:19] if result.train_window_to else 'N/A'}",
+            )
+            table.add_row(
+                "TEST Window",
+                f"{result.test_window_from[:19] if result.test_window_from else 'N/A'} → "
+                f"{result.test_window_to[:19] if result.test_window_to else 'N/A'}",
+            )
+            table.add_row("Fitted Pairs", f"{result.fitted_pairs_count}/{result.total_pairs_count}")
         pnl_color = "green" if result.backtest_pnl >= 0 else "red"
-        table.add_row("Backtest PnL", f"[{pnl_color}]${result.backtest_pnl:.2f}[/{pnl_color}]")
+        table.add_row(
+            "TEST PnL" if result.walk_forward else "Backtest PnL",
+            f"[{pnl_color}]${result.backtest_pnl:.2f}[/{pnl_color}]",
+        )
+        if result.walk_forward:
+            table.add_row("TEST Sharpe", f"{result.backtest_sharpe:.3f}")
+            table.add_row("TEST Win Rate", f"{result.backtest_win_rate:.1%}")
+            table.add_row("TEST Trades", str(result.backtest_total_trades))
         table.add_row("Backtest Score", f"{result.backtest_score:.1f}/100")
 
     # Approval
@@ -2171,6 +2232,12 @@ def eval_run(
         table.add_row("Paper Errors", str(result.paper_errors_count))
 
     console.print(table)
+
+    # Walk-forward note
+    if result.walk_forward:
+        console.print(
+            "\n[dim italic]Note: Scorecard evaluated on TEST only (walk-forward, no data leakage)[/dim italic]"
+        )
 
     # Summary
     console.print(f"\n[bold]Summary:[/bold] {result.summary}")

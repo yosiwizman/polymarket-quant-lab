@@ -177,35 +177,81 @@ class EvaluationReporter:
             f"**Strategy:** {result.strategy_name} v{result.strategy_version}",
             f"**Created:** {result.created_at}",
             f"**Final Status:** **{result.final_status}**",
-            "",
-            "---",
-            "",
-            "## Summary",
-            "",
-            result.summary,
-            "",
-            "---",
-            "",
-            "## Step 1: Data Quality",
-            "",
-            f"- **Status:** {result.quality_status}",
-            f"- **Maturity Score:** {result.maturity_score}/100",
-            f"- **Ready for Scorecard:** {'Yes' if result.ready_for_scorecard else 'No'}",
-            f"- **Window:** {result.window_from} → {result.window_to}",
-            "",
         ]
 
+        if result.walk_forward:
+            lines.append("**Mode:** Walk-Forward (TEST only)")
+
+        lines.extend(
+            [
+                "",
+                "---",
+                "",
+                "## Summary",
+                "",
+                result.summary,
+                "",
+                "---",
+                "",
+                "## Step 1: Data Quality",
+                "",
+                f"- **Status:** {result.quality_status}",
+                f"- **Maturity Score:** {result.maturity_score}/100",
+                f"- **Ready for Scorecard:** {'Yes' if result.ready_for_scorecard else 'No'}",
+                f"- **Window:** {result.window_from} → {result.window_to}",
+                "",
+            ]
+        )
+
         if result.backtest_run_id:
-            lines.extend(
-                [
-                    "## Step 2: Backtest",
-                    "",
-                    f"- **Run ID:** `{result.backtest_run_id}`",
-                    f"- **PnL:** ${result.backtest_pnl:.2f}",
-                    f"- **Score:** {result.backtest_score:.1f}/100",
-                    "",
-                ]
-            )
+            if result.walk_forward:
+                lines.extend(
+                    [
+                        "## Step 2: Walk-Forward Evaluation",
+                        "",
+                        f"- **Run ID:** `{result.backtest_run_id}`",
+                        f"- **TRAIN Window:** {result.train_window_from} → {result.train_window_to}",
+                        f"- **TEST Window:** {result.test_window_from} → {result.test_window_to}",
+                        f"- **TRAIN Snapshots:** {result.train_times_count}",
+                        f"- **TEST Snapshots:** {result.test_times_count}",
+                        f"- **Fitted Pairs:** {result.fitted_pairs_count}/{result.total_pairs_count}",
+                        "",
+                        "### TEST Metrics (used for Scorecard)",
+                        "",
+                        f"- **PnL:** ${result.backtest_pnl:.2f}",
+                        f"- **Sharpe:** {result.backtest_sharpe:.3f}",
+                        f"- **Win Rate:** {result.backtest_win_rate:.1%}",
+                        f"- **Max Drawdown:** {result.backtest_max_drawdown:.2%}",
+                        f"- **Total Trades:** {result.backtest_total_trades}",
+                        f"- **Score:** {result.backtest_score:.1f}/100",
+                        "",
+                    ]
+                )
+                if result.statarb_params:
+                    lines.extend(
+                        [
+                            "### Parameters Used",
+                            "",
+                        ]
+                    )
+                    for key, value in result.statarb_params.items():
+                        lines.append(f"- **{key}:** {value}")
+                    lines.append("")
+                lines.append(
+                    "*Note: Scorecard evaluated on TEST only (walk-forward, no data leakage)*"
+                )
+                lines.append("")
+            else:
+                lines.extend(
+                    [
+                        "## Step 2: Backtest",
+                        "",
+                        f"- **Run ID:** `{result.backtest_run_id}`",
+                        f"- **PnL:** ${result.backtest_pnl:.2f}",
+                        f"- **Score:** {result.backtest_score:.1f}/100",
+                        "",
+                    ]
+                )
 
         lines.extend(
             [

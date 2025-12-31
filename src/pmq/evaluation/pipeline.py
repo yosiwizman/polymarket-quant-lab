@@ -2,7 +2,7 @@
 
 Executes:
 1. Quality check (assert data is ready)
-2. Backtest run
+2. Backtest run (or walk-forward for statarb)
 3. Approval evaluation
 4. Optional paper trading smoke test
 5. Final report generation
@@ -13,8 +13,12 @@ import subprocess
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import yaml
+
+from pmq.backtest.metrics import BacktestMetrics
 from pmq.backtest.runner import BacktestRunner
 from pmq.governance.scorecard import compute_scorecard
 from pmq.logging import get_logger
@@ -71,6 +75,24 @@ class EvaluationResult:
     paper_trades_count: int = 0
     paper_errors_count: int = 0
 
+    # Walk-forward fields (statarb z-score)
+    walk_forward: bool = False
+    train_times_count: int = 0
+    test_times_count: int = 0
+    fitted_pairs_count: int = 0
+    total_pairs_count: int = 0
+    train_window_from: str = ""
+    train_window_to: str = ""
+    test_window_from: str = ""
+    test_window_to: str = ""
+    statarb_params: dict[str, Any] = field(default_factory=dict)
+
+    # Additional backtest metrics for walk-forward
+    backtest_sharpe: float = 0.0
+    backtest_win_rate: float = 0.0
+    backtest_max_drawdown: float = 0.0
+    backtest_total_trades: int = 0
+
     # Summary
     summary: str = ""
     commands: list[str] = field(default_factory=list)
@@ -110,6 +132,11 @@ class EvaluationPipeline:
         window_from: str | None = None,
         window_to: str | None = None,
         pairs_config: str | None = None,
+        # Walk-forward parameters (statarb only)
+        walk_forward: bool | None = None,
+        statarb_params_path: str | None = None,
+        train_times: int = 100,
+        test_times: int = 50,
     ) -> EvaluationResult:
         """Run the full evaluation pipeline.
 
@@ -125,6 +152,10 @@ class EvaluationPipeline:
             window_from: Explicit window start (for explicit mode)
             window_to: Explicit window end (for explicit mode)
             pairs_config: Path to pairs config file (required for statarb)
+            walk_forward: Enable walk-forward evaluation (auto-detect if None)
+            statarb_params_path: Path to statarb params YAML file
+            train_times: Number of snapshots for TRAIN segment
+            test_times: Number of snapshots for TEST segment
 
         Returns:
             EvaluationResult with all step outcomes
@@ -242,24 +273,71 @@ class EvaluationPipeline:
             logger.warning(f"Evaluation {eval_id} failed: data not ready")
             return result
 
-        # Step 2: Run backtest
-        backtest_cmd = (
-            f"pmq backtest run --strategy {strategy_name} "
-            f"--from {quality_result.window_from[:10]} --to {quality_result.window_to[:10]} "
-            f"--balance {initial_balance} --quantity {quantity}"
-        )
-        if pairs_config:
-            backtest_cmd += f" --pairs {pairs_config}"
-        self._log_command(backtest_cmd)
-
-        backtest_result = self._run_backtest(
+        # Step 2: Run backtest (or walk-forward for statarb)
+        # Determine if walk-forward should be used for statarb
+        use_walk_forward = self._should_use_walk_forward(
             strategy_name=strategy_name,
-            start_date=quality_result.window_from,
-            end_date=quality_result.window_to,
-            quantity=quantity,
-            initial_balance=initial_balance,
-            pairs_config=pairs_config,
+            strategy_version=strategy_version,
+            walk_forward=walk_forward,
+            statarb_params_path=statarb_params_path,
         )
+
+        if use_walk_forward and strategy_name == "statarb":
+            # Walk-forward evaluation for statarb
+            walkforward_cmd = (
+                f"pmq statarb walkforward "
+                f"--from {quality_result.window_from[:10]} --to {quality_result.window_to[:10]} "
+                f"--pairs {pairs_config} --train-times {train_times} --test-times {test_times}"
+            )
+            if statarb_params_path:
+                walkforward_cmd += f" (params from {statarb_params_path})"
+            self._log_command(walkforward_cmd)
+
+            backtest_result = self._run_walkforward(
+                pairs_config_result=pairs_config_result,
+                quality_result=quality_result,
+                statarb_params_path=statarb_params_path,
+                train_times=train_times,
+                test_times=test_times,
+                quantity=quantity,
+            )
+
+            # Store walk-forward specific results
+            result.walk_forward = True
+            result.train_times_count = backtest_result.get("train_count", 0)
+            result.test_times_count = backtest_result.get("test_count", 0)
+            result.fitted_pairs_count = backtest_result.get("fitted_pairs", 0)
+            result.total_pairs_count = backtest_result.get("total_pairs", 0)
+            result.train_window_from = backtest_result.get("train_from", "")
+            result.train_window_to = backtest_result.get("train_to", "")
+            result.test_window_from = backtest_result.get("test_from", "")
+            result.test_window_to = backtest_result.get("test_to", "")
+            result.statarb_params = backtest_result.get("params", {})
+
+            # Store additional metrics
+            result.backtest_sharpe = backtest_result["metrics"].sharpe_ratio
+            result.backtest_win_rate = backtest_result["metrics"].win_rate
+            result.backtest_max_drawdown = backtest_result["metrics"].max_drawdown
+            result.backtest_total_trades = backtest_result["metrics"].total_trades
+        else:
+            # Standard backtest path
+            backtest_cmd = (
+                f"pmq backtest run --strategy {strategy_name} "
+                f"--from {quality_result.window_from[:10]} --to {quality_result.window_to[:10]} "
+                f"--balance {initial_balance} --quantity {quantity}"
+            )
+            if pairs_config:
+                backtest_cmd += f" --pairs {pairs_config}"
+            self._log_command(backtest_cmd)
+
+            backtest_result = self._run_backtest(
+                strategy_name=strategy_name,
+                start_date=quality_result.window_from,
+                end_date=quality_result.window_to,
+                quantity=quantity,
+                initial_balance=initial_balance,
+                pairs_config=pairs_config,
+            )
 
         # Save pairs config artifact if used
         if pairs_config_result:
@@ -289,16 +367,26 @@ class EvaluationPipeline:
             backtest_score=0.0,
         )
 
-        # Save backtest artifact
+        # Save backtest artifact (include walk-forward metadata if applicable)
+        backtest_artifact: dict[str, Any] = {
+            "run_id": backtest_result["run_id"],
+            "metrics": backtest_result["metrics"].__dict__,
+        }
+        if result.walk_forward:
+            backtest_artifact["walk_forward"] = {
+                "enabled": True,
+                "train_count": result.train_times_count,
+                "test_count": result.test_times_count,
+                "train_window": f"{result.train_window_from} to {result.train_window_to}",
+                "test_window": f"{result.test_window_from} to {result.test_window_to}",
+                "fitted_pairs": f"{result.fitted_pairs_count}/{result.total_pairs_count}",
+                "params": result.statarb_params,
+                "note": "Scorecard evaluated on TEST only (walk-forward, no data leakage)",
+            }
         self._dao.save_evaluation_artifact(
             evaluation_id=eval_id,
             kind="BACKTEST_JSON",
-            content=json.dumps(
-                {
-                    "run_id": backtest_result["run_id"],
-                    "metrics": backtest_result["metrics"].__dict__,
-                }
-            ),
+            content=json.dumps(backtest_artifact),
         )
 
         # Step 3: Approval evaluation (standard mode)
@@ -483,6 +571,215 @@ class EvaluationPipeline:
             )
 
         return {"run_id": run_id, "metrics": metrics}
+
+    def _should_use_walk_forward(
+        self,
+        strategy_name: str,
+        strategy_version: str,
+        walk_forward: bool | None,
+        statarb_params_path: str | None,
+    ) -> bool:
+        """Determine if walk-forward evaluation should be used.
+
+        Walk-forward is enabled when:
+        - Explicitly requested (walk_forward=True), OR
+        - statarb_params_path is provided, OR
+        - strategy_version contains 'zscore' or 'walkforward'
+        - config/statarb_best.yml exists (auto-detect)
+
+        Walk-forward is disabled when:
+        - Explicitly disabled (walk_forward=False)
+        - Strategy is not statarb
+        """
+        if strategy_name != "statarb":
+            return False
+
+        if walk_forward is False:
+            return False
+
+        if walk_forward is True:
+            return True
+
+        # Auto-detect based on version string
+        version_lower = strategy_version.lower()
+        if "zscore" in version_lower or "walkforward" in version_lower:
+            return True
+
+        # Auto-detect based on params path
+        if statarb_params_path:
+            return True
+
+        # Auto-detect based on default config existence
+        default_params = Path("config/statarb_best.yml")
+        if default_params.exists():
+            logger.info(f"Found {default_params}, enabling walk-forward evaluation for statarb")
+            return True
+
+        return False
+
+    def _run_walkforward(
+        self,
+        pairs_config_result: Any,
+        quality_result: QualityResult,
+        statarb_params_path: str | None,
+        train_times: int,
+        test_times: int,
+        quantity: float,
+    ) -> dict[str, Any]:
+        """Run walk-forward evaluation for statarb z-score strategy.
+
+        Returns dict with:
+        - run_id: str
+        - metrics: BacktestMetrics-compatible object
+        - train_count, test_count: int
+        - train_from, train_to, test_from, test_to: str
+        - fitted_pairs, total_pairs: int
+        - params: dict of z-score parameters used
+        """
+        from pmq.statarb.walkforward import run_walk_forward
+
+        # Load z-score parameters from YAML or use defaults
+        params = self._load_statarb_params(statarb_params_path)
+        logger.info(f"Walk-forward params: {params}")
+
+        # Get pairs from config
+        pairs = pairs_config_result.enabled_pairs if pairs_config_result else []
+
+        # Get snapshots from quality window
+        snapshots = self._dao.get_snapshots(
+            start_time=quality_result.window_from,
+            end_time=quality_result.window_to,
+        )
+
+        # Run walk-forward evaluation
+        wf_result = run_walk_forward(
+            snapshots=snapshots,
+            pairs=pairs,
+            train_count=train_times,
+            test_count=test_times,
+            lookback=params.get("lookback", 30),
+            entry_z=params.get("entry_z", 2.0),
+            exit_z=params.get("exit_z", 0.5),
+            max_hold_bars=params.get("max_hold_bars", 60),
+            cooldown_bars=params.get("cooldown_bars", 5),
+            fee_bps=params.get("fee_bps", 0.0),
+            slippage_bps=params.get("slippage_bps", 0.0),
+            quantity_per_trade=quantity,
+        )
+
+        # Map WalkForwardMetrics to BacktestMetrics-compatible structure
+        test_metrics = wf_result.test_metrics
+        metrics = self._walkforward_to_backtest_metrics(test_metrics, wf_result)
+
+        # Count fitted pairs
+        fitted_count = sum(1 for p in wf_result.fitted_params.values() if p.is_valid)
+
+        # Create run ID for tracking
+        run_id = f"wf_{uuid.uuid4().hex[:8]}"
+
+        # Save walk-forward manifest
+        self._dao.create_backtest_run(
+            run_id=run_id,
+            strategy="statarb_walkforward",
+            start_date=quality_result.window_from,
+            end_date=quality_result.window_to,
+            initial_balance=10000.0,  # Not used for walk-forward
+        )
+
+        return {
+            "run_id": run_id,
+            "metrics": metrics,
+            "train_count": wf_result.split.train_count,
+            "test_count": wf_result.split.test_count,
+            "train_from": wf_result.split.first_train,
+            "train_to": wf_result.split.last_train,
+            "test_from": wf_result.split.first_test,
+            "test_to": wf_result.split.last_test,
+            "fitted_pairs": fitted_count,
+            "total_pairs": len(pairs),
+            "params": params,
+        }
+
+    def _load_statarb_params(self, params_path: str | None) -> dict[str, Any]:
+        """Load statarb z-score parameters from YAML file.
+
+        Falls back to defaults if file doesn't exist.
+        """
+        defaults = {
+            "lookback": 30,
+            "entry_z": 2.0,
+            "exit_z": 0.5,
+            "max_hold_bars": 60,
+            "cooldown_bars": 5,
+            "fee_bps": 0.0,
+            "slippage_bps": 0.0,
+        }
+
+        # Try explicit path first
+        if params_path:
+            path = Path(params_path)
+            if path.exists():
+                return self._parse_params_yaml(path, defaults)
+            else:
+                logger.warning(f"Params file not found: {params_path}, using defaults")
+                return defaults
+
+        # Try default path
+        default_path = Path("config/statarb_best.yml")
+        if default_path.exists():
+            return self._parse_params_yaml(default_path, defaults)
+
+        return defaults
+
+    def _parse_params_yaml(self, path: Path, defaults: dict[str, Any]) -> dict[str, Any]:
+        """Parse statarb params from YAML file."""
+        try:
+            with path.open() as f:
+                data = yaml.safe_load(f)
+
+            if not data:
+                return defaults
+
+            # Handle nested 'statarb' key from tuning output
+            if "statarb" in data:
+                data = data["statarb"]
+
+            # Merge with defaults
+            result = defaults.copy()
+            for key in defaults:
+                if key in data:
+                    result[key] = data[key]
+
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to parse params file {path}: {e}")
+            return defaults
+
+    def _walkforward_to_backtest_metrics(
+        self,
+        wf_metrics: Any,  # WalkForwardMetrics
+        wf_result: Any,  # WalkForwardResult
+    ) -> BacktestMetrics:
+        """Convert WalkForwardMetrics to BacktestMetrics for scorecard compatibility."""
+        # Calculate trades per day (approximate)
+        test_count = wf_result.split.test_count
+        # Assume ~1 minute intervals, so test_count minutes / 1440 minutes per day
+        days = max(test_count / 1440, 0.01)  # At least some fraction of a day
+        trades_per_day = wf_metrics.total_trades / days if days > 0 else 0.0
+
+        return BacktestMetrics(
+            total_pnl=wf_metrics.total_pnl,
+            max_drawdown=wf_metrics.max_drawdown,
+            win_rate=wf_metrics.win_rate,
+            sharpe_ratio=wf_metrics.sharpe_ratio,
+            total_trades=wf_metrics.total_trades,
+            trades_per_day=trades_per_day,
+            capital_utilization=0.0,  # Not applicable for walk-forward
+            total_notional=wf_metrics.total_trades * 10.0,  # Approximate
+            final_balance=10000.0 + wf_metrics.total_pnl,
+            peak_equity=10000.0 + max(wf_metrics.total_pnl, 0),
+            lowest_equity=10000.0 + min(wf_metrics.total_pnl, 0),
+        )
 
     def _evaluate_approval(
         self,

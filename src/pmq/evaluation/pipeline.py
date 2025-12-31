@@ -108,6 +108,19 @@ class EvaluationResult:
     effective_quality_pct: float = 0.0
     quality_window_aligned: bool = False  # True when quality was re-checked on effective window
 
+    # Realism fields (Phase 4.8)
+    # Cost assumptions used for evaluation
+    fee_bps: float = 0.0
+    slippage_bps: float = 0.0
+    # Constraint filtering results
+    constraints_applied: bool = False
+    constraint_min_liquidity: float | None = None  # Effective min_liquidity used (global override)
+    constraint_max_spread: float | None = None  # Effective max_spread used (global override)
+    pairs_before_constraints: int = 0
+    pairs_after_constraints: int = 0
+    pairs_filtered_low_liquidity: int = 0
+    pairs_filtered_high_spread: int = 0
+
     # Summary
     summary: str = ""
     commands: list[str] = field(default_factory=list)
@@ -152,6 +165,11 @@ class EvaluationPipeline:
         statarb_params_path: str | None = None,
         train_times: int = 100,
         test_times: int = 50,
+        # Realism parameters (Phase 4.8, statarb walk-forward only)
+        fee_bps_override: float | None = None,
+        slippage_bps_override: float | None = None,
+        min_liquidity_override: float | None = None,
+        max_spread_override: float | None = None,
     ) -> EvaluationResult:
         """Run the full evaluation pipeline.
 
@@ -171,6 +189,10 @@ class EvaluationPipeline:
             statarb_params_path: Path to statarb params YAML file
             train_times: Number of snapshots for TRAIN segment
             test_times: Number of snapshots for TEST segment
+            fee_bps_override: Override fee_bps from CLI (takes precedence over YAML)
+            slippage_bps_override: Override slippage_bps from CLI
+            min_liquidity_override: Global min_liquidity threshold (overrides per-pair)
+            max_spread_override: Global max_spread threshold (overrides per-pair)
 
         Returns:
             EvaluationResult with all step outcomes
@@ -357,6 +379,11 @@ class EvaluationPipeline:
                 train_times=actual_train_times,
                 test_times=actual_test_times,
                 quantity=quantity,
+                # Phase 4.8: Realism parameters
+                fee_bps_override=fee_bps_override,
+                slippage_bps_override=slippage_bps_override,
+                min_liquidity_override=min_liquidity_override,
+                max_spread_override=max_spread_override,
             )
 
             # Store walk-forward specific results
@@ -376,6 +403,19 @@ class EvaluationPipeline:
             result.backtest_win_rate = backtest_result["metrics"].win_rate
             result.backtest_max_drawdown = backtest_result["metrics"].max_drawdown
             result.backtest_total_trades = backtest_result["metrics"].total_trades
+
+            # Phase 4.8: Store realism fields from walk-forward
+            result.fee_bps = backtest_result.get("fee_bps", 0.0)
+            result.slippage_bps = backtest_result.get("slippage_bps", 0.0)
+            result.constraints_applied = backtest_result.get("constraints_applied", False)
+            result.constraint_min_liquidity = backtest_result.get("constraint_min_liquidity")
+            result.constraint_max_spread = backtest_result.get("constraint_max_spread")
+            result.pairs_before_constraints = backtest_result.get("pairs_before_constraints", 0)
+            result.pairs_after_constraints = backtest_result.get("pairs_after_constraints", 0)
+            result.pairs_filtered_low_liquidity = backtest_result.get(
+                "pairs_filtered_low_liquidity", 0
+            )
+            result.pairs_filtered_high_spread = backtest_result.get("pairs_filtered_high_spread", 0)
 
             # Phase 4.7: Re-check quality on the effective window used by walk-forward
             # This ensures governance evaluates quality on the same window as trades
@@ -733,6 +773,11 @@ class EvaluationPipeline:
         train_times: int,
         test_times: int,
         quantity: float,
+        # Phase 4.8: Realism parameters
+        fee_bps_override: float | None = None,
+        slippage_bps_override: float | None = None,
+        min_liquidity_override: float | None = None,
+        max_spread_override: float | None = None,
     ) -> dict[str, Any]:
         """Run walk-forward evaluation for statarb z-score strategy.
 
@@ -743,21 +788,79 @@ class EvaluationPipeline:
         - train_from, train_to, test_from, test_to: str
         - fitted_pairs, total_pairs: int
         - params: dict of z-score parameters used
+        - Phase 4.8 realism fields:
+          - fee_bps, slippage_bps: effective cost values used
+          - constraints_applied: bool
+          - constraint_min_liquidity, constraint_max_spread: effective overrides (or None)
+          - pairs_before_constraints, pairs_after_constraints: pair counts
+          - pairs_filtered_low_liquidity, pairs_filtered_high_spread: filter counts
         """
+        from pmq.statarb.constraints import apply_market_constraints
         from pmq.statarb.walkforward import run_walk_forward
 
         # Load z-score parameters from YAML or use defaults
         params = self._load_statarb_params(statarb_params_path)
+
+        # Phase 4.8: Apply precedence for cost parameters
+        # CLI overrides > YAML values > project defaults (already in params)
+        effective_fee_bps = (
+            fee_bps_override if fee_bps_override is not None else params.get("fee_bps", 2.0)
+        )
+        effective_slippage_bps = (
+            slippage_bps_override
+            if slippage_bps_override is not None
+            else params.get("slippage_bps", 5.0)
+        )
+        params["fee_bps"] = effective_fee_bps
+        params["slippage_bps"] = effective_slippage_bps
+
         logger.info(f"Walk-forward params: {params}")
 
         # Get pairs from config
-        pairs = pairs_config_result.enabled_pairs if pairs_config_result else []
+        all_pairs = pairs_config_result.enabled_pairs if pairs_config_result else []
+        pairs_before = len(all_pairs)
 
         # Get snapshots from quality window
         snapshots = self._dao.get_snapshots(
             start_time=quality_result.window_from,
             end_time=quality_result.window_to,
         )
+
+        # Phase 4.8: Apply constraint filtering
+        # Global overrides replace per-pair constraints
+        if min_liquidity_override is not None or max_spread_override is not None:
+            # Apply global overrides to all pairs temporarily
+            for pair in all_pairs:
+                if min_liquidity_override is not None:
+                    pair.min_liquidity = min_liquidity_override
+                if max_spread_override is not None:
+                    pair.max_spread = max_spread_override
+
+        # Get distinct times for constraint computation
+        times = sorted({s["snapshot_time"] for s in snapshots})
+
+        # Check if any pairs have constraints
+        has_constraints = any(
+            p.min_liquidity is not None or p.max_spread is not None for p in all_pairs
+        )
+
+        constraint_result = apply_market_constraints(
+            pairs=all_pairs,
+            snapshots=snapshots,
+            times=times,
+            enforce_constraints=has_constraints,
+        )
+
+        # Use eligible pairs for walk-forward
+        pairs = constraint_result.eligible_pairs
+        pairs_after = len(pairs)
+
+        if constraint_result.has_filtered_pairs:
+            logger.info(
+                f"Constraint filtering: {pairs_after}/{pairs_before} pairs eligible "
+                f"(low liquidity: {constraint_result.filtered_low_liquidity}, "
+                f"high spread: {constraint_result.filtered_high_spread})"
+            )
 
         # Run walk-forward evaluation
         wf_result = run_walk_forward(
@@ -770,8 +873,8 @@ class EvaluationPipeline:
             exit_z=params.get("exit_z", 0.5),
             max_hold_bars=params.get("max_hold_bars", 60),
             cooldown_bars=params.get("cooldown_bars", 5),
-            fee_bps=params.get("fee_bps", 0.0),
-            slippage_bps=params.get("slippage_bps", 0.0),
+            fee_bps=effective_fee_bps,
+            slippage_bps=effective_slippage_bps,
             quantity_per_trade=quantity,
         )
 
@@ -804,8 +907,18 @@ class EvaluationPipeline:
             "test_from": wf_result.split.first_test,
             "test_to": wf_result.split.last_test,
             "fitted_pairs": fitted_count,
-            "total_pairs": len(pairs),
+            "total_pairs": pairs_before,  # Original count before filtering
             "params": params,
+            # Phase 4.8: Realism fields
+            "fee_bps": effective_fee_bps,
+            "slippage_bps": effective_slippage_bps,
+            "constraints_applied": constraint_result.constraints_applied,
+            "constraint_min_liquidity": min_liquidity_override,
+            "constraint_max_spread": max_spread_override,
+            "pairs_before_constraints": pairs_before,
+            "pairs_after_constraints": pairs_after,
+            "pairs_filtered_low_liquidity": constraint_result.filtered_low_liquidity,
+            "pairs_filtered_high_spread": constraint_result.filtered_high_spread,
         }
 
     def _load_statarb_params(self, params_path: str | None) -> dict[str, Any]:

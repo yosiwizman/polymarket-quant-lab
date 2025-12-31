@@ -1047,6 +1047,129 @@ poetry run pmq snapshots quality --from 2024-12-01T00:00:00 --to 2024-12-01T01:0
 
 > 💡 **Why Alignment Matters:** Governance should evaluate quality on the same window that trades are evaluated on. Misaligned windows cause false negatives (rejecting good strategies) or false positives (approving strategies with data issues).
 
+### Eval Pipeline Realism: Costs + Constraints (Phase 4.8)
+
+Phase 4.8 makes `pmq eval run` for StatArb fully "realistic" by propagating cost and constraint parameters into the evaluation pipeline, with transparent reporting.
+
+#### CLI Flags for Realism
+
+New flags on `pmq eval run` allow overriding costs and constraints at evaluation time:
+
+```powershell
+# Evaluate with custom costs (override YAML and defaults)
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --walkforward \
+  --fee-bps 3.0 --slippage-bps 8.0
+
+# Evaluate with global constraint overrides
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --walkforward \
+  --min-liquidity 500 --max-spread 0.03
+
+# Full realism: costs + constraints
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --walkforward \
+  --fee-bps 5.0 --slippage-bps 10.0 \
+  --min-liquidity 1000 --max-spread 0.02
+```
+
+#### Precedence Rules
+
+Costs and constraints follow a clear precedence hierarchy:
+
+1. **CLI flags** override everything (global overrides)
+2. **Params YAML** values are used if CLI flag not set (`--statarb-params config/statarb_best.yml`)
+3. **Project defaults** used if neither CLI nor YAML set:
+   - `fee_bps`: 2.0 (Polymarket maker/taker fees)
+   - `slippage_bps`: 5.0 (market impact)
+   - Constraints: unset unless provided per-pair in pairs.yml
+
+```powershell
+# Precedence example: CLI (3.0) > YAML (5.0) > Default (2.0)
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --statarb-params config/best.yml \
+  --fee-bps 3.0  # Uses 3.0 from CLI, ignores YAML's 5.0
+```
+
+#### Constraint Filtering
+
+Global constraint overrides (`--min-liquidity`, `--max-spread`) filter pairs before walk-forward fitting:
+
+1. Load all pairs from `pairs.yml`
+2. Apply global constraint overrides (replace per-pair constraints)
+3. Filter pairs that don't meet liquidity/spread requirements
+4. Run walk-forward on eligible pairs only
+5. Report filtering statistics
+
+#### Report Sections
+
+Evaluation reports now include:
+
+**Cost Assumptions:**
+```markdown
+### Cost Assumptions
+- **Fee:** 2.0 bps
+- **Slippage:** 5.0 bps
+- **Total Round-Trip Cost:** 7.0 bps
+```
+
+**Constraint Filtering:**
+```markdown
+### Constraint Filtering
+- **Pairs Before Filtering:** 10
+- **Pairs After Filtering:** 7
+- **Filtered (Low Liquidity):** 2
+- **Filtered (High Spread):** 1
+- **Global Min Liquidity:** 500.0
+- **Global Max Spread:** 0.03
+```
+
+#### New CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--fee-bps` | float | None | Fee override (bps) |
+| `--slippage-bps` | float | None | Slippage override (bps) |
+| `--min-liquidity` | float | None | Global min liquidity filter |
+| `--max-spread` | float | None | Global max spread filter |
+
+#### New EvaluationResult Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `fee_bps` | float | Effective fee used (bps) |
+| `slippage_bps` | float | Effective slippage used (bps) |
+| `constraints_applied` | bool | True if any constraints filtered pairs |
+| `constraint_min_liquidity` | float | Global min liquidity override (if set) |
+| `constraint_max_spread` | float | Global max spread override (if set) |
+| `pairs_before_constraints` | int | Total pairs before filtering |
+| `pairs_after_constraints` | int | Pairs after constraint filtering |
+| `pairs_filtered_low_liquidity` | int | Pairs filtered for low liquidity |
+| `pairs_filtered_high_spread` | int | Pairs filtered for high spread |
+
+#### Example Workflow
+
+```powershell
+# 1. Tune parameters with realistic costs
+poetry run pmq statarb tune --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml --fee-bps 2.0 --slippage-bps 5.0 \
+  --export-best config/statarb_best.yml
+
+# 2. Evaluate with same costs (auto-loaded from best.yml)
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --statarb-params config/statarb_best.yml
+
+# 3. Sensitivity analysis: higher costs
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --fee-bps 5.0 --slippage-bps 10.0
+
+# 4. Add constraint filtering
+poetry run pmq eval run --strategy statarb --version zscore-v1 \
+  --pairs config/pairs.yml --min-liquidity 1000 --max-spread 0.02
+```
+
+> 💡 **Why Realism Matters:** Evaluation should use the same cost assumptions that will apply in live trading. Phase 4.8 ensures costs and constraints are explicit, configurable, and transparently reported.
+
 ## Project Structure
 
 ```
@@ -1226,12 +1349,20 @@ poetry run mypy src
 - [x] Market constraint filtering (min_liquidity, max_spread)
 - [x] Cost assumptions in evaluation reports
 
-### Phase 4.7 (Current) ✓
+### Phase 4.7 ✓
 - [x] Quality window alignment with walk-forward evaluation
 - [x] `check_explicit_window()` for proper expected/observed computation
 - [x] Effective window quality fields in EvaluationResult
 - [x] Approval gate uses aligned quality percentage
 - [x] Reporter shows effective window quality section
+
+### Phase 4.8 ✓
+- [x] Eval pipeline realism: costs + constraints for StatArb
+- [x] CLI flags (`--fee-bps`, `--slippage-bps`, `--min-liquidity`, `--max-spread`)
+- [x] Precedence rules (CLI > YAML > defaults)
+- [x] Constraint filtering with pair counts in reports
+- [x] Cost Assumptions section in evaluation reports
+- [x] Constraint Filtering section in evaluation reports
 
 ### Phase 5 (Future)
 - [ ] Authenticated CLOB integration

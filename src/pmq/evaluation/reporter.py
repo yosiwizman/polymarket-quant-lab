@@ -246,6 +246,19 @@ class EvaluationReporter:
                     for key, value in result.statarb_params.items():
                         lines.append(f"- **{key}:** {value}")
                     lines.append("")
+
+                    # Cost assumptions section (Phase 4.6)
+                    fee = result.statarb_params.get("fee_bps", 2.0)
+                    slip = result.statarb_params.get("slippage_bps", 5.0)
+                    lines.extend(
+                        [
+                            "### Cost Assumptions",
+                            "",
+                            f"- **Fee:** {fee} bps",
+                            f"- **Slippage:** {slip} bps",
+                            "",
+                        ]
+                    )
                 lines.append(
                     "*Note: Scorecard evaluated on TEST only (walk-forward, no data leakage)*"
                 )

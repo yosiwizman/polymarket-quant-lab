@@ -774,14 +774,17 @@ class EvaluationPipeline:
 
         Falls back to defaults if file doesn't exist.
         """
+        # Realistic cost defaults for Phase 4.6
+        # fee_bps=2.0 approximates Polymarket maker/taker fees
+        # slippage_bps=5.0 accounts for market impact on entry/exit
         defaults = {
             "lookback": 30,
             "entry_z": 2.0,
             "exit_z": 0.5,
             "max_hold_bars": 60,
             "cooldown_bars": 5,
-            "fee_bps": 0.0,
-            "slippage_bps": 0.0,
+            "fee_bps": 2.0,
+            "slippage_bps": 5.0,
         }
 
         # Try explicit path first

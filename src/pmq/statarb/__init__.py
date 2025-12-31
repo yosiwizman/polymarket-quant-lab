@@ -1,8 +1,15 @@
 """Statistical arbitrage module for pairs trading.
 
 Phase 4.3: Z-score based mean-reversion with walk-forward evaluation.
+Phase 4.6: Realistic costs and market constraints.
 """
 
+from pmq.statarb.constraints import (
+    ConstraintResult,
+    FilterReason,
+    apply_market_constraints,
+    constraint_result_to_dict,
+)
 from pmq.statarb.discovery import (
     CandidatePair,
     compute_correlation,
@@ -48,6 +55,11 @@ from pmq.statarb.zscore import (
 )
 
 __all__ = [
+    # Constraints (Phase 4.6)
+    "ConstraintResult",
+    "FilterReason",
+    "apply_market_constraints",
+    "constraint_result_to_dict",
     # Discovery
     "CandidatePair",
     "compute_correlation",

@@ -3244,6 +3244,14 @@ def statarb_tune(
         Path | None,
         typer.Option("--export-best", help="Export best config to YAML file"),
     ] = None,
+    fee_bps: Annotated[
+        float | None,
+        typer.Option("--fee-bps", help="Override fee in basis points (default: 2.0)"),
+    ] = None,
+    slippage_bps: Annotated[
+        float | None,
+        typer.Option("--slippage-bps", help="Override slippage in basis points (default: 5.0)"),
+    ] = None,
 ) -> None:
     """Run grid search to find optimal statarb parameters.
 
@@ -3294,7 +3302,16 @@ def statarb_tune(
         grid = GridConfig()
         console.print("[cyan]Using default grid config[/cyan]")
 
+    # Apply CLI overrides for costs (Phase 4.6)
+    if fee_bps is not None:
+        grid.fee_bps = [fee_bps]
+        console.print(f"[cyan]Using fee_bps override: {fee_bps}[/cyan]")
+    if slippage_bps is not None:
+        grid.slippage_bps = [slippage_bps]
+        console.print(f"[cyan]Using slippage_bps override: {slippage_bps}[/cyan]")
+
     console.print(f"[cyan]Grid has {grid.total_combinations} parameter combinations[/cyan]")
+    console.print(f"[cyan]Costs: fee_bps={grid.fee_bps}, slippage_bps={grid.slippage_bps}[/cyan]")
 
     # Get market IDs from pairs
     pair_market_ids = set()
@@ -3374,6 +3391,8 @@ def statarb_tune(
     console.print(f"  exit_z: {best.params['exit_z']}")
     console.print(f"  max_hold_bars: {best.params['max_hold_bars']}")
     console.print(f"  cooldown_bars: {best.params['cooldown_bars']}")
+    console.print(f"  fee_bps: {best.params['fee_bps']}")
+    console.print(f"  slippage_bps: {best.params['slippage_bps']}")
     console.print(f"  TEST Sharpe: {best.sharpe:.3f}")
     console.print(f"  TEST PnL: ${best.pnl:.2f}")
 
@@ -3434,6 +3453,14 @@ def statarb_walkforward(
         int,
         typer.Option("--max-hold", help="Max bars before forced exit"),
     ] = 60,
+    fee_bps: Annotated[
+        float,
+        typer.Option("--fee-bps", help="Fee in basis points (default: 2.0)"),
+    ] = 2.0,
+    slippage_bps: Annotated[
+        float,
+        typer.Option("--slippage-bps", help="Slippage in basis points (default: 5.0)"),
+    ] = 5.0,
 ) -> None:
     """Run single walk-forward evaluation with z-score signals.
 
@@ -3460,6 +3487,8 @@ def statarb_walkforward(
         entry_z=entry_z,
         exit_z=exit_z,
         max_hold_bars=max_hold_bars,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
     )
 
     # Display results
@@ -3535,6 +3564,8 @@ def statarb_walkforward(
     console.print(f"  entry_z: {config.get('entry_z', '?')}")
     console.print(f"  exit_z: {config.get('exit_z', '?')}")
     console.print(f"  max_hold_bars: {config.get('max_hold_bars', '?')}")
+    console.print(f"  fee_bps: {config.get('fee_bps', '?')}")
+    console.print(f"  slippage_bps: {config.get('slippage_bps', '?')}")
 
 
 if __name__ == "__main__":

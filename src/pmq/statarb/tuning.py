@@ -32,8 +32,9 @@ class GridConfig:
     exit_z: list[float] = field(default_factory=lambda: [0.3, 0.5, 0.7])
     max_hold_bars: list[int] = field(default_factory=lambda: [30, 60, 120])
     cooldown_bars: list[int] = field(default_factory=lambda: [5])
-    fee_bps: list[float] = field(default_factory=lambda: [0.0])
-    slippage_bps: list[float] = field(default_factory=lambda: [0.0])
+    # Realistic cost defaults for Phase 4.6
+    fee_bps: list[float] = field(default_factory=lambda: [2.0])
+    slippage_bps: list[float] = field(default_factory=lambda: [5.0])
 
     @property
     def total_combinations(self) -> int:

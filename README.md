@@ -968,6 +968,85 @@ poetry run pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 \
 
 > ⚠️ **Why Costs Matter:** Zero-cost backtests are unrealistically optimistic. Real trading incurs fees, spreads, and slippage. Phase 4.6 defaults ensure evaluation results are closer to live performance.
 
+### Quality Window Alignment with Walk-Forward (Phase 4.7)
+
+Phase 4.7 fixes "false-negative" Data Quality failures by aligning quality scoring with the actual contiguous evaluation window (TRAIN+TEST) used by walk-forward evaluation.
+
+#### The Problem
+
+Previously, the quality check computed coverage against the *requested* window size, not the *effective* window actually used by walk-forward:
+
+1. User requests `--train-times 100 --test-times 50` (150 total)
+2. Only 93 contiguous times are available due to gaps
+3. Walk-forward scales down to use 62 train + 31 test = 93 times
+4. Quality was evaluated against 150 expected → 62% coverage → FAIL
+5. But the actual evaluation used all 93 available times → should be 100%
+
+This caused false Data Quality failures when data was actually sufficient.
+
+#### The Solution
+
+After walk-forward determines its effective window (train_from to test_to), the pipeline re-evaluates quality on that exact window:
+
+```
+# Before Phase 4.7
+Quality: 62/150 expected = 41.3% → FAIL (false negative)
+
+# After Phase 4.7  
+Effective Quality: 93/93 expected = 100% → PASS
+```
+
+#### Effective Window Quality in Reports
+
+Evaluation reports now include an "Effective Window Quality" section when walk-forward is used:
+
+```markdown
+### Effective Window Quality (Aligned with Walk-Forward)
+
+- **Effective Window:** 2025-01-01T00:00:00 → 2025-01-01T01:33:00
+- **Expected Points:** 94
+- **Observed Points:** 93
+- **Quality Pct:** 98.9%
+
+*Quality re-evaluated on the exact window used by walk-forward (TRAIN+TEST)*
+```
+
+#### How It Works
+
+1. Initial quality check runs with requested window size
+2. Walk-forward scales train/test if fewer times available
+3. Walk-forward returns effective window boundaries (`train_from` to `test_to`)
+4. Quality is re-checked on the effective window using `check_explicit_window()`
+5. Scorecard uses the effective quality percentage for approval
+6. Reports surface both requested and effective quality metrics
+
+#### New Fields in EvaluationResult
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `effective_window_from` | str | Start of effective window (train start) |
+| `effective_window_to` | str | End of effective window (test end) |
+| `effective_expected_points` | int | Expected points for effective window |
+| `effective_observed_points` | int | Actual distinct times in effective window |
+| `effective_quality_pct` | float | Coverage % for effective window |
+| `quality_window_aligned` | bool | True when quality was re-checked on effective window |
+
+#### CLI: Explicit Window Quality
+
+The `snapshots quality` command now uses proper expected/observed computation for explicit windows:
+
+```powershell
+# Check quality for a specific time range
+poetry run pmq snapshots quality --from 2024-12-01T00:00:00 --to 2024-12-01T01:00:00 --interval 60
+
+# Output shows expected vs observed points
+# Expected: floor((end-start)/interval)+1 = 61 points
+# Observed: actual distinct snapshot times = 58 points  
+# Coverage: 58/61 = 95.1%
+```
+
+> 💡 **Why Alignment Matters:** Governance should evaluate quality on the same window that trades are evaluated on. Misaligned windows cause false negatives (rejecting good strategies) or false positives (approving strategies with data issues).
+
 ## Project Structure
 
 ```
@@ -1125,12 +1204,34 @@ poetry run mypy src
 - [x] Evaluation pipeline integration (`--pairs` flag)
 - [x] Pairs config artifacts in evaluation reports
 
-### Phase 4.2 (Current) ✅
+### Phase 4.2 ✓
 - [x] `pmq statarb discover` - Correlation-based pair discovery
 - [x] `pmq statarb validate` - Validate overlap in date range
 - [x] Deterministic discovery output (same inputs → same outputs)
 - [x] Discovery tests (correlation, overlap, determinism)
 - [x] Documentation: StatArb Quickstart
+
+### Phase 4.3-4.4 ✓
+- [x] Walk-forward evaluation for statarb z-score
+- [x] Train/test split with fitted pair parameters
+- [x] Scorecard evaluated on TEST only (no data leakage)
+
+### Phase 4.5 ✓
+- [x] Gap-aware contiguous data windows
+- [x] Prevents old session gaps from penalizing recent healthy data
+- [x] Contiguous mode in quality checks and walk-forward
+
+### Phase 4.6 ✓
+- [x] Realistic transaction costs (fee_bps, slippage_bps)
+- [x] Market constraint filtering (min_liquidity, max_spread)
+- [x] Cost assumptions in evaluation reports
+
+### Phase 4.7 (Current) ✓
+- [x] Quality window alignment with walk-forward evaluation
+- [x] `check_explicit_window()` for proper expected/observed computation
+- [x] Effective window quality fields in EvaluationResult
+- [x] Approval gate uses aligned quality percentage
+- [x] Reporter shows effective window quality section
 
 ### Phase 5 (Future)
 - [ ] Authenticated CLOB integration

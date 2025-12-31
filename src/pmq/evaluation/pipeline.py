@@ -99,6 +99,15 @@ class EvaluationResult:
     requested_times: int = 0
     actual_times: int = 0
 
+    # Effective window quality fields (Phase 4.7)
+    # Quality evaluated on the exact window walk-forward actually used
+    effective_window_from: str = ""
+    effective_window_to: str = ""
+    effective_expected_points: int = 0
+    effective_observed_points: int = 0
+    effective_quality_pct: float = 0.0
+    quality_window_aligned: bool = False  # True when quality was re-checked on effective window
+
     # Summary
     summary: str = ""
     commands: list[str] = field(default_factory=list)
@@ -367,6 +376,30 @@ class EvaluationPipeline:
             result.backtest_win_rate = backtest_result["metrics"].win_rate
             result.backtest_max_drawdown = backtest_result["metrics"].max_drawdown
             result.backtest_total_trades = backtest_result["metrics"].total_trades
+
+            # Phase 4.7: Re-check quality on the effective window used by walk-forward
+            # This ensures governance evaluates quality on the same window as trades
+            effective_from = result.train_window_from
+            effective_to = result.test_window_to
+            if effective_from and effective_to:
+                effective_quality = self._quality_checker.check_explicit_window(
+                    start_time=effective_from,
+                    end_time=effective_to,
+                    expected_interval_seconds=interval_seconds,
+                )
+                result.effective_window_from = effective_from
+                result.effective_window_to = effective_to
+                result.effective_expected_points = effective_quality.notes.get("expected_times", 0)
+                result.effective_observed_points = effective_quality.notes.get("observed_times", 0)
+                result.effective_quality_pct = effective_quality.coverage_pct
+                result.quality_window_aligned = True
+                logger.info(
+                    f"Quality aligned to effective window: "
+                    f"{effective_from[:19]} to {effective_to[:19]}, "
+                    f"expected={result.effective_expected_points}, "
+                    f"observed={result.effective_observed_points}, "
+                    f"quality={result.effective_quality_pct:.1f}%"
+                )
         else:
             # Standard backtest path
             backtest_cmd = (
@@ -450,11 +483,17 @@ class EvaluationPipeline:
         # Step 3: Approval evaluation (standard mode)
         self._log_command(f"pmq approve evaluate --run-id {backtest_result['run_id']}")
 
+        # Phase 4.7: Use effective quality pct when quality was aligned with walk-forward window
+        effective_quality_value: float | None = (
+            result.effective_quality_pct if result.quality_window_aligned else None
+        )
+
         scorecard = self._evaluate_approval(
             metrics=backtest_result["metrics"],
             quality_result=quality_result,
             initial_balance=initial_balance,
             validation_mode=(strategy_name == "observer"),
+            effective_quality_pct=effective_quality_value,
         )
 
         result.backtest_score = scorecard.score
@@ -859,8 +898,26 @@ class EvaluationPipeline:
         quality_result: QualityResult,
         initial_balance: float,
         validation_mode: bool = False,
+        effective_quality_pct: float | None = None,
     ) -> Any:
-        """Evaluate strategy for approval."""
+        """Evaluate strategy for approval.
+
+        Args:
+            metrics: Backtest metrics
+            quality_result: Quality result from initial check
+            initial_balance: Initial balance for backtest
+            validation_mode: If True, use validation mode thresholds
+            effective_quality_pct: If provided (Phase 4.7), use this quality pct
+                instead of quality_result.coverage_pct. This is quality re-checked
+                on the effective window used by walk-forward.
+        """
+        # Phase 4.7: Use effective quality pct if available (aligned with walk-forward window)
+        quality_pct = (
+            effective_quality_pct
+            if effective_quality_pct is not None
+            else quality_result.coverage_pct
+        )
+
         return compute_scorecard(
             total_pnl=metrics.total_pnl,
             max_drawdown=metrics.max_drawdown,
@@ -870,7 +927,7 @@ class EvaluationPipeline:
             trades_per_day=metrics.trades_per_day,
             capital_utilization=metrics.capital_utilization,
             initial_balance=initial_balance,
-            data_quality_pct=quality_result.coverage_pct,
+            data_quality_pct=quality_pct,
             validation_mode=validation_mode,
             data_quality_status=quality_result.status,
             maturity_score=quality_result.maturity_score,

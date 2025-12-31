@@ -467,6 +467,94 @@ class QualityChecker:
 
         return result
 
+    def check_explicit_window(
+        self,
+        start_time: str,
+        end_time: str,
+        expected_interval_seconds: int = 60,
+    ) -> QualityResult:
+        """Check quality for an explicit time window (Phase 4.7).
+
+        Computes expected points based on the time range:
+        - expected_points = floor((end - start) / interval) + 1
+        - observed_points = actual distinct snapshot times in window
+        - quality_pct = observed_points / expected_points * 100
+
+        This is used to evaluate quality on the exact effective window
+        used by walk-forward evaluation.
+
+        Args:
+            start_time: Start of window (ISO format)
+            end_time: End of window (ISO format)
+            expected_interval_seconds: Expected interval between snapshots
+
+        Returns:
+            QualityResult with explicit window quality metrics
+        """
+        # Calculate expected points for this window
+        expected_points = self._calculate_expected_times(
+            start_time, end_time, expected_interval_seconds
+        )
+
+        # Get coverage info
+        coverage = self._dao.get_snapshot_coverage(start_time, end_time)
+        observed_points = coverage["distinct_times"]
+
+        # Calculate coverage percentage based on expected vs observed
+        if expected_points > 0:
+            coverage_pct = (observed_points / expected_points) * 100
+            coverage_pct = min(100.0, coverage_pct)
+        else:
+            coverage_pct = 0.0
+
+        # Check for gaps
+        gaps = self._check_gaps(start_time, end_time, expected_interval_seconds)
+
+        # Check for duplicates
+        duplicates = self._dao.get_duplicate_snapshots(start_time, end_time)
+        duplicate_count = sum(d["dup_count"] - 1 for d in duplicates)
+
+        # Determine status
+        if observed_points < MIN_SNAPSHOTS_FOR_QUALITY:
+            status = QualityStatus.INSUFFICIENT_DATA
+        elif coverage_pct >= 80 and duplicate_count == 0:
+            status = QualityStatus.SUFFICIENT
+        elif coverage_pct >= 50:
+            status = QualityStatus.DEGRADED
+        else:
+            status = QualityStatus.INSUFFICIENT_DATA
+
+        # Calculate maturity
+        maturity = self._calculate_maturity(observed_points, coverage_pct, duplicate_count)
+
+        return QualityResult(
+            window_from=start_time,
+            window_to=end_time,
+            expected_interval_seconds=expected_interval_seconds,
+            window_mode=WindowMode.EXPLICIT,
+            markets_seen=coverage["markets_covered"],
+            snapshots_written=coverage["total_snapshots"],
+            missing_intervals=len(gaps),
+            largest_gap_seconds=max((g.gap_seconds for g in gaps), default=0.0),
+            duplicate_count=duplicate_count,
+            stale_market_count=self._count_stale_markets(end_time),
+            coverage_pct=coverage_pct,
+            status=status,
+            maturity_score=maturity,
+            ready_for_scorecard=maturity >= MATURITY_READY_THRESHOLD,
+            gaps=gaps,
+            top_gap_markets=self._find_gap_markets(start_time, end_time, expected_interval_seconds),
+            notes={
+                "distinct_snapshot_times": observed_points,
+                "expected_times": expected_points,
+                "observed_times": observed_points,
+                "duplicate_entries": len(duplicates),
+                "min_snapshots_required": MIN_SNAPSHOTS_FOR_QUALITY,
+                "window_mode": "explicit",
+                "quality_note": f"Quality evaluated on explicit window: {start_time[:19]} to {end_time[:19]}",
+            },
+        )
+
     def check_last_times(
         self,
         limit: int = 30,

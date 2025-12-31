@@ -210,6 +210,22 @@ class EvaluationReporter:
             if result.gap_cutoff_time:
                 lines.append(f"- **Gap Cutoff:** {result.gap_cutoff_time}")
 
+        # Add effective window quality info (Phase 4.7)
+        if result.quality_window_aligned:
+            lines.extend(
+                [
+                    "",
+                    "### Effective Window Quality (Aligned with Walk-Forward)",
+                    "",
+                    f"- **Effective Window:** {result.effective_window_from[:19]} → {result.effective_window_to[:19]}",
+                    f"- **Expected Points:** {result.effective_expected_points}",
+                    f"- **Observed Points:** {result.effective_observed_points}",
+                    f"- **Quality Pct:** {result.effective_quality_pct:.1f}%",
+                    "",
+                    "*Quality re-evaluated on the exact window used by walk-forward (TRAIN+TEST)*",
+                ]
+            )
+
         lines.append("")
 
         if result.backtest_run_id:

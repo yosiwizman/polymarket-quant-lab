@@ -1441,12 +1441,15 @@ def snapshots_quality(
             if use_contiguous:
                 window_desc += " (contiguous)"
         else:
+            # Phase 4.7: Use check_explicit_window for proper expected/observed computation
             assert from_date is not None and to_date is not None
-            result = reporter.generate_report(
-                start_time=from_date,
-                end_time=to_date,
+            # Normalize times
+            start_time = from_date if "T" in from_date else f"{from_date}T00:00:00+00:00"
+            end_time = to_date if "T" in to_date else f"{to_date}T23:59:59+00:00"
+            result = checker.check_explicit_window(
+                start_time=start_time,
+                end_time=end_time,
                 expected_interval_seconds=interval,
-                save=True,
             )
             window_desc = f"{from_date} to {to_date}"
 

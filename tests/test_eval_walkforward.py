@@ -148,8 +148,9 @@ class TestParamsLoading:
         assert params["exit_z"] == 0.5
         assert params["max_hold_bars"] == 60
         assert params["cooldown_bars"] == 5
-        assert params["fee_bps"] == 0.0
-        assert params["slippage_bps"] == 0.0
+        # Phase 4.6: Realistic cost defaults
+        assert params["fee_bps"] == 2.0
+        assert params["slippage_bps"] == 5.0
 
     def test_parse_flat_yaml(self, tmp_path: Path) -> None:
         """Parse YAML with flat structure."""
@@ -170,9 +171,9 @@ max_hold_bars: 30
         assert params["entry_z"] == 2.5
         assert params["exit_z"] == 0.3
         assert params["max_hold_bars"] == 30
-        # Defaults for missing keys
+        # Defaults for missing keys (Phase 4.6 realistic costs)
         assert params["cooldown_bars"] == 5
-        assert params["fee_bps"] == 0.0
+        assert params["fee_bps"] == 2.0
 
     def test_parse_nested_yaml(self, tmp_path: Path) -> None:
         """Parse YAML with 'statarb' nested key (from tuning output)."""

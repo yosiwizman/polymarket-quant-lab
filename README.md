@@ -886,6 +886,88 @@ poetry run pmq eval export --id <eval-id> --format md
 
 > 💡 **Why Contiguous?** Old snapshot sessions with gaps shouldn't penalize recent healthy data. Contiguous mode ensures quality metrics reflect the actual usable data window, preventing false "NOT READY" results.
 
+### Realistic Costs + Market Constraints (Phase 4.6)
+
+Phase 4.6 adds realistic transaction cost modeling and market constraint filtering to prevent overly optimistic evaluation results.
+
+#### Cost Model
+
+All evaluation commands now use realistic cost defaults:
+- **fee_bps**: 2.0 bps (approximates Polymarket maker/taker fees)
+- **slippage_bps**: 5.0 bps (accounts for market impact)
+
+```powershell
+# Tuning with default costs (fee_bps=2.0, slippage_bps=5.0)
+poetry run pmq statarb tune --from 2024-12-01 --to 2024-12-30 --pairs config/pairs.yml
+
+# Override costs for sensitivity analysis
+poetry run pmq statarb tune --from 2024-12-01 --to 2024-12-30 --pairs config/pairs.yml \
+  --fee-bps 5.0 --slippage-bps 10.0
+
+# Walk-forward with custom costs
+poetry run pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml --fee-bps 3.0 --slippage-bps 8.0
+```
+
+#### Cost Impact
+
+Costs are applied consistently:
+1. **Entry**: Pay `(fee_bps + slippage_bps) × notional` on position entry
+2. **Exit**: Pay `(fee_bps + slippage_bps) × notional` on position exit
+3. **Net PnL**: Raw PnL minus total costs
+
+Reports now show cost assumptions:
+
+```
+### Cost Assumptions
+- Fee: 2.0 bps
+- Slippage: 5.0 bps
+```
+
+#### Market Constraints
+
+Pairs can define optional liquidity and spread constraints in `pairs.yml`:
+
+```yaml
+pairs:
+  - market_a_id: "0x..."
+    market_b_id: "0x..."
+    name: "ETH_YES/BTC_YES"
+    enabled: true
+    min_liquidity: 1000.0    # Filter if avg liquidity < 1000
+    max_spread: 0.02         # Filter if avg spread > 2%
+```
+
+During walk-forward evaluation:
+- Pairs violating constraints are filtered BEFORE fitting
+- Filter reasons are logged and included in results
+- Reports show `eligible_pairs / total_pairs` counts
+
+#### CLI Flags
+
+| Command | Flag | Default | Description |
+|---------|------|---------|-------------|
+| `statarb tune` | `--fee-bps` | 2.0 | Fee in basis points |
+| `statarb tune` | `--slippage-bps` | 5.0 | Slippage in basis points |
+| `statarb walkforward` | `--fee-bps` | 2.0 | Fee in basis points |
+| `statarb walkforward` | `--slippage-bps` | 5.0 | Slippage in basis points |
+
+#### Example: Cost Sensitivity
+
+```powershell
+# Compare no-cost vs realistic costs
+poetry run pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml --fee-bps 0 --slippage-bps 0  # Optimistic
+
+poetry run pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml --fee-bps 2 --slippage-bps 5  # Realistic (default)
+
+poetry run pmq statarb walkforward --from 2024-12-01 --to 2024-12-30 \
+  --pairs config/pairs.yml --fee-bps 5 --slippage-bps 10 # Conservative
+```
+
+> ⚠️ **Why Costs Matter:** Zero-cost backtests are unrealistically optimistic. Real trading incurs fees, spreads, and slippage. Phase 4.6 defaults ensure evaluation results are closer to live performance.
+
 ## Project Structure
 
 ```

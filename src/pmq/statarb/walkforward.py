@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pmq.logging import get_logger
+from pmq.statarb.constraints import ConstraintResult, apply_market_constraints
 from pmq.statarb.pairs_config import PairConfig
 from pmq.statarb.zscore import (
     FittedParams,
@@ -158,6 +159,8 @@ class WalkForwardResult:
     test_metrics: WalkForwardMetrics
     pair_summaries: list[dict[str, Any]]
     config_used: dict[str, Any]
+    # Phase 4.6: Constraint filtering results
+    constraint_result: ConstraintResult | None = None
 
 
 def extract_pair_prices(
@@ -501,15 +504,17 @@ def run_walk_forward(
     exit_z: float = 0.5,
     max_hold_bars: int = 60,
     cooldown_bars: int = 5,
-    fee_bps: float = 0.0,
-    slippage_bps: float = 0.0,
+    fee_bps: float = 2.0,
+    slippage_bps: float = 5.0,
     quantity_per_trade: float = 10.0,
+    enforce_constraints: bool = True,
 ) -> WalkForwardResult:
     """Run complete walk-forward evaluation.
 
-    1. Split times into TRAIN and TEST
-    2. Fit parameters on TRAIN
-    3. Generate signals and compute metrics on TEST
+    1. Apply market constraints to filter pairs (Phase 4.6)
+    2. Split times into TRAIN and TEST
+    3. Fit parameters on TRAIN
+    4. Generate signals and compute metrics on TEST
 
     Args:
         snapshots: All snapshots (will be filtered by time)
@@ -521,9 +526,10 @@ def run_walk_forward(
         exit_z: Exit threshold
         max_hold_bars: Max hold period
         cooldown_bars: Cooldown after exit
-        fee_bps: Fee in basis points
-        slippage_bps: Slippage in basis points
+        fee_bps: Fee in basis points (default 2.0)
+        slippage_bps: Slippage in basis points (default 5.0)
         quantity_per_trade: Quantity per trade
+        enforce_constraints: Apply min_liquidity/max_spread filters (default True)
 
     Returns:
         WalkForwardResult with full evaluation data
@@ -538,6 +544,15 @@ def run_walk_forward(
         f"Walk-forward split: {split.train_count} TRAIN, {split.test_count} TEST "
         f"(total {split.total_count})"
     )
+
+    # Apply market constraints (Phase 4.6)
+    constraint_result = apply_market_constraints(
+        pairs=pairs,
+        snapshots=snapshots,
+        times=all_times,
+        enforce_constraints=enforce_constraints,
+    )
+    eligible_pairs = constraint_result.eligible_pairs
 
     if split.train_count == 0:
         logger.warning("No TRAIN data available")
@@ -560,18 +575,19 @@ def run_walk_forward(
             ),
             pair_summaries=[],
             config_used={},
+            constraint_result=constraint_result,
         )
 
-    # Fit on TRAIN
-    fitted_params = fit_all_pairs(snapshots, pairs, split.train_times)
+    # Fit on TRAIN (only eligible pairs after constraint filtering)
+    fitted_params = fit_all_pairs(snapshots, eligible_pairs, split.train_times)
 
     valid_pairs = sum(1 for p in fitted_params.values() if p.is_valid)
-    logger.info(f"Fitted {valid_pairs}/{len(pairs)} pairs successfully")
+    logger.info(f"Fitted {valid_pairs}/{len(eligible_pairs)} pairs successfully")
 
-    # Evaluate on TEST
+    # Evaluate on TEST (only eligible pairs)
     signals, test_metrics, pair_summaries = evaluate_test_period(
         snapshots=snapshots,
-        pairs=pairs,
+        pairs=eligible_pairs,
         fitted_params=fitted_params,
         test_times=split.test_times,
         lookback=lookback,
@@ -612,12 +628,15 @@ def run_walk_forward(
         test_metrics=test_metrics,
         pair_summaries=pair_summaries,
         config_used=config_used,
+        constraint_result=constraint_result,
     )
 
 
 def result_to_dict(result: WalkForwardResult) -> dict[str, Any]:
     """Convert WalkForwardResult to dict for serialization."""
-    return {
+    from pmq.statarb.constraints import constraint_result_to_dict
+
+    d: dict[str, Any] = {
         "split": {
             "train_count": result.split.train_count,
             "test_count": result.split.test_count,
@@ -654,3 +673,9 @@ def result_to_dict(result: WalkForwardResult) -> dict[str, Any]:
         "config_used": result.config_used,
         "signal_count": len(result.signals),
     }
+
+    # Add constraint info (Phase 4.6)
+    if result.constraint_result:
+        d["constraints"] = constraint_result_to_dict(result.constraint_result)
+
+    return d

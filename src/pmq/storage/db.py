@@ -71,6 +71,44 @@ class Database:
         conn.executescript(schema_sql)
         logger.info("Database schema initialized")
 
+        # Run migrations for backward compatibility
+        self._run_migrations()
+
+    def _run_migrations(self) -> None:
+        """Run schema migrations for backward compatibility.
+
+        Adds new columns to existing tables if they don't exist.
+        """
+        # Phase 4.9: Add microstructure columns to market_snapshots
+        microstructure_columns = [
+            ("best_bid", "REAL"),
+            ("best_ask", "REAL"),
+            ("mid_price", "REAL"),
+            ("spread_bps", "REAL"),
+            ("top_depth_usd", "REAL"),
+        ]
+
+        for col_name, col_type in microstructure_columns:
+            if not self._column_exists("market_snapshots", col_name):
+                try:
+                    self.execute(f"ALTER TABLE market_snapshots ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Added column {col_name} to market_snapshots")
+                except Exception as e:
+                    logger.debug(f"Column {col_name} may already exist: {e}")
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        """Check if a column exists in a table.
+
+        Args:
+            table_name: Name of the table
+            column_name: Name of the column
+
+        Returns:
+            True if column exists
+        """
+        result = self.fetch_all(f"PRAGMA table_info({table_name})")
+        return any(row["name"] == column_name for row in result)
+
     def execute(
         self,
         sql: str,

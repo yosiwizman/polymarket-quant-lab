@@ -323,10 +323,7 @@ def generate_signals(
     spreads = spread_series(prices_a, prices_b, fitted_params.beta)
 
     # Z-score using TRAIN mean/std (more stable than rolling)
-    zscores = [
-        (s - fitted_params.spread_mean) / fitted_params.spread_std
-        for s in spreads
-    ]
+    zscores = [(s - fitted_params.spread_mean) / fitted_params.spread_std for s in spreads]
 
     signals: list[ZScoreSignal] = []
     position = PositionState()
@@ -360,19 +357,21 @@ def generate_signals(
                 exit_reason = f"Max hold reached ({max_hold_bars} bars)"
 
             if should_exit:
-                signals.append(ZScoreSignal(
-                    time=t,
-                    pair_name=fitted_params.pair_name,
-                    market_a_id=fitted_params.market_a_id,
-                    market_b_id=fitted_params.market_b_id,
-                    action=SignalAction.EXIT,
-                    z_score=z,
-                    spread=spread,
-                    price_a=price_a,
-                    price_b=price_b,
-                    beta=fitted_params.beta,
-                    reason=exit_reason,
-                ))
+                signals.append(
+                    ZScoreSignal(
+                        time=t,
+                        pair_name=fitted_params.pair_name,
+                        market_a_id=fitted_params.market_a_id,
+                        market_b_id=fitted_params.market_b_id,
+                        action=SignalAction.EXIT,
+                        z_score=z,
+                        spread=spread,
+                        price_a=price_a,
+                        price_b=price_b,
+                        beta=fitted_params.beta,
+                        reason=exit_reason,
+                    )
+                )
                 position = PositionState()
                 cooldown_remaining = cooldown_bars
                 continue
@@ -381,19 +380,21 @@ def generate_signals(
         if not position.is_open and cooldown_remaining == 0:
             if z <= -entry_z:
                 # Spread is low, expect reversion up -> Long A, Short B
-                signals.append(ZScoreSignal(
-                    time=t,
-                    pair_name=fitted_params.pair_name,
-                    market_a_id=fitted_params.market_a_id,
-                    market_b_id=fitted_params.market_b_id,
-                    action=SignalAction.ENTER_LONG,
-                    z_score=z,
-                    spread=spread,
-                    price_a=price_a,
-                    price_b=price_b,
-                    beta=fitted_params.beta,
-                    reason=f"Z-score {z:.2f} <= -{entry_z}",
-                ))
+                signals.append(
+                    ZScoreSignal(
+                        time=t,
+                        pair_name=fitted_params.pair_name,
+                        market_a_id=fitted_params.market_a_id,
+                        market_b_id=fitted_params.market_b_id,
+                        action=SignalAction.ENTER_LONG,
+                        z_score=z,
+                        spread=spread,
+                        price_a=price_a,
+                        price_b=price_b,
+                        beta=fitted_params.beta,
+                        reason=f"Z-score {z:.2f} <= -{entry_z}",
+                    )
+                )
                 position = PositionState(
                     is_open=True,
                     direction="long",
@@ -404,19 +405,21 @@ def generate_signals(
                 )
             elif z >= entry_z:
                 # Spread is high, expect reversion down -> Short A, Long B
-                signals.append(ZScoreSignal(
-                    time=t,
-                    pair_name=fitted_params.pair_name,
-                    market_a_id=fitted_params.market_a_id,
-                    market_b_id=fitted_params.market_b_id,
-                    action=SignalAction.ENTER_SHORT,
-                    z_score=z,
-                    spread=spread,
-                    price_a=price_a,
-                    price_b=price_b,
-                    beta=fitted_params.beta,
-                    reason=f"Z-score {z:.2f} >= {entry_z}",
-                ))
+                signals.append(
+                    ZScoreSignal(
+                        time=t,
+                        pair_name=fitted_params.pair_name,
+                        market_a_id=fitted_params.market_a_id,
+                        market_b_id=fitted_params.market_b_id,
+                        action=SignalAction.ENTER_SHORT,
+                        z_score=z,
+                        spread=spread,
+                        price_a=price_a,
+                        price_b=price_b,
+                        beta=fitted_params.beta,
+                        reason=f"Z-score {z:.2f} >= {entry_z}",
+                    )
+                )
                 position = PositionState(
                     is_open=True,
                     direction="short",
@@ -428,19 +431,21 @@ def generate_signals(
 
     # Force exit at end if still in position
     if position.is_open and n > 0:
-        signals.append(ZScoreSignal(
-            time=times[-1],
-            pair_name=fitted_params.pair_name,
-            market_a_id=fitted_params.market_a_id,
-            market_b_id=fitted_params.market_b_id,
-            action=SignalAction.EXIT,
-            z_score=zscores[-1],
-            spread=spreads[-1],
-            price_a=prices_a[-1],
-            price_b=prices_b[-1],
-            beta=fitted_params.beta,
-            reason="End of period forced exit",
-        ))
+        signals.append(
+            ZScoreSignal(
+                time=times[-1],
+                pair_name=fitted_params.pair_name,
+                market_a_id=fitted_params.market_a_id,
+                market_b_id=fitted_params.market_b_id,
+                action=SignalAction.EXIT,
+                z_score=zscores[-1],
+                spread=spreads[-1],
+                price_a=prices_a[-1],
+                price_b=prices_b[-1],
+                beta=fitted_params.beta,
+                reason="End of period forced exit",
+            )
+        )
 
     return signals
 

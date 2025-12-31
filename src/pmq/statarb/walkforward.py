@@ -221,9 +221,7 @@ def fit_all_pairs(
     result: dict[str, FittedParams] = {}
 
     for pair in pairs:
-        common_times, prices_a, prices_b = extract_pair_prices(
-            snapshots, pair, train_times
-        )
+        common_times, prices_a, prices_b = extract_pair_prices(snapshots, pair, train_times)
 
         params = fit_pair_params(
             prices_a=prices_a,
@@ -286,25 +284,27 @@ def evaluate_test_period(
     for pair in pairs:
         params = fitted_params.get(pair.name)
         if not params or not params.is_valid:
-            pair_summaries.append({
-                "pair_name": pair.name,
-                "status": "skipped",
-                "reason": params.error_msg if params else "No fitted params",
-                "signals": 0,
-            })
+            pair_summaries.append(
+                {
+                    "pair_name": pair.name,
+                    "status": "skipped",
+                    "reason": params.error_msg if params else "No fitted params",
+                    "signals": 0,
+                }
+            )
             continue
 
-        common_times, prices_a, prices_b = extract_pair_prices(
-            snapshots, pair, test_times
-        )
+        common_times, prices_a, prices_b = extract_pair_prices(snapshots, pair, test_times)
 
         if len(common_times) < 5:
-            pair_summaries.append({
-                "pair_name": pair.name,
-                "status": "skipped",
-                "reason": f"Insufficient TEST data: {len(common_times)} points",
-                "signals": 0,
-            })
+            pair_summaries.append(
+                {
+                    "pair_name": pair.name,
+                    "status": "skipped",
+                    "reason": f"Insufficient TEST data: {len(common_times)} points",
+                    "signals": 0,
+                }
+            )
             continue
 
         signals = generate_signals(
@@ -321,17 +321,23 @@ def evaluate_test_period(
 
         all_signals.extend(signals)
 
-        pair_summaries.append({
-            "pair_name": pair.name,
-            "status": "evaluated",
-            "beta": params.beta,
-            "spread_mean": params.spread_mean,
-            "spread_std": params.spread_std,
-            "test_points": len(common_times),
-            "signals": len(signals),
-            "entries": sum(1 for s in signals if s.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT)),
-            "exits": sum(1 for s in signals if s.action == SignalAction.EXIT),
-        })
+        pair_summaries.append(
+            {
+                "pair_name": pair.name,
+                "status": "evaluated",
+                "beta": params.beta,
+                "spread_mean": params.spread_mean,
+                "spread_std": params.spread_std,
+                "test_points": len(common_times),
+                "signals": len(signals),
+                "entries": sum(
+                    1
+                    for s in signals
+                    if s.action in (SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT)
+                ),
+                "exits": sum(1 for s in signals if s.action == SignalAction.EXIT),
+            }
+        )
 
     # Compute metrics from signals
     metrics = compute_metrics_from_signals(
@@ -449,7 +455,7 @@ def compute_metrics_from_signals(
     if len(pnls) >= 2:
         mean_pnl = total_pnl / len(pnls)
         variance = sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls)
-        std_pnl = variance ** 0.5
+        std_pnl = variance**0.5
         sharpe_ratio = mean_pnl / std_pnl if std_pnl > 0 else 0.0
     else:
         sharpe_ratio = 0.0
@@ -541,9 +547,16 @@ def run_walk_forward(
             signals=[],
             train_metrics=None,
             test_metrics=WalkForwardMetrics(
-                total_pnl=0, sharpe_ratio=0, win_rate=0, max_drawdown=0,
-                total_trades=0, avg_trades_per_pair=0, total_fees=0, net_pnl=0,
-                entry_count=0, exit_count=0,
+                total_pnl=0,
+                sharpe_ratio=0,
+                win_rate=0,
+                max_drawdown=0,
+                total_trades=0,
+                avg_trades_per_pair=0,
+                total_fees=0,
+                net_pnl=0,
+                entry_count=0,
+                exit_count=0,
             ),
             pair_summaries=[],
             config_used={},

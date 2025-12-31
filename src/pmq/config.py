@@ -48,21 +48,15 @@ class StatArbConfig(BaseSettings):
     )
 
     # Z-score parameters
-    lookback: int = Field(
-        default=30, description="Rolling lookback window for z-score calculation"
-    )
+    lookback: int = Field(default=30, description="Rolling lookback window for z-score calculation")
     entry_z: float = Field(
         default=2.0, description="Z-score threshold to enter position (|z| >= entry_z)"
     )
     exit_z: float = Field(
         default=0.5, description="Z-score threshold to exit position (|z| <= exit_z)"
     )
-    max_hold_bars: int = Field(
-        default=60, description="Maximum bars to hold before forced exit"
-    )
-    cooldown_bars: int = Field(
-        default=5, description="Bars to wait after exit before new entry"
-    )
+    max_hold_bars: int = Field(default=60, description="Maximum bars to hold before forced exit")
+    cooldown_bars: int = Field(default=5, description="Bars to wait after exit before new entry")
 
     # Position limits
     max_open_pairs: int = Field(
@@ -76,23 +70,15 @@ class StatArbConfig(BaseSettings):
     )
 
     # Data quality filters
-    min_liquidity: float = Field(
-        default=100.0, description="Minimum liquidity per market in USD"
-    )
-    max_spread: float = Field(
-        default=0.5, description="Maximum bid-ask spread (as fraction)"
-    )
+    min_liquidity: float = Field(default=100.0, description="Minimum liquidity per market in USD")
+    max_spread: float = Field(default=0.5, description="Maximum bid-ask spread (as fraction)")
     min_overlap_points: int = Field(
         default=30, description="Minimum overlapping data points for pair"
     )
 
     # Transaction costs
-    fee_bps: float = Field(
-        default=0.0, description="Trading fee in basis points"
-    )
-    slippage_bps: float = Field(
-        default=0.0, description="Expected slippage in basis points"
-    )
+    fee_bps: float = Field(default=0.0, description="Trading fee in basis points")
+    slippage_bps: float = Field(default=0.0, description="Expected slippage in basis points")
 
     # Walk-forward defaults
     default_train_count: int = Field(

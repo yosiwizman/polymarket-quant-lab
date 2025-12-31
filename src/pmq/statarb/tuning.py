@@ -132,15 +132,17 @@ def generate_param_combinations(grid: GridConfig) -> list[dict[str, Any]]:
     Returns:
         List of parameter dicts, sorted deterministically
     """
-    combinations = list(itertools.product(
-        sorted(grid.lookback),
-        sorted(grid.entry_z),
-        sorted(grid.exit_z),
-        sorted(grid.max_hold_bars),
-        sorted(grid.cooldown_bars),
-        sorted(grid.fee_bps),
-        sorted(grid.slippage_bps),
-    ))
+    combinations = list(
+        itertools.product(
+            sorted(grid.lookback),
+            sorted(grid.entry_z),
+            sorted(grid.exit_z),
+            sorted(grid.max_hold_bars),
+            sorted(grid.cooldown_bars),
+            sorted(grid.fee_bps),
+            sorted(grid.slippage_bps),
+        )
+    )
 
     return [
         {
@@ -152,8 +154,7 @@ def generate_param_combinations(grid: GridConfig) -> list[dict[str, Any]]:
             "fee_bps": fee_bps,
             "slippage_bps": slippage_bps,
         }
-        for lookback, entry_z, exit_z, max_hold_bars, cooldown_bars, fee_bps, slippage_bps
-        in combinations
+        for lookback, entry_z, exit_z, max_hold_bars, cooldown_bars, fee_bps, slippage_bps in combinations
     ]
 
 
@@ -212,26 +213,30 @@ def run_grid_search(
                 quantity_per_trade=quantity_per_trade,
             )
 
-            results.append(TuningResult(
-                params=params,
-                pnl=wf_result.test_metrics.total_pnl,
-                sharpe=wf_result.test_metrics.sharpe_ratio,
-                win_rate=wf_result.test_metrics.win_rate,
-                max_drawdown=wf_result.test_metrics.max_drawdown,
-                total_trades=wf_result.test_metrics.total_trades,
-                net_pnl=wf_result.test_metrics.net_pnl,
-            ))
+            results.append(
+                TuningResult(
+                    params=params,
+                    pnl=wf_result.test_metrics.total_pnl,
+                    sharpe=wf_result.test_metrics.sharpe_ratio,
+                    win_rate=wf_result.test_metrics.win_rate,
+                    max_drawdown=wf_result.test_metrics.max_drawdown,
+                    total_trades=wf_result.test_metrics.total_trades,
+                    net_pnl=wf_result.test_metrics.net_pnl,
+                )
+            )
         except Exception as e:
             logger.warning(f"Failed combination {i + 1}: {e}")
-            results.append(TuningResult(
-                params=params,
-                pnl=0.0,
-                sharpe=0.0,
-                win_rate=0.0,
-                max_drawdown=0.0,
-                total_trades=0,
-                net_pnl=0.0,
-            ))
+            results.append(
+                TuningResult(
+                    params=params,
+                    pnl=0.0,
+                    sharpe=0.0,
+                    win_rate=0.0,
+                    max_drawdown=0.0,
+                    total_trades=0,
+                    net_pnl=0.0,
+                )
+            )
 
     # Sort by Sharpe (desc), then PnL (desc), then param values for determinism
     results.sort(
@@ -255,7 +260,9 @@ def run_grid_search(
 
     logger.info(
         f"Grid search complete. Best: Sharpe={top_results[0].sharpe:.3f}, "
-        f"PnL=${top_results[0].pnl:.2f}" if top_results else "No valid results"
+        f"PnL=${top_results[0].pnl:.2f}"
+        if top_results
+        else "No valid results"
     )
 
     return TuningLeaderboard(
@@ -283,41 +290,45 @@ def save_leaderboard_csv(leaderboard: TuningLeaderboard, path: Path | str) -> No
         writer = csv.writer(f)
 
         # Header
-        writer.writerow([
-            "rank",
-            "sharpe",
-            "pnl",
-            "net_pnl",
-            "win_rate",
-            "max_drawdown",
-            "trades",
-            "lookback",
-            "entry_z",
-            "exit_z",
-            "max_hold_bars",
-            "cooldown_bars",
-            "fee_bps",
-            "slippage_bps",
-        ])
+        writer.writerow(
+            [
+                "rank",
+                "sharpe",
+                "pnl",
+                "net_pnl",
+                "win_rate",
+                "max_drawdown",
+                "trades",
+                "lookback",
+                "entry_z",
+                "exit_z",
+                "max_hold_bars",
+                "cooldown_bars",
+                "fee_bps",
+                "slippage_bps",
+            ]
+        )
 
         # Results
         for result in leaderboard.results:
-            writer.writerow([
-                result.rank,
-                f"{result.sharpe:.4f}",
-                f"{result.pnl:.2f}",
-                f"{result.net_pnl:.2f}",
-                f"{result.win_rate:.4f}",
-                f"{result.max_drawdown:.4f}",
-                result.total_trades,
-                result.params["lookback"],
-                result.params["entry_z"],
-                result.params["exit_z"],
-                result.params["max_hold_bars"],
-                result.params["cooldown_bars"],
-                result.params["fee_bps"],
-                result.params["slippage_bps"],
-            ])
+            writer.writerow(
+                [
+                    result.rank,
+                    f"{result.sharpe:.4f}",
+                    f"{result.pnl:.2f}",
+                    f"{result.net_pnl:.2f}",
+                    f"{result.win_rate:.4f}",
+                    f"{result.max_drawdown:.4f}",
+                    result.total_trades,
+                    result.params["lookback"],
+                    result.params["entry_z"],
+                    result.params["exit_z"],
+                    result.params["max_hold_bars"],
+                    result.params["cooldown_bars"],
+                    result.params["fee_bps"],
+                    result.params["slippage_bps"],
+                ]
+            )
 
     logger.info(f"Saved leaderboard to {path}")
 

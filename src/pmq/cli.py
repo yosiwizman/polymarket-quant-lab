@@ -3293,7 +3293,9 @@ def statarb_tune(
         console.print(f"[green]✓ Exported best config to {export_best}[/green]")
 
     # Guidance
-    console.print("\n[dim]To use best config, set environment variables or update config file:[/dim]")
+    console.print(
+        "\n[dim]To use best config, set environment variables or update config file:[/dim]"
+    )
     console.print(f"[dim]  PMQ_STATARB_LOOKBACK={best.params['lookback']}[/dim]")
     console.print(f"[dim]  PMQ_STATARB_ENTRY_Z={best.params['entry_z']}[/dim]")
     console.print(f"[dim]  PMQ_STATARB_EXIT_Z={best.params['exit_z']}[/dim]")
@@ -3378,7 +3380,9 @@ def statarb_walkforward(
     split = wf_data.get("split", {})
     console.print("\n[bold]TRAIN Summary[/bold]")
     console.print(f"  Snapshots: {split.get('train_count', 0)}")
-    console.print(f"  Period: {split.get('first_train', '?')[:10]} to {split.get('last_train', '?')[:10]}")
+    console.print(
+        f"  Period: {split.get('first_train', '?')[:10]} to {split.get('last_train', '?')[:10]}"
+    )
 
     fitted = wf_data.get("fitted_params", {})
     valid_pairs = sum(1 for p in fitted.values() if p.get("is_valid", False))
@@ -3388,10 +3392,14 @@ def statarb_walkforward(
     test_m = wf_data.get("test_metrics", {})
     console.print("\n[bold]TEST Summary (Scorecard Metrics)[/bold]")
     console.print(f"  Snapshots: {split.get('test_count', 0)}")
-    console.print(f"  Period: {split.get('first_test', '?')[:10]} to {split.get('last_test', '?')[:10]}")
+    console.print(
+        f"  Period: {split.get('first_test', '?')[:10]} to {split.get('last_test', '?')[:10]}"
+    )
 
     pnl_color = "green" if metrics.total_pnl > 0 else "red"
-    sharpe_color = "green" if metrics.sharpe_ratio > 1.0 else "yellow" if metrics.sharpe_ratio > 0 else "red"
+    sharpe_color = (
+        "green" if metrics.sharpe_ratio > 1.0 else "yellow" if metrics.sharpe_ratio > 0 else "red"
+    )
     wr_color = "green" if metrics.win_rate > 0.5 else "yellow" if metrics.win_rate > 0.4 else "red"
 
     console.print(f"  Total PnL: [{pnl_color}]${metrics.total_pnl:.2f}[/{pnl_color}]")

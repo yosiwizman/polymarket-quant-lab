@@ -8,7 +8,6 @@ import pytest
 from pmq.statarb.pairs_config import PairConfig
 from pmq.statarb.tuning import GridConfig, generate_param_combinations
 from pmq.statarb.walkforward import (
-    WalkForwardMetrics,
     compute_metrics_from_signals,
     extract_pair_prices,
     split_times,
@@ -24,7 +23,6 @@ from pmq.statarb.zscore import (
     spread_series,
     zscore_series,
 )
-
 
 # =============================================================================
 # OLS Beta Tests
@@ -125,7 +123,7 @@ class TestRollingMeanStd:
         """Test rolling mean calculation."""
         values = [1.0, 2.0, 3.0, 4.0, 5.0]
         means, stds = rolling_mean_std(values, lookback=3)
-        
+
         # First few values use expanding window
         assert abs(means[0] - 1.0) < 1e-10  # Just first value
         assert abs(means[1] - 1.5) < 1e-10  # Mean of [1, 2]
@@ -148,12 +146,12 @@ class TestZScoreSeries:
         # Create data that will have known z-scores
         spreads = [0.0, 0.0, 0.0, 3.0, 0.0]  # Spike at index 3
         zscores = zscore_series(spreads, lookback=3)
-        
+
         # Z-scores should be 0 for first few, spike at index 3, then revert
         assert len(zscores) == 5
         # First value has no prior data for std, so z=0
         assert zscores[0] == 0.0
-        
+
     def test_constant_spreads(self) -> None:
         """Constant spreads should give z-score of 0."""
         spreads = [0.5, 0.5, 0.5, 0.5, 0.5]
@@ -174,14 +172,15 @@ class TestFitPairParams:
         """Test successful parameter fitting."""
         prices_a = [0.5, 0.52, 0.48, 0.55, 0.51, 0.49, 0.53, 0.50, 0.52, 0.48]
         prices_b = [0.45, 0.47, 0.44, 0.50, 0.46, 0.44, 0.48, 0.45, 0.47, 0.43]
-        
+
         params = fit_pair_params(
-            prices_a, prices_b,
+            prices_a,
+            prices_b,
             pair_name="Test Pair",
             market_a_id="market_a",
             market_b_id="market_b",
         )
-        
+
         assert params.is_valid
         assert params.pair_name == "Test Pair"
         assert params.train_count == 10
@@ -190,10 +189,7 @@ class TestFitPairParams:
 
     def test_insufficient_data(self) -> None:
         """Test with insufficient data."""
-        params = fit_pair_params(
-            [0.5, 0.52], [0.45, 0.47],
-            "Test", "a", "b"
-        )
+        params = fit_pair_params([0.5, 0.52], [0.45, 0.47], "Test", "a", "b")
         assert not params.is_valid
         assert "Insufficient TRAIN data" in params.error_msg
 
@@ -218,17 +214,23 @@ class TestGenerateSignals:
             train_count=20,
             is_valid=True,
         )
-        
+
         times = ["t1", "t2", "t3"]
         # Create spreads that give z-score <= -2.0
         prices_a = [0.3, 0.3, 0.3]  # Spread = 0.3 - 0.5 = -0.2
         prices_b = [0.5, 0.5, 0.5]  # z = (-0.2 - 0) / 0.1 = -2.0
-        
+
         signals = generate_signals(
-            times, prices_a, prices_b, params,
-            lookback=10, entry_z=2.0, exit_z=0.5, max_hold_bars=10
+            times,
+            prices_a,
+            prices_b,
+            params,
+            lookback=10,
+            entry_z=2.0,
+            exit_z=0.5,
+            max_hold_bars=10,
         )
-        
+
         # Should have entry signal
         assert len(signals) >= 1
         entry_signals = [s for s in signals if s.action == SignalAction.ENTER_LONG]
@@ -253,8 +255,14 @@ class TestGenerateSignals:
         prices_b = [0.5, 0.5, 0.5]  # z = (0.25 - 0) / 0.1 = 2.5
 
         signals = generate_signals(
-            times, prices_a, prices_b, params,
-            lookback=10, entry_z=2.0, exit_z=0.5, max_hold_bars=10
+            times,
+            prices_a,
+            prices_b,
+            params,
+            lookback=10,
+            entry_z=2.0,
+            exit_z=0.5,
+            max_hold_bars=10,
         )
 
         entry_signals = [s for s in signals if s.action == SignalAction.ENTER_SHORT]
@@ -273,10 +281,9 @@ class TestGenerateSignals:
             is_valid=False,
             error_msg="Invalid",
         )
-        
+
         signals = generate_signals(
-            ["t1"], [0.5], [0.5], params,
-            lookback=10, entry_z=2.0, exit_z=0.5, max_hold_bars=10
+            ["t1"], [0.5], [0.5], params, lookback=10, entry_z=2.0, exit_z=0.5, max_hold_bars=10
         )
         assert signals == []
 
@@ -293,7 +300,7 @@ class TestWalkForwardSplit:
         """Test basic TRAIN/TEST split."""
         times = ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10"]
         split = split_times(times, train_count=6, test_count=4)
-        
+
         assert split.train_count == 6
         assert split.test_count == 4
         assert split.train_times == ["t1", "t2", "t3", "t4", "t5", "t6"]
@@ -303,13 +310,13 @@ class TestWalkForwardSplit:
         """TRAIN and TEST should not overlap (no data leakage)."""
         times = [f"t{i}" for i in range(100)]
         split = split_times(times, train_count=70, test_count=30)
-        
+
         train_set = set(split.train_times)
         test_set = set(split.test_times)
-        
+
         # Ensure no overlap
         assert train_set.isdisjoint(test_set), "TRAIN and TEST must not overlap"
-        
+
         # Ensure chronological ordering
         if split.train_times and split.test_times:
             assert split.last_train < split.first_test, "TRAIN must come before TEST"
@@ -318,7 +325,7 @@ class TestWalkForwardSplit:
         """When insufficient data, should scale proportionally."""
         times = ["t1", "t2", "t3", "t4", "t5"]
         split = split_times(times, train_count=100, test_count=50)
-        
+
         # Should scale down proportionally
         assert split.train_count + split.test_count <= 5
         assert split.train_count > 0 or split.test_count > 0
@@ -340,7 +347,7 @@ class TestExtractPairPrices:
             market_b_id="market_b",
             name="Test Pair",
         )
-        
+
         snapshots = [
             {"market_id": "market_a", "snapshot_time": "t1", "yes_price": 0.5},
             {"market_id": "market_b", "snapshot_time": "t1", "yes_price": 0.4},
@@ -349,11 +356,9 @@ class TestExtractPairPrices:
             {"market_id": "market_a", "snapshot_time": "t3", "yes_price": 0.52},
             # Missing market_b at t3
         ]
-        
-        times, prices_a, prices_b = extract_pair_prices(
-            snapshots, pair, ["t1", "t2", "t3"]
-        )
-        
+
+        times, prices_a, prices_b = extract_pair_prices(snapshots, pair, ["t1", "t2", "t3"])
+
         # Should only have times where both markets have data
         assert len(times) == 2  # t1 and t2 only
         assert len(prices_a) == 2
@@ -380,7 +385,7 @@ class TestGridSearch:
             fee_bps=[0.0],
             slippage_bps=[0.0],
         )
-        
+
         combos = generate_param_combinations(grid)
         assert len(combos) == 2 * 2 * 1 * 1 * 1 * 1 * 1  # 4 combinations
 
@@ -389,7 +394,7 @@ class TestGridSearch:
         grid = GridConfig()
         combos1 = generate_param_combinations(grid)
         combos2 = generate_param_combinations(grid)
-        
+
         assert combos1 == combos2, "Grid combinations must be deterministic"
 
     def test_sorted_params(self) -> None:
@@ -398,9 +403,9 @@ class TestGridSearch:
             lookback=[50, 20, 30],  # Unsorted input
             entry_z=[2.5, 1.5, 2.0],
         )
-        
+
         combos = generate_param_combinations(grid)
-        
+
         # First combo should have smallest values
         assert combos[0]["lookback"] == 20
         assert combos[0]["entry_z"] == 1.5
@@ -419,7 +424,7 @@ class TestMetricsComputation:
         metrics = compute_metrics_from_signals(
             [], fee_bps=0.0, slippage_bps=0.0, quantity_per_trade=10.0
         )
-        
+
         assert metrics.total_pnl == 0.0
         assert metrics.sharpe_ratio == 0.0
         assert metrics.win_rate == 0.0
@@ -427,29 +432,38 @@ class TestMetricsComputation:
 
     def test_winning_trade(self) -> None:
         """Test metrics with a winning trade."""
-        params = FittedParams(
-            pair_name="Test", market_a_id="a", market_b_id="b",
-            beta=1.0, spread_mean=0.0, spread_std=0.1, train_count=20, is_valid=True
-        )
-        
         # Entry at high z-score (spread = 0.2), exit at low z-score (spread = 0.05)
         signals = [
             ZScoreSignal(
-                time="t1", pair_name="Test", market_a_id="a", market_b_id="b",
+                time="t1",
+                pair_name="Test",
+                market_a_id="a",
+                market_b_id="b",
                 action=SignalAction.ENTER_SHORT,  # Short spread expecting it to decrease
-                z_score=2.0, spread=0.2, price_a=0.6, price_b=0.4, beta=1.0
+                z_score=2.0,
+                spread=0.2,
+                price_a=0.6,
+                price_b=0.4,
+                beta=1.0,
             ),
             ZScoreSignal(
-                time="t2", pair_name="Test", market_a_id="a", market_b_id="b",
+                time="t2",
+                pair_name="Test",
+                market_a_id="a",
+                market_b_id="b",
                 action=SignalAction.EXIT,
-                z_score=0.5, spread=0.05, price_a=0.5, price_b=0.45, beta=1.0
+                z_score=0.5,
+                spread=0.05,
+                price_a=0.5,
+                price_b=0.45,
+                beta=1.0,
             ),
         ]
-        
+
         metrics = compute_metrics_from_signals(
             signals, fee_bps=0.0, slippage_bps=0.0, quantity_per_trade=10.0
         )
-        
+
         # Short spread: profit when spread decreases
         # Spread went from 0.2 to 0.05, change = -0.15
         # Short profit = -(-0.15) * 10 = 1.5

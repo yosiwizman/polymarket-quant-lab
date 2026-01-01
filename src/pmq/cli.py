@@ -3878,9 +3878,45 @@ def ops_daemon(
         float | None,
         typer.Option(
             "--wss-staleness",
-            help="WSS cache staleness threshold in seconds (default: adaptive = max(3*interval, 60))",
+            help="Deprecated: use --wss-health-timeout instead (kept for compat)",
         ),
-    ] = None,  # Phase 5.3: None = adaptive
+    ] = None,
+    # Phase 5.4: Health-gated fallback flags
+    wss_health_timeout: Annotated[
+        float,
+        typer.Option(
+            "--wss-health-timeout",
+            help="WSS connection health timeout in seconds (default: 60)",
+        ),
+    ] = 60.0,
+    max_book_age: Annotated[
+        float,
+        typer.Option(
+            "--max-book-age",
+            help="Max cache age safety cap in seconds (default: 1800 = 30 min)",
+        ),
+    ] = 1800.0,
+    reconcile_sample: Annotated[
+        int,
+        typer.Option(
+            "--reconcile-sample",
+            help="Max markets to reconcile per tick (default: 10)",
+        ),
+    ] = 10,
+    reconcile_min_age: Annotated[
+        float,
+        typer.Option(
+            "--reconcile-min-age",
+            help="Min cache age to trigger reconciliation (default: 300s)",
+        ),
+    ] = 300.0,
+    reconcile_timeout: Annotated[
+        float,
+        typer.Option(
+            "--reconcile-timeout",
+            help="Timeout for reconciliation REST batch (default: 5s)",
+        ),
+    ] = 5.0,
     max_hours: Annotated[
         float | None,
         typer.Option(
@@ -3930,7 +3966,9 @@ def ops_daemon(
     Production-grade data capture with:
     - Resilient WSS connection with REST fallback
     - Application-level keepalive ("PING") for stable long-lived WSS (Phase 5.3)
-    - Adaptive staleness threshold: max(3*interval, 60s) by default (Phase 5.3)
+    - Health-gated fallback: REST only when WSS unhealthy OR cache missing (Phase 5.4)
+    - Quiet markets use cached data without REST fallback (event-driven WSS model)
+    - REST reconciliation sampler for drift detection (Phase 5.4)
     - Coverage tracking per tick (wss_hits, rest_fallbacks, stale, missing)
     - Daily export artifacts (CSV, JSON, markdown)
     - Daily snapshot exports to gzip CSV (Phase 5.2)
@@ -3938,8 +3976,8 @@ def ops_daemon(
     - Clean shutdown on SIGINT/SIGTERM
 
     Artifacts exported daily (UTC rollover):
-    - exports/ticks_YYYY-MM-DD.csv - Per-tick history
-    - exports/coverage_YYYY-MM-DD.json - Coverage statistics
+    - exports/ticks_YYYY-MM-DD.csv - Per-tick history + reconciliation stats
+    - exports/coverage_YYYY-MM-DD.json - Coverage + drift stats
     - exports/daemon_summary_YYYY-MM-DD.md - Human-readable summary
     - exports/snapshots_YYYY-MM-DD.csv.gz - Snapshot data (Phase 5.2)
 
@@ -3948,7 +3986,8 @@ def ops_daemon(
         pmq ops daemon --orderbook-source rest --max-hours 24
         pmq ops daemon --export-dir ./data/exports
         pmq ops daemon --retention-days 30  # Keep 30 days of snapshots
-        pmq ops daemon --wss-staleness 120  # Explicit staleness (override adaptive)
+        pmq ops daemon --wss-health-timeout 60 --max-book-age 1800
+        pmq ops daemon --reconcile-sample 10 --reconcile-min-age 300
     """
     import asyncio
 
@@ -3980,6 +4019,12 @@ def ops_daemon(
         snapshot_export=snapshot_export,
         snapshot_export_format=snapshot_export_format,
         retention_days=retention_days,
+        # Phase 5.4: Health-gated fallback settings
+        wss_health_timeout=wss_health_timeout,
+        max_book_age=max_book_age,
+        reconcile_sample=reconcile_sample,
+        reconcile_min_age=reconcile_min_age,
+        reconcile_timeout=reconcile_timeout,
     )
 
     # Initialize dependencies
@@ -3998,9 +4043,10 @@ def ops_daemon(
     if with_orderbook and orderbook_source == "wss":
         from pmq.markets.wss_market import MarketWssClient
 
-        # Phase 5.3: Use adaptive staleness if not explicitly set
-        effective_staleness = config.get_effective_staleness()
-        wss_client = MarketWssClient(staleness_seconds=effective_staleness)
+        # Phase 5.4: Configure health timeout
+        wss_client = MarketWssClient(
+            health_timeout_seconds=wss_health_timeout,
+        )
 
     # Create runner
     runner = DaemonRunner(
@@ -4016,16 +4062,14 @@ def ops_daemon(
 
     # Print startup info
     retention_str = f"{retention_days} days" if retention_days else "disabled"
-    effective_staleness = config.get_effective_staleness()
-    staleness_str = f"{effective_staleness:.0f}s" + (
-        " (adaptive)" if wss_staleness_seconds is None else ""
-    )
     console.print(
-        f"[bold green]Starting ops daemon[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 5.4)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
-        f"WSS Staleness: {staleness_str}\n"
+        f"WSS Health Timeout: {wss_health_timeout:.0f}s\n"
+        f"Max Book Age: {max_book_age:.0f}s\n"
+        f"Reconcile: {reconcile_sample} samples, min age {reconcile_min_age:.0f}s\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"

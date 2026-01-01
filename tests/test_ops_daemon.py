@@ -218,6 +218,9 @@ class FakeWssClient:
         self.closed = False
         self.staleness_seconds: float = 60.0  # Phase 5.3: staleness threshold
         self._cache_ages: dict[str, float] = {}  # token_id -> age in seconds
+        # Phase 5.4: Health tracking
+        self.health_timeout_seconds: float = 60.0
+        self._healthy: bool = True  # Simulate healthy connection
 
     async def connect(self) -> None:
         """Simulate connect."""
@@ -285,6 +288,32 @@ class FakeWssClient:
             median_age=median,
             count=len(ages),
         )
+
+    # Phase 5.4: Health-gated methods
+    def is_healthy(self, health_timeout: float | None = None) -> bool:  # noqa: ARG002
+        """Check if WSS connection is healthy (Phase 5.4)."""
+        return self._healthy
+
+    def set_healthy(self, healthy: bool) -> None:
+        """Set health status for testing."""
+        self._healthy = healthy
+
+    def has_cached_book(self, token_id: str) -> bool:
+        """Check if we have cached data for token (Phase 5.4)."""
+        return token_id in self._orderbooks
+
+    def get_orderbook_if_healthy(
+        self, token_id: str, max_book_age: float | None = None
+    ) -> FakeOrderBook | None:
+        """Get orderbook regardless of staleness, with optional max age (Phase 5.4)."""
+        if token_id not in self._orderbooks:
+            return None
+        # Check max_book_age if specified
+        if max_book_age is not None:
+            age = self._cache_ages.get(token_id, 0.0)
+            if age > max_book_age:
+                return None
+        return self._orderbooks.get(token_id)
 
     async def close(self) -> None:
         """Close connection."""
@@ -1416,3 +1445,275 @@ class TestTickStatsPhase53:
         assert stats.wss_missing == 20
         assert stats.cache_age_median == 5.5
         assert stats.cache_age_max == 25.0
+
+
+# =============================================================================
+# Phase 5.4: Health-Gated Fallback Tests
+# =============================================================================
+
+
+class TestPhase54Config:
+    """Tests for Phase 5.4 DaemonConfig fields."""
+
+    def test_default_health_timeout(self) -> None:
+        """Default wss_health_timeout should be 60s."""
+        config = DaemonConfig()
+        assert config.wss_health_timeout == 60.0
+
+    def test_default_max_book_age(self) -> None:
+        """Default max_book_age should be 1800s (30 min)."""
+        config = DaemonConfig()
+        assert config.max_book_age == 1800.0
+
+    def test_default_reconcile_settings(self) -> None:
+        """Default reconcile settings should be set."""
+        config = DaemonConfig()
+        assert config.reconcile_sample == 10
+        assert config.reconcile_min_age == 300.0
+        assert config.reconcile_timeout == 5.0
+
+    def test_custom_phase54_settings(self) -> None:
+        """Custom Phase 5.4 settings should be accepted."""
+        config = DaemonConfig(
+            wss_health_timeout=30.0,
+            max_book_age=3600.0,
+            reconcile_sample=5,
+            reconcile_min_age=600.0,
+            reconcile_timeout=10.0,
+        )
+        assert config.wss_health_timeout == 30.0
+        assert config.max_book_age == 3600.0
+        assert config.reconcile_sample == 5
+        assert config.reconcile_min_age == 600.0
+        assert config.reconcile_timeout == 10.0
+
+
+class TestTickStatsPhase54:
+    """Tests for Phase 5.4 TickStats fields."""
+
+    def test_tick_stats_has_phase54_fields(self) -> None:
+        """TickStats should have Phase 5.4 health-gated fields."""
+        stats = TickStats(timestamp="2024-01-01T00:00:00Z")
+        assert stats.wss_cache_used == 0
+        assert stats.wss_cache_quiet == 0
+        assert stats.wss_cache_very_old == 0
+        assert stats.wss_unhealthy_count == 0
+        assert stats.wss_healthy is True
+        assert stats.reconciled_count == 0
+        assert stats.drift_count == 0
+        assert stats.drift_max_spread == 0.0
+
+    def test_tick_stats_phase54_values(self) -> None:
+        """TickStats should accept Phase 5.4 values."""
+        stats = TickStats(
+            timestamp="2024-01-01T00:00:00Z",
+            wss_cache_used=180,
+            wss_cache_quiet=150,
+            wss_cache_very_old=5,
+            wss_unhealthy_count=0,
+            wss_healthy=True,
+            reconciled_count=10,
+            drift_count=2,
+            drift_max_spread=50.0,
+        )
+        assert stats.wss_cache_used == 180
+        assert stats.wss_cache_quiet == 150
+        assert stats.wss_cache_very_old == 5
+        assert stats.wss_unhealthy_count == 0
+        assert stats.wss_healthy is True
+        assert stats.reconciled_count == 10
+        assert stats.drift_count == 2
+        assert stats.drift_max_spread == 50.0
+
+
+class TestDailyStatsPhase54:
+    """Tests for Phase 5.4 DailyStats fields."""
+
+    def test_daily_stats_has_reconciliation_fields(self) -> None:
+        """DailyStats should have Phase 5.4 reconciliation fields."""
+        stats = DailyStats(date="2024-01-01")
+        assert stats.total_reconciled == 0
+        assert stats.total_drift == 0
+
+
+class TestHealthGatedFallback:
+    """Tests for Phase 5.4 health-gated fallback policy."""
+
+    @pytest.fixture
+    def dao(self) -> FakeDAO:
+        """Create fake DAO."""
+        return FakeDAO()
+
+    @pytest.fixture
+    def gamma_client(self) -> FakeGammaClient:
+        """Create fake Gamma client with markets."""
+        return FakeGammaClient(
+            markets=[
+                FakeMarket("market1", "0xtoken1"),
+                FakeMarket("market2", "0xtoken2"),
+            ]
+        )
+
+    @pytest.fixture
+    def wss_client(self) -> FakeWssClient:
+        """Create fake WSS client."""
+        return FakeWssClient()
+
+    @pytest.fixture
+    def ob_fetcher(self) -> FakeOrderBookFetcher:
+        """Create fake orderbook fetcher."""
+        return FakeOrderBookFetcher()
+
+    @pytest.mark.asyncio
+    async def test_quiet_cache_no_rest_when_healthy(
+        self,
+        dao: FakeDAO,
+        gamma_client: FakeGammaClient,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Quiet cache (old but present) should NOT trigger REST when WSS is healthy."""
+        # Setup: add cached orderbooks with high age (quiet markets)
+        wss_client.add_orderbook("0xtoken1", valid=True)
+        wss_client.add_orderbook("0xtoken2", valid=True)
+        wss_client.set_cache_age("0xtoken1", 500.0)  # 500s old (quiet)
+        wss_client.set_cache_age("0xtoken2", 600.0)  # 600s old (quiet)
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            wss_health_timeout=60.0,
+            max_book_age=1800.0,  # 30 min
+            reconcile_sample=0,  # Disable reconciliation for this test
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # Should use WSS cache (quiet but OK), NOT REST
+        assert tick_stats.wss_hits >= 2
+        assert ob_fetcher.fetch_count == 0  # No REST calls
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_wss_triggers_rest(
+        self,
+        dao: FakeDAO,
+        gamma_client: FakeGammaClient,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Unhealthy WSS should trigger REST fallback for all markets."""
+        # Setup: add cached orderbooks but mark WSS unhealthy
+        wss_client.add_orderbook("0xtoken1", valid=True)
+        wss_client.add_orderbook("0xtoken2", valid=True)
+        wss_client.set_healthy(False)  # Unhealthy!
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            wss_health_timeout=60.0,
+            reconcile_sample=0,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # Should use REST fallback due to unhealthy WSS
+        assert tick_stats.wss_unhealthy_count >= 2
+        assert tick_stats.wss_healthy is False
+        assert ob_fetcher.fetch_count >= 2  # REST calls
+
+    @pytest.mark.asyncio
+    async def test_missing_cache_triggers_rest(
+        self,
+        dao: FakeDAO,
+        gamma_client: FakeGammaClient,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Missing cache (not subscribed yet) should trigger REST."""
+        # Setup: no cached orderbooks (first tick scenario)
+        wss_client.set_healthy(True)
+        # Don't add any orderbooks to cache
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            wss_health_timeout=60.0,
+            reconcile_sample=0,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # Should use REST for missing cache entries
+        assert tick_stats.wss_missing >= 2
+        assert ob_fetcher.fetch_count >= 2  # REST calls
+
+    @pytest.mark.asyncio
+    async def test_very_old_cache_triggers_rest(
+        self,
+        dao: FakeDAO,
+        gamma_client: FakeGammaClient,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Cache older than max_book_age should trigger REST."""
+        # Setup: add very old cached orderbook
+        wss_client.add_orderbook("0xtoken1", valid=True)
+        wss_client.add_orderbook("0xtoken2", valid=True)
+        wss_client.set_cache_age("0xtoken1", 2000.0)  # 33 min (> 30 min max)
+        wss_client.set_cache_age("0xtoken2", 100.0)  # Fresh
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            max_book_age=1800.0,  # 30 min
+            reconcile_sample=0,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # token1 is very old -> should use REST
+        # token2 is fresh -> should use cache
+        assert tick_stats.wss_cache_very_old >= 1
+        assert ob_fetcher.fetch_count >= 1  # At least one REST call

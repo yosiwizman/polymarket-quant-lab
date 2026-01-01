@@ -1,6 +1,7 @@
 """Tests for Market WebSocket client.
 
 Phase 5.0: WebSocket microstructure feed integration tests.
+Phase 5.3: Keepalive, cache age tracking, and reconnect tests.
 """
 
 from __future__ import annotations
@@ -15,9 +16,12 @@ import pytest
 
 from pmq.markets.wss_market import (
     BACKOFF_MULTIPLIER,
+    DEFAULT_KEEPALIVE_INTERVAL_SECONDS,
+    DEFAULT_STALENESS_SECONDS,
     INITIAL_BACKOFF_SECONDS,
     JITTER_FACTOR,
     MAX_BACKOFF_SECONDS,
+    CacheAgeStats,
     CacheEntry,
     MarketWssClient,
     WssStats,
@@ -40,6 +44,9 @@ class TestWssStats:
         assert stats.cache_hits == 0
         assert stats.cache_misses == 0
         assert stats.cache_stale == 0
+        # Phase 5.3
+        assert stats.keepalive_sent == 0
+        assert stats.keepalive_failures == 0
 
     def test_custom_values(self) -> None:
         """Stats should accept custom values."""
@@ -57,6 +64,12 @@ class TestWssStats:
         assert stats.cache_hits == 80
         assert stats.cache_misses == 10
         assert stats.cache_stale == 3
+
+    def test_keepalive_stats(self) -> None:
+        """Phase 5.3: Stats should track keepalive metrics."""
+        stats = WssStats(keepalive_sent=100, keepalive_failures=2)
+        assert stats.keepalive_sent == 100
+        assert stats.keepalive_failures == 2
 
 
 # =============================================================================
@@ -202,8 +215,9 @@ class TestMessageParsing:
 
     @pytest.mark.asyncio
     async def test_handle_message_invalid_json(self, client: MarketWssClient) -> None:
-        """Invalid JSON should increment parse_errors."""
-        await client._handle_message("not valid json {{{")
+        """Invalid JSON (long enough to not be treated as control message) should increment parse_errors."""
+        # Must be > 20 chars to be counted as a real parse error (short strings are treated as control messages)
+        await client._handle_message("this is not valid json data {{{")
 
         stats = client.get_stats()
         assert stats.parse_errors == 1
@@ -600,3 +614,206 @@ class TestIntegration:
             assert token in cached_ids
             ob = client.get_orderbook(token)
             assert ob is not None
+
+
+# =============================================================================
+# Phase 5.3: Cache Age Tracking Tests
+# =============================================================================
+
+
+class TestCacheAgeTracking:
+    """Tests for Phase 5.3 cache age tracking."""
+
+    def test_cache_age_stats_empty(self) -> None:
+        """CacheAgeStats should have sensible defaults."""
+        stats = CacheAgeStats()
+        assert stats.min_age == 0.0
+        assert stats.max_age == 0.0
+        assert stats.median_age == 0.0
+        assert stats.count == 0
+
+    def test_get_cache_ages_empty(self) -> None:
+        """get_cache_ages on empty cache should return empty stats."""
+        client = MarketWssClient()
+        stats = client.get_cache_ages()
+        assert stats.count == 0
+
+    def test_get_cache_ages_with_entries(self) -> None:
+        """get_cache_ages should compute stats from cache entries."""
+        from pmq.markets.orderbook import OrderBookData
+
+        client = MarketWssClient()
+
+        # Manually add cache entries with known timestamps
+        now = time.monotonic()
+        client._cache["token1"] = CacheEntry(
+            data=OrderBookData(token_id="token1"),
+            updated_at=now - 5.0,  # 5 seconds old
+        )
+        client._cache["token2"] = CacheEntry(
+            data=OrderBookData(token_id="token2"),
+            updated_at=now - 10.0,  # 10 seconds old
+        )
+        client._cache["token3"] = CacheEntry(
+            data=OrderBookData(token_id="token3"),
+            updated_at=now - 15.0,  # 15 seconds old
+        )
+
+        stats = client.get_cache_ages()
+        assert stats.count == 3
+        assert 4.0 <= stats.min_age <= 6.0  # ~5s
+        assert 14.0 <= stats.max_age <= 16.0  # ~15s
+        assert 9.0 <= stats.median_age <= 11.0  # ~10s
+
+    def test_get_cache_freshness(self) -> None:
+        """get_cache_freshness should return fresh/stale/missing breakdown."""
+        from pmq.markets.orderbook import OrderBookData
+
+        client = MarketWssClient(staleness_seconds=10.0)
+
+        now = time.monotonic()
+        # Fresh entry (5s old, threshold 10s)
+        client._cache["token1"] = CacheEntry(
+            data=OrderBookData(token_id="token1"),
+            updated_at=now - 5.0,
+        )
+        # Stale entry (15s old, threshold 10s)
+        client._cache["token2"] = CacheEntry(
+            data=OrderBookData(token_id="token2"),
+            updated_at=now - 15.0,
+        )
+        # token3 not in cache (missing)
+
+        fresh, stale, missing = client.get_cache_freshness(["token1", "token2", "token3"])
+        assert fresh == 1
+        assert stale == 1
+        assert missing == 1
+
+
+# =============================================================================
+# Phase 5.3: Keepalive Tests
+# =============================================================================
+
+
+class TestKeepalive:
+    """Tests for Phase 5.3 keepalive functionality."""
+
+    def test_default_keepalive_interval(self) -> None:
+        """Default keepalive interval should be DEFAULT_KEEPALIVE_INTERVAL_SECONDS."""
+        client = MarketWssClient()
+        assert client.keepalive_interval == DEFAULT_KEEPALIVE_INTERVAL_SECONDS
+
+    def test_custom_keepalive_interval(self) -> None:
+        """Custom keepalive interval should be accepted."""
+        client = MarketWssClient(keepalive_interval=5.0)
+        assert client.keepalive_interval == 5.0
+
+    @pytest.mark.asyncio
+    async def test_keepalive_task_starts_and_stops(self) -> None:
+        """Keepalive task should start and stop cleanly."""
+        client = MarketWssClient(keepalive_interval=1.0)
+        client._running = True
+        client._stop_event.clear()
+
+        await client._start_keepalive()
+        assert client._keepalive_task is not None
+        assert not client._keepalive_task.done()
+
+        await client._stop_keepalive()
+        assert client._keepalive_task is None
+
+    @pytest.mark.asyncio
+    async def test_keepalive_sends_ping(self) -> None:
+        """Keepalive loop should send 'PING' messages."""
+        client = MarketWssClient(keepalive_interval=0.1)  # Very short for test
+        client._running = True
+        client._stop_event.clear()
+
+        # Mock the WebSocket
+        mock_ws = AsyncMock()
+        client._ws = mock_ws
+
+        await client._start_keepalive()
+
+        # Wait for at least one ping
+        await asyncio.sleep(0.25)
+
+        # Stop and verify
+        await client._stop_keepalive()
+
+        # Should have sent at least one PING
+        mock_ws.send.assert_called_with("PING")
+        assert client._stats.keepalive_sent >= 1
+
+
+# =============================================================================
+# Phase 5.3: Message Handling Tests
+# =============================================================================
+
+
+class TestPongHandling:
+    """Tests for Phase 5.3 PONG message handling."""
+
+    @pytest.mark.asyncio
+    async def test_handles_pong_text(self) -> None:
+        """_handle_message should handle 'PONG' text responses."""
+        client = MarketWssClient()
+
+        await client._handle_message("PONG")
+        assert client._stats.parse_errors == 0
+        assert client._stats.messages_received == 1
+
+    @pytest.mark.asyncio
+    async def test_handles_ping_text(self) -> None:
+        """_handle_message should handle 'PING' text responses."""
+        client = MarketWssClient()
+
+        await client._handle_message("PING")
+        assert client._stats.parse_errors == 0
+        assert client._stats.messages_received == 1
+
+    @pytest.mark.asyncio
+    async def test_handles_json_pong(self) -> None:
+        """_handle_message should handle JSON pong messages."""
+        client = MarketWssClient()
+
+        await client._handle_message('{"type": "pong"}')
+        assert client._stats.parse_errors == 0
+
+    @pytest.mark.asyncio
+    async def test_short_non_json_not_error(self) -> None:
+        """Short non-JSON messages should not increment parse errors."""
+        client = MarketWssClient()
+
+        await client._handle_message("OK")
+        # Short non-JSON is logged but not counted as parse error
+        assert client._stats.parse_errors == 0
+
+
+# =============================================================================
+# Phase 5.3: Configuration Tests
+# =============================================================================
+
+
+class TestPhase53Config:
+    """Tests for Phase 5.3 client configuration."""
+
+    def test_default_staleness(self) -> None:
+        """Default staleness should be DEFAULT_STALENESS_SECONDS."""
+        client = MarketWssClient()
+        assert client.staleness_seconds == DEFAULT_STALENESS_SECONDS
+
+    def test_custom_staleness(self) -> None:
+        """Custom staleness should be accepted."""
+        client = MarketWssClient(staleness_seconds=120.0)
+        assert client.staleness_seconds == 120.0
+
+    def test_stats_include_keepalive(self) -> None:
+        """get_stats should include keepalive metrics."""
+        client = MarketWssClient()
+        client._stats.keepalive_sent = 50
+        client._stats.keepalive_failures = 1
+
+        stats = client.get_stats()
+        assert stats.keepalive_sent == 50
+        assert stats.keepalive_failures == 1

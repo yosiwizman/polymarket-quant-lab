@@ -1563,6 +1563,86 @@ This configuration:
 4. Exports coverage stats and tick history daily
 5. Stops gracefully on Ctrl+C with final export
 
+### WSS Reliability + Coverage Uplift (Phase 5.3)
+
+Phase 5.3 improves WebSocket reliability and coverage from ~5% to 60%+ by implementing:
+- Application-level keepalive ("PING" every 10s, per Polymarket's WSS quickstart)
+- Adaptive staleness threshold based on daemon interval
+- Enhanced tick logging with detailed freshness breakdown
+- Cache age statistics for observability
+
+#### Keepalive Protocol
+
+Polymarket's WSS server expects application-level keepalive messages (not library-level WebSocket pings). Phase 5.3 sends:
+- Literal `"PING"` text frame every 10 seconds
+- Handles `"PONG"` responses (and gracefully ignores `"PING"` echoes)
+
+This prevents the server from closing idle connections, dramatically improving WSS coverage.
+
+#### Adaptive Staleness
+
+By default, the staleness threshold adapts to the daemon interval:
+
+```
+effective_staleness = max(3.0 × interval_seconds, 60.0)
+```
+
+Examples:
+- 60s interval → 180s staleness (3 missed updates = stale)
+- 30s interval → 90s staleness
+- 10s interval → 60s staleness (floor)
+
+This prevents false positives where data is marked stale before it has a chance to update.
+
+```powershell
+# Use adaptive staleness (default in Phase 5.3)
+poetry run pmq ops daemon --interval 60
+
+# Override with explicit staleness threshold
+poetry run pmq ops daemon --interval 60 --wss-staleness 120
+```
+
+#### Enhanced Tick Logging
+
+Each tick now logs detailed freshness breakdown:
+
+```
+Tick completed: markets=200, snapshots=200, wss_fresh=180, wss_stale=10, wss_missing=10,
+               rest_fallback=20, cache_age_median=5.2s, cache_age_max=45.1s
+```
+
+Coverage metrics:
+- **wss_fresh**: Tokens with fresh WSS data (under staleness threshold)
+- **wss_stale**: Tokens with stale WSS data (over threshold but present)
+- **wss_missing**: Tokens not in WSS cache at all
+- **rest_fallback**: Tokens fetched via REST (stale + missing)
+- **cache_age_median/max**: Cache age statistics in seconds
+
+#### Phase 5.3 CLI Changes
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--wss-staleness` | float | None | WSS staleness threshold (None = adaptive) |
+
+When `--wss-staleness` is not provided, adaptive staleness is used automatically.
+
+#### WSS Coverage Target
+
+With Phase 5.3, a 15-minute daemon run should achieve:
+- **wss_coverage_pct ≥ 60%** (vs ~5% before keepalive)
+- Lower REST fallback rate
+- More stable long-running sessions
+
+#### Monitoring WSS Health
+
+```powershell
+# Run daemon and monitor logs for coverage
+poetry run pmq ops daemon --interval 60 --max-hours 0.25
+
+# Check final coverage in daily export JSON
+# Or monitor per-tick logs for wss_fresh vs rest_fallback ratio
+```
+
 ## Project Structure
 
 ```

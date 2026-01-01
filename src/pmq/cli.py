@@ -1268,6 +1268,20 @@ def snapshots_run(
             help="Fetch order book data for microstructure (spread, depth)",
         ),
     ] = True,
+    orderbook_source: Annotated[
+        str,
+        typer.Option(
+            "--orderbook-source",
+            help="Order book data source: rest (default), wss (WebSocket streaming)",
+        ),
+    ] = "rest",
+    wss_staleness_seconds: Annotated[
+        float,
+        typer.Option(
+            "--wss-staleness",
+            help="WSS cache staleness threshold in seconds (fallback to REST if exceeded)",
+        ),
+    ] = 30.0,
 ) -> None:
     """Run automated snapshot collection loop.
 
@@ -1277,13 +1291,27 @@ def snapshots_run(
     Phase 4.9: With --with-orderbook (default), also captures order book
     microstructure (best bid/ask, spread, depth) for each market.
 
+    Phase 5.0: --orderbook-source controls the data source:
+    - rest (default): Fetch order books via REST API each cycle
+    - wss: Stream order books via WebSocket, fallback to REST if stale/missing
+
     Example:
         pmq snapshots run --interval 60 --limit 200 --duration-minutes 60
         pmq snapshots run --interval 60 --no-orderbook  # Skip order books
+        pmq snapshots run --orderbook-source wss  # Use WebSocket streaming
+        pmq snapshots run --orderbook-source wss --wss-staleness 15  # Stricter staleness
     """
+    import asyncio
     import os
 
     settings = get_settings()
+
+    # Validate orderbook-source
+    if orderbook_source not in ("rest", "wss"):
+        console.print(
+            f"[red]Invalid --orderbook-source: {orderbook_source}. Must be 'rest' or 'wss'.[/red]"
+        )
+        raise typer.Exit(1)
 
     # Check kill switch
     if settings.safety.kill_switch or os.environ.get("PMQ_SNAPSHOT_KILL", "").lower() == "true":
@@ -1291,23 +1319,36 @@ def snapshots_run(
         raise typer.Exit(1)
 
     orderbook_str = "[green]ON[/green]" if with_orderbook else "[dim]OFF[/dim]"
+    source_str = f"[cyan]{orderbook_source.upper()}[/cyan]" if with_orderbook else "[dim]N/A[/dim]"
     console.print(
         f"[bold green]Starting snapshot collection[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Duration: {'infinite' if duration_minutes == 0 else f'{duration_minutes} minutes'}\n"
         f"Order Book: {orderbook_str}\n"
+        f"Order Book Source: {source_str}\n"
     )
 
     dao = DAO()
     client = GammaClient()
 
-    # Phase 4.9: OrderBook fetcher for microstructure data
+    # Phase 4.9: OrderBook fetcher for REST microstructure data
     ob_fetcher = None
     if with_orderbook:
         from pmq.markets.orderbook import OrderBookFetcher
 
         ob_fetcher = OrderBookFetcher()
+
+    # Phase 5.0: WSS client for streaming order books
+    wss_client = None
+    if with_orderbook and orderbook_source == "wss":
+        from pmq.markets.wss_market import MarketWssClient
+
+        wss_client = MarketWssClient(staleness_seconds=wss_staleness_seconds)
+
+    # WSS stats tracking
+    wss_hits = 0
+    wss_fallbacks = 0
 
     start_time = time.time()
     end_time = start_time + (duration_minutes * 60) if duration_minutes > 0 else float("inf")
@@ -1315,85 +1356,223 @@ def snapshots_run(
     backoff = 1
     max_backoff = 300
 
+    async def run_wss_collection() -> None:
+        """Async wrapper for WSS-enabled collection loop."""
+        nonlocal cycle_count, backoff, wss_hits, wss_fallbacks
+
+        if wss_client:
+            await wss_client.connect()
+            connected = await wss_client.wait_connected(timeout=10.0)
+            if not connected:
+                console.print("[yellow]WSS connection timeout, will retry...[/yellow]")
+
+        try:
+            while time.time() < end_time:
+                cycle_count += 1
+                now = datetime.now(UTC).isoformat()
+
+                # Check kill switch each cycle
+                if os.environ.get("PMQ_SNAPSHOT_KILL", "").lower() == "true":
+                    console.print("[red]Kill switch activated. Stopping.[/red]")
+                    break
+
+                console.print(f"\n[cyan]Cycle {cycle_count} @ {now[:19]}[/cyan]")
+
+                try:
+                    # Fetch markets
+                    console.print(f"[dim]Fetching {limit} markets...[/dim]")
+                    markets = client.list_markets(limit=limit)
+
+                    # Upsert market data
+                    dao.upsert_markets(markets)
+
+                    # Subscribe to new markets if using WSS
+                    if wss_client:
+                        token_ids = [m.yes_token_id for m in markets if m.yes_token_id]
+                        if token_ids:
+                            await wss_client.subscribe(token_ids)
+
+                    # Fetch order books (WSS with REST fallback, or REST only)
+                    orderbook_data: dict[str, Any] | None = None
+                    ob_success_count = 0
+                    cycle_wss_hits = 0
+                    cycle_fallbacks = 0
+
+                    if with_orderbook:
+                        console.print(
+                            f"[dim]Fetching order books ({orderbook_source.upper()})...[/dim]"
+                        )
+                        orderbook_data = {}
+
+                        for market in markets:
+                            token_id = market.yes_token_id
+                            if not token_id:
+                                continue
+
+                            ob = None
+
+                            # Try WSS cache first if enabled
+                            if wss_client:
+                                ob = wss_client.get_orderbook(token_id)
+                                if ob and ob.has_valid_book:
+                                    cycle_wss_hits += 1
+
+                            # Fallback to REST if WSS miss/stale
+                            if ob is None and ob_fetcher:
+                                try:
+                                    ob = ob_fetcher.fetch_order_book(token_id)
+                                    if wss_client:  # Track fallback only in WSS mode
+                                        cycle_fallbacks += 1
+                                except Exception as e:
+                                    logger.debug(
+                                        f"REST order book fetch failed for {market.id}: {e}"
+                                    )
+
+                            if ob and ob.has_valid_book:
+                                orderbook_data[market.id] = ob.to_dict()
+                                ob_success_count += 1
+
+                        wss_hits += cycle_wss_hits
+                        wss_fallbacks += cycle_fallbacks
+
+                    # Save snapshots
+                    snapshot_time = datetime.now(UTC).isoformat()
+                    snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time, orderbook_data)
+
+                    msg = (
+                        f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                    )
+                    if with_orderbook:
+                        msg += f" [dim]({ob_success_count} with order books)[/dim]"
+                        if wss_client:
+                            msg += f" [dim](WSS: {cycle_wss_hits}, REST fallback: {cycle_fallbacks})[/dim]"
+                    console.print(msg)
+
+                    # Update runtime state
+                    dao.set_runtime_state("last_snapshot_at", snapshot_time)
+                    dao.set_runtime_state("snapshot_cycle_count", str(cycle_count))
+
+                    # Reset backoff on success
+                    backoff = 1
+
+                except GammaClientError as e:
+                    dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
+                    console.print(f"[red]API error: {e}[/red]")
+                    console.print(f"[yellow]Backing off {backoff}s...[/yellow]")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+                    continue
+
+                except Exception as e:
+                    dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
+                    console.print(f"[red]Error: {e}[/red]")
+
+                # Wait for next cycle
+                if time.time() < end_time:
+                    await asyncio.sleep(interval)
+
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted by user[/yellow]")
+        finally:
+            if wss_client:
+                await wss_client.close()
+
+    # Run the collection loop
     try:
-        while time.time() < end_time:
-            cycle_count += 1
-            now = datetime.now(UTC).isoformat()
-
-            # Check kill switch each cycle
-            if os.environ.get("PMQ_SNAPSHOT_KILL", "").lower() == "true":
-                console.print("[red]Kill switch activated. Stopping.[/red]")
-                break
-
-            console.print(f"\n[cyan]Cycle {cycle_count} @ {now[:19]}[/cyan]")
-
+        if orderbook_source == "wss":
+            # Run async WSS-enabled collection
+            asyncio.run(run_wss_collection())
+        else:
+            # Run sync REST-only collection
             try:
-                # Fetch markets
-                console.print(f"[dim]Fetching {limit} markets...[/dim]")
-                markets = client.list_markets(limit=limit)
+                while time.time() < end_time:
+                    cycle_count += 1
+                    now = datetime.now(UTC).isoformat()
 
-                # Upsert market data
-                dao.upsert_markets(markets)
+                    # Check kill switch each cycle
+                    if os.environ.get("PMQ_SNAPSHOT_KILL", "").lower() == "true":
+                        console.print("[red]Kill switch activated. Stopping.[/red]")
+                        break
 
-                # Phase 4.9: Fetch order books if enabled
-                orderbook_data: dict[str, Any] | None = None
-                ob_success_count = 0
-                if ob_fetcher and with_orderbook:
-                    console.print("[dim]Fetching order books...[/dim]")
-                    orderbook_data = {}
-                    for market in markets:
-                        token_id = market.yes_token_id
-                        if token_id:
-                            try:
-                                ob = ob_fetcher.fetch_order_book(token_id)
-                                if ob.has_valid_book:
-                                    orderbook_data[market.id] = ob.to_dict()
-                                    ob_success_count += 1
-                            except Exception as e:
-                                # Don't fail the run; log and continue
-                                logger.debug(f"Order book fetch failed for {market.id}: {e}")
+                    console.print(f"\n[cyan]Cycle {cycle_count} @ {now[:19]}[/cyan]")
 
-                # Save snapshots
-                snapshot_time = datetime.now(UTC).isoformat()
-                snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time, orderbook_data)
+                    try:
+                        # Fetch markets
+                        console.print(f"[dim]Fetching {limit} markets...[/dim]")
+                        markets = client.list_markets(limit=limit)
 
-                msg = f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
-                if with_orderbook:
-                    msg += f" [dim]({ob_success_count} with order books)[/dim]"
-                console.print(msg)
+                        # Upsert market data
+                        dao.upsert_markets(markets)
 
-                # Update runtime state
-                dao.set_runtime_state("last_snapshot_at", snapshot_time)
-                dao.set_runtime_state("snapshot_cycle_count", str(cycle_count))
+                        # Fetch order books via REST
+                        orderbook_data: dict[str, Any] | None = None
+                        ob_success_count = 0
+                        if ob_fetcher and with_orderbook:
+                            console.print("[dim]Fetching order books (REST)...[/dim]")
+                            orderbook_data = {}
+                            for market in markets:
+                                token_id = market.yes_token_id
+                                if token_id:
+                                    try:
+                                        ob = ob_fetcher.fetch_order_book(token_id)
+                                        if ob.has_valid_book:
+                                            orderbook_data[market.id] = ob.to_dict()
+                                            ob_success_count += 1
+                                    except Exception as e:
+                                        logger.debug(
+                                            f"Order book fetch failed for {market.id}: {e}"
+                                        )
 
-                # Reset backoff on success
-                backoff = 1
+                        # Save snapshots
+                        snapshot_time = datetime.now(UTC).isoformat()
+                        snapshot_count = dao.save_snapshots_bulk(
+                            markets, snapshot_time, orderbook_data
+                        )
 
-            except GammaClientError as e:
-                dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
-                console.print(f"[red]API error: {e}[/red]")
-                console.print(f"[yellow]Backing off {backoff}s...[/yellow]")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
-                continue
+                        msg = f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                        if with_orderbook:
+                            msg += f" [dim]({ob_success_count} with order books)[/dim]"
+                        console.print(msg)
 
-            except Exception as e:
-                dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
-                console.print(f"[red]Error: {e}[/red]")
+                        # Update runtime state
+                        dao.set_runtime_state("last_snapshot_at", snapshot_time)
+                        dao.set_runtime_state("snapshot_cycle_count", str(cycle_count))
 
-            # Wait for next cycle
-            if time.time() < end_time:
-                time.sleep(interval)
+                        # Reset backoff on success
+                        backoff = 1
 
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted by user[/yellow]")
+                    except GammaClientError as e:
+                        dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
+                        console.print(f"[red]API error: {e}[/red]")
+                        console.print(f"[yellow]Backing off {backoff}s...[/yellow]")
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+
+                    except Exception as e:
+                        dao.set_runtime_state("last_snapshot_error", f"{now}: {e}")
+                        console.print(f"[red]Error: {e}[/red]")
+
+                    # Wait for next cycle
+                    if time.time() < end_time:
+                        time.sleep(interval)
+
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted by user[/yellow]")
+
     finally:
         client.close()
         if ob_fetcher:
             ob_fetcher.close()
 
     elapsed = int((time.time() - start_time) / 60)
-    console.print(f"\n[bold]Completed {cycle_count} cycles in {elapsed} minutes[/bold]")
+    summary = f"\n[bold]Completed {cycle_count} cycles in {elapsed} minutes[/bold]"
+    if orderbook_source == "wss" and (wss_hits + wss_fallbacks) > 0:
+        wss_pct = (
+            (wss_hits / (wss_hits + wss_fallbacks)) * 100 if (wss_hits + wss_fallbacks) > 0 else 0
+        )
+        summary += f"\n[dim]WSS coverage: {wss_pct:.1f}% ({wss_hits} hits, {wss_fallbacks} REST fallbacks)[/dim]"
+    console.print(summary)
 
 
 @snapshots_app.command("quality")

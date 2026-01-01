@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     liquidity REAL DEFAULT 0.0,
     volume REAL DEFAULT 0.0,
     snapshot_time TEXT NOT NULL,  -- UTC timestamp
+    -- Phase 4.9: Microstructure fields (nullable for backward compatibility)
+    best_bid REAL,          -- Best bid price from order book
+    best_ask REAL,          -- Best ask price from order book
+    mid_price REAL,         -- Mid price = (bid + ask) / 2
+    spread_bps REAL,        -- Spread in basis points = ((ask - bid) / mid) * 10_000
+    top_depth_usd REAL,     -- Top-of-book depth in USD (conservative: min of bid/ask)
     FOREIGN KEY (market_id) REFERENCES markets(id)
 );
 

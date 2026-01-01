@@ -305,6 +305,48 @@ class EvaluationReporter:
                         lines.append("- **Note:** No constraints applied (all pairs passed)")
                     lines.append("")
 
+                # Phase 4.9: Microstructure section
+                if result.microstructure_snapshots_total > 0:
+                    lines.extend(
+                        [
+                            "### Market Microstructure",
+                            "",
+                        ]
+                    )
+                    pct_with_book = (
+                        (
+                            result.microstructure_snapshots_with_book
+                            / result.microstructure_snapshots_total
+                        )
+                        * 100
+                        if result.microstructure_snapshots_total > 0
+                        else 0
+                    )
+                    lines.append(
+                        f"- **Snapshots with Order Book:** {result.microstructure_snapshots_with_book}/{result.microstructure_snapshots_total} ({pct_with_book:.1f}%)"
+                    )
+                    if result.microstructure_median_spread_bps is not None:
+                        lines.append(
+                            f"- **Median Spread:** {result.microstructure_median_spread_bps:.1f} bps"
+                        )
+                    if result.microstructure_median_depth_usd is not None:
+                        lines.append(
+                            f"- **Median Top Depth:** ${result.microstructure_median_depth_usd:,.2f}"
+                        )
+                    if (
+                        result.microstructure_used_for_spread > 0
+                        or result.microstructure_used_for_depth > 0
+                    ):
+                        lines.append(
+                            f"- **Constraint Data Source:** {result.microstructure_used_for_spread} pairs used real spread, "
+                            f"{result.microstructure_used_for_depth} pairs used real depth"
+                        )
+                    if result.microstructure_missing > 0:
+                        lines.append(
+                            f"- **Missing Microstructure:** {result.microstructure_missing} pairs used fallback"
+                        )
+                    lines.append("")
+
                 lines.append(
                     "*Note: Scorecard evaluated on TEST only (walk-forward, no data leakage)*"
                 )

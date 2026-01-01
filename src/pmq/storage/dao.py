@@ -713,6 +713,12 @@ class DAO:
         liquidity: float,
         volume: float,
         snapshot_time: str,
+        *,
+        best_bid: float | None = None,
+        best_ask: float | None = None,
+        mid_price: float | None = None,
+        spread_bps: float | None = None,
+        top_depth_usd: float | None = None,
     ) -> int:
         """Save a market snapshot for backtesting.
 
@@ -723,6 +729,11 @@ class DAO:
             liquidity: Liquidity at snapshot time
             volume: Volume at snapshot time
             snapshot_time: UTC timestamp of snapshot
+            best_bid: Best bid price from order book (Phase 4.9)
+            best_ask: Best ask price from order book (Phase 4.9)
+            mid_price: Mid price from order book (Phase 4.9)
+            spread_bps: Spread in basis points (Phase 4.9)
+            top_depth_usd: Top-of-book depth in USD (Phase 4.9)
 
         Returns:
             Snapshot ID
@@ -730,19 +741,39 @@ class DAO:
         cursor = self._db.execute(
             """
             INSERT INTO market_snapshots
-            (market_id, yes_price, no_price, liquidity, volume, snapshot_time)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (market_id, yes_price, no_price, liquidity, volume, snapshot_time,
+             best_bid, best_ask, mid_price, spread_bps, top_depth_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (market_id, yes_price, no_price, liquidity, volume, snapshot_time),
+            (
+                market_id,
+                yes_price,
+                no_price,
+                liquidity,
+                volume,
+                snapshot_time,
+                best_bid,
+                best_ask,
+                mid_price,
+                spread_bps,
+                top_depth_usd,
+            ),
         )
         return cursor.lastrowid or 0
 
-    def save_snapshots_bulk(self, markets: list[GammaMarket], snapshot_time: str) -> int:
+    def save_snapshots_bulk(
+        self,
+        markets: list[GammaMarket],
+        snapshot_time: str,
+        orderbook_data: dict[str, Any] | None = None,
+    ) -> int:
         """Save snapshots for multiple markets.
 
         Args:
             markets: List of markets to snapshot
             snapshot_time: UTC timestamp for all snapshots
+            orderbook_data: Optional dict mapping market_id to OrderBookData
+                (Phase 4.9 microstructure enrichment)
 
         Returns:
             Number of snapshots saved
@@ -750,6 +781,21 @@ class DAO:
         count = 0
         for market in markets:
             if market.yes_price > 0 and market.no_price > 0:
+                # Extract microstructure data if available
+                best_bid = None
+                best_ask = None
+                mid_price = None
+                spread_bps = None
+                top_depth_usd = None
+
+                if orderbook_data and market.id in orderbook_data:
+                    ob = orderbook_data[market.id]
+                    best_bid = ob.get("best_bid")
+                    best_ask = ob.get("best_ask")
+                    mid_price = ob.get("mid_price")
+                    spread_bps = ob.get("spread_bps")
+                    top_depth_usd = ob.get("top_depth_usd")
+
                 self.save_snapshot(
                     market_id=market.id,
                     yes_price=market.yes_price,
@@ -757,6 +803,11 @@ class DAO:
                     liquidity=market.liquidity,
                     volume=market.volume,
                     snapshot_time=snapshot_time,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    mid_price=mid_price,
+                    spread_bps=spread_bps,
+                    top_depth_usd=top_depth_usd,
                 )
                 count += 1
         logger.info(f"Saved {count} snapshots at {snapshot_time}")

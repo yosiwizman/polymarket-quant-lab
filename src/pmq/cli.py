@@ -24,11 +24,13 @@ from rich.table import Table
 from pmq import __version__
 from pmq.config import get_settings
 from pmq.gamma_client import GammaClient, GammaClientError
-from pmq.logging import setup_logging
+from pmq.logging import get_logger, setup_logging
 from pmq.models import SignalType
 from pmq.storage import DAO
 from pmq.strategies import ArbitrageScanner, PaperLedger, StatArbScanner
 from pmq.strategies.paper import SafetyError
+
+logger = get_logger("cli")
 
 app = typer.Typer(
     name="pmq",
@@ -1259,14 +1261,25 @@ def snapshots_run(
         int,
         typer.Option("--duration-minutes", "-d", help="Total duration in minutes (0 = infinite)"),
     ] = 60,
+    with_orderbook: Annotated[
+        bool,
+        typer.Option(
+            "--with-orderbook/--no-orderbook",
+            help="Fetch order book data for microstructure (spread, depth)",
+        ),
+    ] = True,
 ) -> None:
     """Run automated snapshot collection loop.
 
     Collects market snapshots at regular intervals for backtesting.
     Does NOT execute any trades - data capture only.
 
+    Phase 4.9: With --with-orderbook (default), also captures order book
+    microstructure (best bid/ask, spread, depth) for each market.
+
     Example:
         pmq snapshots run --interval 60 --limit 200 --duration-minutes 60
+        pmq snapshots run --interval 60 --no-orderbook  # Skip order books
     """
     import os
 
@@ -1277,15 +1290,24 @@ def snapshots_run(
         console.print("[red]Kill switch is active. Snapshot collection halted.[/red]")
         raise typer.Exit(1)
 
+    orderbook_str = "[green]ON[/green]" if with_orderbook else "[dim]OFF[/dim]"
     console.print(
         f"[bold green]Starting snapshot collection[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Duration: {'infinite' if duration_minutes == 0 else f'{duration_minutes} minutes'}\n"
+        f"Order Book: {orderbook_str}\n"
     )
 
     dao = DAO()
     client = GammaClient()
+
+    # Phase 4.9: OrderBook fetcher for microstructure data
+    ob_fetcher = None
+    if with_orderbook:
+        from pmq.markets.orderbook import OrderBookFetcher
+
+        ob_fetcher = OrderBookFetcher()
 
     start_time = time.time()
     end_time = start_time + (duration_minutes * 60) if duration_minutes > 0 else float("inf")
@@ -1313,13 +1335,32 @@ def snapshots_run(
                 # Upsert market data
                 dao.upsert_markets(markets)
 
+                # Phase 4.9: Fetch order books if enabled
+                orderbook_data: dict[str, Any] | None = None
+                ob_success_count = 0
+                if ob_fetcher and with_orderbook:
+                    console.print("[dim]Fetching order books...[/dim]")
+                    orderbook_data = {}
+                    for market in markets:
+                        token_id = market.yes_token_id
+                        if token_id:
+                            try:
+                                ob = ob_fetcher.fetch_order_book(token_id)
+                                if ob.has_valid_book:
+                                    orderbook_data[market.id] = ob.to_dict()
+                                    ob_success_count += 1
+                            except Exception as e:
+                                # Don't fail the run; log and continue
+                                logger.debug(f"Order book fetch failed for {market.id}: {e}")
+
                 # Save snapshots
                 snapshot_time = datetime.now(UTC).isoformat()
-                snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time)
+                snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time, orderbook_data)
 
-                console.print(
-                    f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
-                )
+                msg = f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                if with_orderbook:
+                    msg += f" [dim]({ob_success_count} with order books)[/dim]"
+                console.print(msg)
 
                 # Update runtime state
                 dao.set_runtime_state("last_snapshot_at", snapshot_time)
@@ -1348,6 +1389,8 @@ def snapshots_run(
         console.print("\n[yellow]Interrupted by user[/yellow]")
     finally:
         client.close()
+        if ob_fetcher:
+            ob_fetcher.close()
 
     elapsed = int((time.time() - start_time) / 60)
     console.print(f"\n[bold]Completed {cycle_count} cycles in {elapsed} minutes[/bold]")

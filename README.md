@@ -187,6 +187,12 @@ poetry run pmq snapshots run --interval 60 --limit 200 --duration-minutes 60
 
 # Run indefinitely (Ctrl+C to stop)
 poetry run pmq snapshots run --interval 60 --duration-minutes 0
+
+# With order book microstructure data (Phase 4.9, default: ON)
+poetry run pmq snapshots run --interval 60 --with-orderbook
+
+# Disable order book fetching for faster collection
+poetry run pmq snapshots run --interval 60 --no-orderbook
 ```
 
 The scheduler:
@@ -1170,6 +1176,88 @@ poetry run pmq eval run --strategy statarb --version zscore-v1 \
 
 > 💡 **Why Realism Matters:** Evaluation should use the same cost assumptions that will apply in live trading. Phase 4.8 ensures costs and constraints are explicit, configurable, and transparently reported.
 
+### Microstructure Truth: Real Order Book Data (Phase 4.9)
+
+Phase 4.9 enriches snapshots and evaluation with REAL bid/ask spread + top-of-book liquidity from Polymarket's public CLOB API, so constraints are based on actual order books rather than heuristics.
+
+#### What's Captured
+
+When `--with-orderbook` is enabled (default), snapshot collection fetches order book data:
+
+| Field | Description |
+|-------|-------------|
+| `best_bid` | Highest bid price from order book |
+| `best_ask` | Lowest ask price from order book |
+| `mid_price` | (best_bid + best_ask) / 2 |
+| `spread_bps` | ((best_ask - best_bid) / mid_price) × 10,000 |
+| `top_depth_usd` | min(bid_notional, ask_notional) at top of book |
+
+#### How It Works
+
+1. **Snapshot Collection**: Each market snapshot fetches order book from CLOB public endpoint
+2. **Microstructure Computation**: Computes spread_bps and top_depth_usd from raw order book
+3. **Constraint Evaluation**: Uses real spread_bps/top_depth_usd when available, falls back to legacy heuristics otherwise
+4. **Evaluation Reporting**: Shows microstructure coverage and median values
+
+#### CLI Usage
+
+```powershell
+# Collect snapshots WITH order book data (default)
+poetry run pmq snapshots run --interval 60 --with-orderbook
+
+# Disable order book fetching (faster, less data)
+poetry run pmq snapshots run --interval 60 --no-orderbook
+```
+
+#### Microstructure in Evaluation Reports
+
+When microstructure data is available, evaluation reports include:
+
+```markdown
+### Microstructure
+- **Snapshots with Order Book:** 80/100 (80.0%)
+- **Median Spread:** 150.0 bps
+- **Median Top-of-Book Depth:** $250.0
+- **Pairs Using Real Spread:** 5
+- **Pairs Using Real Depth:** 5
+- **Pairs Missing Microstructure:** 2
+```
+
+#### Constraint Behavior
+
+When evaluating pair constraints:
+
+| Scenario | Spread Source | Liquidity Source |
+|----------|---------------|------------------|
+| Microstructure available | `spread_bps` from order book | `top_depth_usd` from order book |
+| Microstructure missing | Legacy bid/ask spread heuristic | Legacy liquidity from Gamma API |
+
+Constraint evaluation tracks which source was used and reports it.
+
+#### Schema Changes
+
+The `market_snapshots` table now includes (nullable, backward compatible):
+
+```sql
+best_bid REAL,
+best_ask REAL,
+mid_price REAL,
+spread_bps REAL,
+top_depth_usd REAL
+```
+
+Old databases are automatically migrated when opened.
+
+#### API Endpoints Used
+
+| Endpoint | Purpose |
+|----------|----------|
+| `https://clob.polymarket.com/book?token_id=...` | Fetch order book for a token |
+
+> ⚠️ **Paper Only**: Phase 4.9 does NOT add any wallet auth, private keys, order placement, or WebSocket user channels. All data is from public read-only endpoints.
+
+> 💡 **Why Microstructure?** Heuristic-based spread and liquidity estimates can be inaccurate. Real order book data ensures constraints filter pairs based on actual market conditions, leading to more realistic evaluation results.
+
 ## Project Structure
 
 ```
@@ -1363,6 +1451,15 @@ poetry run mypy src
 - [x] Constraint filtering with pair counts in reports
 - [x] Cost Assumptions section in evaluation reports
 - [x] Constraint Filtering section in evaluation reports
+
+### Phase 4.9 ✓
+- [x] Microstructure Truth: Real bid/ask spread + top-of-book liquidity from CLOB
+- [x] Order book fetching from Polymarket public CLOB API
+- [x] Schema extended with microstructure columns (backward compatible)
+- [x] Snapshot collection with `--with-orderbook` flag
+- [x] Constraints prefer real spread_bps/top_depth_usd over heuristics
+- [x] Microstructure section in evaluation reports
+- [x] Paper-only: no wallet auth or order placement
 
 ### Phase 5 (Future)
 - [ ] Authenticated CLOB integration

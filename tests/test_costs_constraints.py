@@ -366,11 +366,13 @@ class TestLiquiditySpreadComputation:
         ]
         times = ["t1"]
 
-        liquidity = compute_pair_liquidity(snapshots, "A", "B", times)
+        # Phase 4.9: compute_pair_liquidity returns (liquidity, used_microstructure)
+        liquidity, used_micro = compute_pair_liquidity(snapshots, "A", "B", times)
 
         # Average of (100+150) and (200+250) = (250 + 450) / 2 = 350
         assert liquidity is not None
         assert abs(liquidity - 350.0) < 0.01
+        assert used_micro is False  # No microstructure data in legacy test
 
     def test_compute_pair_spread(self) -> None:
         """Test spread computation."""
@@ -384,19 +386,23 @@ class TestLiquiditySpreadComputation:
         ]
         times = ["t1"]
 
-        spread = compute_pair_spread(snapshots, "A", "B", times)
+        # Phase 4.9: compute_pair_spread returns (spread, used_microstructure)
+        spread, used_micro = compute_pair_spread(snapshots, "A", "B", times)
 
         # spread = (0.52 - 0.48) / 0.50 = 0.08
         assert spread is not None
         assert abs(spread - 0.08) < 0.01
+        assert used_micro is False  # No microstructure data in legacy test
 
     def test_compute_liquidity_no_data(self) -> None:
         """Should return None if no liquidity data."""
         snapshots = [{"market_id": "A", "snapshot_time": "t1", "yes_price": 0.50}]
         times = ["t1"]
 
-        liquidity = compute_pair_liquidity(snapshots, "A", "B", times)
+        # Phase 4.9: returns (None, False) when no data
+        liquidity, used_micro = compute_pair_liquidity(snapshots, "A", "B", times)
         assert liquidity is None
+        assert used_micro is False
 
 
 # -----------------------------------------------------------------------------

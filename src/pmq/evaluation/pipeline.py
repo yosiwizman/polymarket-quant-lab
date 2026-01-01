@@ -121,6 +121,16 @@ class EvaluationResult:
     pairs_filtered_low_liquidity: int = 0
     pairs_filtered_high_spread: int = 0
 
+    # Microstructure fields (Phase 4.9)
+    # Order book data source tracking
+    microstructure_snapshots_total: int = 0  # Total snapshots in evaluation
+    microstructure_snapshots_with_book: int = 0  # Snapshots with bid/ask data
+    microstructure_median_spread_bps: float | None = None  # Median spread in bps
+    microstructure_median_depth_usd: float | None = None  # Median top depth in USD
+    microstructure_used_for_spread: int = 0  # Pairs that used real spread_bps
+    microstructure_used_for_depth: int = 0  # Pairs that used real top_depth_usd
+    microstructure_missing: int = 0  # Pairs missing microstructure data
+
     # Summary
     summary: str = ""
     commands: list[str] = field(default_factory=list)
@@ -416,6 +426,27 @@ class EvaluationPipeline:
                 "pairs_filtered_low_liquidity", 0
             )
             result.pairs_filtered_high_spread = backtest_result.get("pairs_filtered_high_spread", 0)
+
+            # Phase 4.9: Store microstructure stats from walk-forward
+            result.microstructure_snapshots_total = backtest_result.get(
+                "microstructure_snapshots_total", 0
+            )
+            result.microstructure_snapshots_with_book = backtest_result.get(
+                "microstructure_snapshots_with_book", 0
+            )
+            result.microstructure_median_spread_bps = backtest_result.get(
+                "microstructure_median_spread_bps"
+            )
+            result.microstructure_median_depth_usd = backtest_result.get(
+                "microstructure_median_depth_usd"
+            )
+            result.microstructure_used_for_spread = backtest_result.get(
+                "microstructure_used_for_spread", 0
+            )
+            result.microstructure_used_for_depth = backtest_result.get(
+                "microstructure_used_for_depth", 0
+            )
+            result.microstructure_missing = backtest_result.get("microstructure_missing", 0)
 
             # Phase 4.7: Re-check quality on the effective window used by walk-forward
             # This ensures governance evaluates quality on the same window as trades
@@ -897,6 +928,9 @@ class EvaluationPipeline:
             initial_balance=10000.0,  # Not used for walk-forward
         )
 
+        # Phase 4.9: Compute microstructure stats from snapshots
+        microstructure_stats = self._compute_microstructure_stats(snapshots)
+
         return {
             "run_id": run_id,
             "metrics": metrics,
@@ -919,6 +953,71 @@ class EvaluationPipeline:
             "pairs_after_constraints": pairs_after,
             "pairs_filtered_low_liquidity": constraint_result.filtered_low_liquidity,
             "pairs_filtered_high_spread": constraint_result.filtered_high_spread,
+            # Phase 4.9: Microstructure stats
+            "microstructure_snapshots_total": microstructure_stats["total"],
+            "microstructure_snapshots_with_book": microstructure_stats["with_book"],
+            "microstructure_median_spread_bps": microstructure_stats["median_spread_bps"],
+            "microstructure_median_depth_usd": microstructure_stats["median_depth_usd"],
+            "microstructure_used_for_spread": constraint_result.used_microstructure_spread,
+            "microstructure_used_for_depth": constraint_result.used_microstructure_depth,
+            "microstructure_missing": constraint_result.missing_microstructure,
+        }
+
+    def _compute_microstructure_stats(self, snapshots: list[Any]) -> dict[str, Any]:
+        """Compute microstructure statistics from snapshots.
+
+        Phase 4.9: Aggregate bid/ask/spread data from order book enriched snapshots.
+
+        Args:
+            snapshots: List of snapshot objects with optional microstructure fields
+
+        Returns:
+            Dict with total, with_book counts, and median spread/depth values
+        """
+        total = len(snapshots)
+        spread_values: list[float] = []
+        depth_values: list[float] = []
+        with_book = 0
+
+        for snap in snapshots:
+            # Check if snapshot has order book data (best_bid is not None)
+            best_bid = getattr(snap, "best_bid", None)
+            if best_bid is not None:
+                with_book += 1
+                # Collect spread_bps if available
+                spread_bps = getattr(snap, "spread_bps", None)
+                if spread_bps is not None:
+                    spread_values.append(float(spread_bps))
+                # Collect top_depth_usd if available
+                top_depth_usd = getattr(snap, "top_depth_usd", None)
+                if top_depth_usd is not None:
+                    depth_values.append(float(top_depth_usd))
+
+        # Compute medians (or None if no data)
+        median_spread: float | None = None
+        median_depth: float | None = None
+
+        if spread_values:
+            sorted_spreads = sorted(spread_values)
+            mid = len(sorted_spreads) // 2
+            if len(sorted_spreads) % 2 == 0:
+                median_spread = (sorted_spreads[mid - 1] + sorted_spreads[mid]) / 2
+            else:
+                median_spread = sorted_spreads[mid]
+
+        if depth_values:
+            sorted_depths = sorted(depth_values)
+            mid = len(sorted_depths) // 2
+            if len(sorted_depths) % 2 == 0:
+                median_depth = (sorted_depths[mid - 1] + sorted_depths[mid]) / 2
+            else:
+                median_depth = sorted_depths[mid]
+
+        return {
+            "total": total,
+            "with_book": with_book,
+            "median_spread_bps": median_spread,
+            "median_depth_usd": median_depth,
         }
 
     def _load_statarb_params(self, params_path: str | None) -> dict[str, Any]:

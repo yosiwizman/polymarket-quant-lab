@@ -1784,6 +1784,75 @@ With Phase 5.5, a 20-minute daemon run should show:
 
 > 💡 **Why Calibration?** Strict equality checks are too sensitive for floating-point data. Real order books have micro-variations that don't affect trading decisions. Phase 5.5's threshold-based detection focuses on differences that actually matter.
 
+### Cache Seeding + Metrics Invariants (Phase 5.6)
+
+Phase 5.6 addresses two issues:
+1. **Cold-start REST calls**: On daemon startup, the WSS cache is empty, causing many REST fallbacks on the first tick.
+2. **Metrics inconsistency**: REST bucket totals didn't always sum correctly.
+
+#### Cache Seeding
+
+Before the first tick, the daemon can pre-populate the WSS cache by fetching orderbooks via REST:
+
+```powershell
+# Default: seeding enabled, uses --limit as max tokens to seed
+poetry run pmq ops daemon --interval 60 --limit 200
+
+# Disable seeding (for faster startup, accepting cold-start REST calls)
+poetry run pmq ops daemon --no-seed-cache
+
+# Customize seeding behavior
+poetry run pmq ops daemon --seed-max 100 --seed-concurrency 20 --seed-timeout 60
+```
+
+Seeding:
+- Runs once at startup, before the first tick
+- Only fetches tokens that are missing from cache
+- Uses concurrent REST fetches with configurable limits
+- Tracks `rest_seed` counter separately from `rest_missing`
+
+#### Phase 5.6 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--seed-cache/--no-seed-cache` | bool | True | Enable cache seeding at startup |
+| `--seed-max` | int | (limit) | Max tokens to seed |
+| `--seed-concurrency` | int | 10 | Concurrent REST fetches during seeding |
+| `--seed-timeout` | float | 30.0 | Timeout for seeding phase (seconds) |
+
+#### Metrics Invariants (Phase 5.6)
+
+REST bucket totals now satisfy:
+
+```
+rest_total = rest_missing + rest_unhealthy + rest_very_old + rest_reconcile + rest_seed
+```
+
+Coverage formulas:
+- **coverage_raw_pct** = `wss_hits / (wss_hits + rest_fallbacks) * 100`
+- **coverage_effective_pct** = `(wss_fresh + wss_quiet) / (wss_fresh + wss_quiet + rest_missing + rest_unhealthy + rest_very_old) * 100`
+  - Excludes `rest_reconcile` and `rest_seed` (intentional operations, not fallbacks)
+
+#### Expected Results
+
+With Phase 5.6, a daemon run should show:
+- **rest_missing ≈ 0 on tick 1** (if seeding enabled)
+- **rest_seed > 0** (tokens seeded at startup)
+- **rest_total = sum of REST buckets** (invariant holds)
+- **coverage_effective > coverage_raw** (excludes reconcile/seed)
+
+#### Daily Export Schema (Phase 5.6)
+
+coverage JSON now includes:
+- `rest_seed`: REST calls for initial cache seeding
+- `rest_total`: Sum of all REST buckets
+
+daemon_summary markdown now shows:
+- REST Seed count in breakdown
+- REST Total as sum of buckets
+
+> 💡 **Why Seeding?** On startup, the WSS cache is empty. Without seeding, the first tick would trigger REST calls for every token, causing `rest_missing` to spike. Seeding pre-populates the cache so the first tick behaves like subsequent ticks.
+
 ## Project Structure
 
 ```

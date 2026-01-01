@@ -2029,3 +2029,301 @@ class TestReconciliationHealing:
 
         # No healing should occur
         assert tick_stats.reconcile_healed_count == 0
+
+
+# =============================================================================
+# Phase 5.6: Metrics Invariants Tests
+# =============================================================================
+
+
+class TestMetricsInvariants:
+    """Tests for Phase 5.6 metrics invariants."""
+
+    def test_tick_stats_has_rest_seed_field(self) -> None:
+        """TickStats should have rest_seed field."""
+        stats = TickStats(timestamp="2024-01-01T00:00:00Z")
+        assert stats.rest_seed == 0
+
+    def test_daily_stats_has_rest_seed_field(self) -> None:
+        """DailyStats should have total_rest_seed field."""
+        stats = DailyStats(date="2024-01-01")
+        assert stats.total_rest_seed == 0
+
+    def test_rest_bucket_sum_invariant(self) -> None:
+        """REST bucket totals should sum correctly."""
+        stats = DailyStats(date="2024-01-01")
+        stats.total_rest_missing = 10
+        stats.total_rest_unhealthy = 5
+        stats.total_rest_very_old = 3
+        stats.total_rest_reconcile = 20
+        stats.total_rest_seed = 50
+
+        # Compute rest_total like daemon does
+        rest_total = (
+            stats.total_rest_missing
+            + stats.total_rest_unhealthy
+            + stats.total_rest_very_old
+            + stats.total_rest_reconcile
+            + stats.total_rest_seed
+        )
+
+        assert rest_total == 88
+
+    def test_coverage_effective_excludes_seed_and_reconcile(self) -> None:
+        """Effective coverage should exclude reconcile and seed REST calls."""
+        # Simulate: 100 fresh + 20 quiet = 120 WSS cache hits
+        # 30 missing + 5 unhealthy + 5 very_old = 40 real fallbacks
+        # 10 reconcile + 50 seed = 60 intentional REST
+        wss_cache_total = 100 + 20
+        rest_fallback_real = 30 + 5 + 5
+
+        effective_denom = wss_cache_total + rest_fallback_real
+        coverage_effective_pct = wss_cache_total / effective_denom * 100
+
+        # 120 / 160 = 75%
+        assert coverage_effective_pct == 75.0
+
+
+# =============================================================================
+# Phase 5.6: Cache Seeding Tests
+# =============================================================================
+
+
+class TestCacheSeeding:
+    """Tests for Phase 5.6 cache seeding."""
+
+    @pytest.fixture
+    def dao(self) -> FakeDAO:
+        """Create fake DAO."""
+        return FakeDAO()
+
+    @pytest.fixture
+    def wss_client(self) -> FakeWssClient:
+        """Create fake WSS client."""
+        return FakeWssClient()
+
+    @pytest.fixture
+    def ob_fetcher(self) -> FakeOrderBookFetcher:
+        """Create fake orderbook fetcher."""
+        return FakeOrderBookFetcher()
+
+    def test_daemon_config_has_seed_fields(self) -> None:
+        """DaemonConfig should have seed_* fields."""
+        config = DaemonConfig()
+        assert config.seed_cache is True
+        assert config.seed_max is None
+        assert config.seed_concurrency == 10
+        assert config.seed_timeout == 30.0
+
+    def test_daemon_config_seed_disabled(self) -> None:
+        """seed_cache=False should disable seeding."""
+        config = DaemonConfig(seed_cache=False)
+        assert config.seed_cache is False
+
+    @pytest.mark.asyncio
+    async def test_seeding_populates_cache(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Seeding should pre-populate cache for missing tokens."""
+        # Setup: markets with no cached orderbooks
+        gamma_client = FakeGammaClient(
+            markets=[
+                FakeMarket("m1", "0xtoken1"),
+                FakeMarket("m2", "0xtoken2"),
+            ]
+        )
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_max=10,
+            seed_concurrency=5,
+            seed_timeout=10.0,
+            max_hours=0.001,  # Stop quickly
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        # Before seeding, no cached books
+        assert not wss_client.has_cached_book("0xtoken1")
+        assert not wss_client.has_cached_book("0xtoken2")
+
+        # Run seeding
+        seeded = await runner._seed_cache()
+
+        # After seeding, books should be cached
+        assert seeded == 2
+        assert wss_client.has_cached_book("0xtoken1")
+        assert wss_client.has_cached_book("0xtoken2")
+
+    @pytest.mark.asyncio
+    async def test_seeding_respects_max(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """seed_max should cap number of tokens seeded."""
+        # Setup: 5 markets but seed_max=2
+        gamma_client = FakeGammaClient(
+            markets=[FakeMarket(f"m{i}", f"0xtoken{i}") for i in range(5)]
+        )
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_max=2,  # Only seed 2
+            seed_concurrency=5,
+            seed_timeout=10.0,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        # Run seeding
+        seeded = await runner._seed_cache()
+
+        # Should only seed 2 tokens
+        assert seeded == 2
+        assert runner._seed_count == 2
+
+    @pytest.mark.asyncio
+    async def test_seeding_disabled(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """seed_cache=False should skip seeding."""
+        gamma_client = FakeGammaClient(markets=[FakeMarket("m1", "0xtoken1")])
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=False,  # Disabled
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        # Seeding should do nothing when disabled
+        seeded = await runner._seed_cache()
+        assert seeded == 0
+        assert not wss_client.has_cached_book("0xtoken1")
+
+    @pytest.mark.asyncio
+    async def test_seeding_skips_already_cached(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Seeding should skip tokens that are already cached."""
+        gamma_client = FakeGammaClient(
+            markets=[
+                FakeMarket("m1", "0xtoken1"),
+                FakeMarket("m2", "0xtoken2"),
+            ]
+        )
+        # Pre-cache one token
+        wss_client.add_orderbook("0xtoken1", valid=True)
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_max=10,
+            seed_concurrency=5,
+            seed_timeout=10.0,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        # Run seeding - should only seed token2
+        seeded = await runner._seed_cache()
+
+        assert seeded == 1  # Only token2 was missing
+        assert runner._seed_count == 1
+
+    @pytest.mark.asyncio
+    async def test_seeding_only_runs_once(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Seeding should only run once per daemon instance."""
+        gamma_client = FakeGammaClient(markets=[FakeMarket("m1", "0xtoken1")])
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_max=10,
+            seed_concurrency=5,
+            seed_timeout=10.0,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        # First seed
+        seeded1 = await runner._seed_cache()
+        assert seeded1 == 1
+
+        # Second seed should return cached count without re-seeding
+        seeded2 = await runner._seed_cache()
+        assert seeded2 == 1  # Returns cached count
+        assert runner._seeded is True

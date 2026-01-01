@@ -26,6 +26,11 @@ Phase 5.7: Seed accounting + WSS health grace:
 - rest_seed correctly counted in exports when seeding runs
 - SeedResult dataclass for clear seeding metrics
 - WSS health grace window to reduce rest_unhealthy at startup
+
+Phase 5.8: REST resilience:
+- Token bucket rate limiter for global REST request rate control
+- Retry with exponential backoff + jitter for transient failures (429/5xx/timeout)
+- New metrics: rest_retry_calls, seed_retry_calls, rest_429_count, rest_5xx_count
 """
 
 from __future__ import annotations
@@ -106,13 +111,17 @@ async def real_sleep(seconds: float) -> None:
 
 @dataclass
 class SeedResult:
-    """Result of cache seeding operation (Phase 5.7)."""
+    """Result of cache seeding operation (Phase 5.7/5.8)."""
 
     attempted: int = 0  # Number of tokens we tried to seed
     succeeded: int = 0  # Number successfully cached
     rest_calls: int = 0  # REST API calls made (= attempted)
     duration_seconds: float = 0.0  # Total seeding time
     errors: int = 0  # Number of failed fetches
+    # Phase 5.8: Retry metrics
+    retry_calls: int = 0  # Total retry attempts during seeding
+    http_429_count: int = 0  # 429 responses seen
+    http_5xx_count: int = 0  # 5xx responses seen
 
 
 @dataclass
@@ -154,6 +163,10 @@ class TickStats:
     drift_count: int = 0  # Number with detected drift (= healed if heal enabled)
     drift_max_mid_bps: float = 0.0  # Max mid price difference observed (bps)
     drift_max_spread: float = 0.0  # Deprecated - use drift_max_mid_bps
+    # Phase 5.8: REST resilience metrics
+    rest_retry_calls: int = 0  # Total retry attempts this tick
+    rest_429_count: int = 0  # 429 responses this tick
+    rest_5xx_count: int = 0  # 5xx responses this tick
 
 
 @dataclass
@@ -187,6 +200,11 @@ class DailyStats:
     total_reconcile_ok: int = 0
     total_reconcile_healed: int = 0
     total_drift: int = 0
+    # Phase 5.8: REST resilience metrics
+    total_rest_retry_calls: int = 0  # Total retry attempts across all REST calls
+    seed_retry_calls: int = 0  # Retry attempts during seeding only
+    total_rest_429: int = 0  # Total 429 responses
+    total_rest_5xx: int = 0  # Total 5xx responses
 
 
 def compute_adaptive_staleness(interval_seconds: int) -> float:
@@ -242,6 +260,12 @@ class DaemonConfig:
     wss_health_grace_seconds: float = (
         60.0  # Grace period after connect before enforcing health timeout
     )
+    # Phase 5.8: REST resilience settings
+    rest_rps: float = 8.0  # REST requests per second (rate limiter)
+    rest_burst: int = 8  # REST burst capacity (token bucket size)
+    rest_max_retries: int = 3  # Max retry attempts (not counting initial)
+    rest_backoff_base: float = 0.25  # Base backoff delay in seconds
+    rest_backoff_max: float = 3.0  # Maximum backoff delay in seconds
 
     def get_effective_staleness(self) -> float:
         """Get effective staleness threshold (adaptive if not explicitly set).
@@ -312,6 +336,25 @@ class DaemonRunner:
         self._seeded = False
         self._seed_result: SeedResult | None = None  # Phase 5.7: Full seeding metrics
 
+        # Phase 5.8: REST resilience - rate limiter and config
+        from pmq.ops.rest_resilience import (
+            RestResilienceConfig,
+            TokenBucketRateLimiter,
+        )
+
+        self._rest_resilience_config = RestResilienceConfig(
+            rps=config.rest_rps,
+            burst=config.rest_burst,
+            max_retries=config.rest_max_retries,
+            backoff_base=config.rest_backoff_base,
+            backoff_max=config.rest_backoff_max,
+        )
+        self._rate_limiter = TokenBucketRateLimiter(
+            rps=config.rest_rps,
+            burst=config.rest_burst,
+            clock=self.clock,
+        )
+
         # Ensure export directory exists
         self.config.export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -369,11 +412,16 @@ class DaemonRunner:
         ):
             seed_result = await self._seed_cache()
             self._seed_result = seed_result
-            # Phase 5.7: Initialize daily stats with seed metrics if needed
+            # Phase 5.7/5.8: Initialize daily stats with seed metrics if needed
             if seed_result.rest_calls > 0:
                 self._ensure_daily_stats_initialized()
                 if self._daily_stats:
                     self._daily_stats.total_rest_seed += seed_result.rest_calls
+                    # Phase 5.8: Propagate retry metrics from seeding
+                    self._daily_stats.seed_retry_calls += seed_result.retry_calls
+                    self._daily_stats.total_rest_retry_calls += seed_result.retry_calls
+                    self._daily_stats.total_rest_429 += seed_result.http_429_count
+                    self._daily_stats.total_rest_5xx += seed_result.http_5xx_count
 
         try:
             while not self._shutdown_requested:
@@ -708,12 +756,15 @@ class DaemonRunner:
     async def _seed_cache(self) -> SeedResult:
         """Pre-populate WSS cache with REST data to reduce cold-start missing.
 
-        Phase 5.6/5.7: Fetches orderbooks for tokens missing from cache at startup.
+        Phase 5.6/5.7/5.8: Fetches orderbooks for tokens missing from cache at startup.
         Uses concurrent REST fetches with configurable limits.
+        Phase 5.8: Uses retry_rest_call with rate limiting for resilience.
 
         Returns:
-            SeedResult with detailed metrics (Phase 5.7)
+            SeedResult with detailed metrics (Phase 5.7/5.8)
         """
+        from pmq.ops.rest_resilience import RestCallStats, retry_rest_call
+
         # Check if seeding is enabled
         if not self.config.seed_cache:
             return SeedResult()
@@ -727,6 +778,8 @@ class DaemonRunner:
         # Capture in local vars for type narrowing (mypy doesn't track across nested functions)
         wss_client = self.wss_client
         ob_fetcher = self.ob_fetcher
+        resilience_config = self._rest_resilience_config
+        rate_limiter = self._rate_limiter
 
         logger.info("Cache seeding started...")
         start_time = self.clock.monotonic()
@@ -758,33 +811,45 @@ class DaemonRunner:
 
         seeded = 0
         errors = 0
+        total_retries = 0
+        total_429 = 0
+        total_5xx = 0
         concurrency = self.config.seed_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def seed_one(token_id: str) -> bool:
-            """Fetch and cache one token."""
+        async def seed_one(token_id: str) -> tuple[bool, RestCallStats]:
+            """Fetch and cache one token with retry."""
             async with semaphore:
-                try:
-                    # Run sync REST fetch in thread pool
-                    loop = asyncio.get_event_loop()
-                    ob = await loop.run_in_executor(
-                        None,
-                        ob_fetcher.fetch_order_book,
-                        token_id,
-                    )
-                    if ob and ob.has_valid_book:
-                        wss_client.update_cache(token_id, ob)
-                        return True
-                except Exception as e:
-                    logger.debug(f"Seed failed for {token_id[:16]}...: {e}")
-                return False
+                # Phase 5.8: Use retry_rest_call with rate limiting
+                ob, stats = await retry_rest_call(
+                    call_fn=lambda: ob_fetcher.fetch_order_book(token_id),
+                    config=resilience_config,
+                    rate_limiter=rate_limiter,
+                )
+                if ob and ob.has_valid_book:
+                    wss_client.update_cache(token_id, ob)
+                    return True, stats
+                return False, stats
 
         try:
             async with asyncio.timeout(self.config.seed_timeout):
                 tasks = [seed_one(tid) for tid in to_seed]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                seeded = sum(1 for r in results if r is True)
-                errors = sum(1 for r in results if r is False or isinstance(r, Exception))
+                for r in results:
+                    if isinstance(r, Exception):
+                        errors += 1
+                    elif isinstance(r, tuple):
+                        success, stats = r
+                        if success:
+                            seeded += 1
+                        else:
+                            errors += 1
+                        # Aggregate retry stats
+                        total_retries += stats.retry_count
+                        total_429 += stats.http_429_count
+                        total_5xx += stats.http_5xx_count
+                    else:
+                        errors += 1
         except TimeoutError:
             logger.warning(f"Cache seeding timed out after {self.config.seed_timeout}s")
             # Count unfinished tasks as errors
@@ -799,11 +864,15 @@ class DaemonRunner:
             rest_calls=len(to_seed),  # Each attempt = 1 REST call
             duration_seconds=duration,
             errors=errors,
+            # Phase 5.8: Retry metrics
+            retry_calls=total_retries,
+            http_429_count=total_429,
+            http_5xx_count=total_5xx,
         )
 
         logger.info(
             f"Cache seeding completed: {seeded}/{len(to_seed)} tokens cached "
-            f"in {duration:.1f}s (rest_seed={result.rest_calls})"
+            f"in {duration:.1f}s (rest_seed={result.rest_calls}, retries={total_retries})"
         )
         return result
 
@@ -855,6 +924,10 @@ class DaemonRunner:
             self._daily_stats.total_reconcile_ok += tick_stats.reconcile_ok_count
             self._daily_stats.total_reconcile_healed += tick_stats.reconcile_healed_count
             self._daily_stats.total_drift += tick_stats.drift_count
+            # Phase 5.8: REST resilience metrics
+            self._daily_stats.total_rest_retry_calls += tick_stats.rest_retry_calls
+            self._daily_stats.total_rest_429 += tick_stats.rest_429_count
+            self._daily_stats.total_rest_5xx += tick_stats.rest_5xx_count
             if tick_stats.error:
                 self._daily_stats.total_errors += 1
             self._daily_stats.end_time = tick_stats.timestamp
@@ -1102,6 +1175,11 @@ class DaemonRunner:
             "drift_count": stats.total_drift,
             "drift_pct": drift_pct,
             "heal_pct": heal_pct,
+            # Phase 5.8: REST resilience metrics
+            "rest_retry_calls": stats.total_rest_retry_calls,
+            "seed_retry_calls": stats.seed_retry_calls,
+            "rest_429_count": stats.total_rest_429,
+            "rest_5xx_count": stats.total_rest_5xx,
             # Metadata
             "errors": stats.total_errors,
             "start_time": stats.start_time,
@@ -1176,14 +1254,16 @@ class DaemonRunner:
         # Export markdown summary (Phase 5.7)
         md_path = export_dir / f"daemon_summary_{date_str}.md"
 
-        # Phase 5.7: Cache seeding section
+        # Phase 5.7/5.8: Cache seeding section
+        seed_retries = seed_result.retry_calls if seed_result else 0
         seed_section = ""
         if seed_attempted > 0:
-            seed_section = f"""## Cache Seeding (Phase 5.7)
+            seed_section = f"""## Cache Seeding (Phase 5.8)
 - **Attempted:** {seed_attempted:,}
 - **Succeeded:** {seed_succeeded:,}
 - **Duration:** {seed_duration:.1f}s
 - **REST Calls:** {stats.total_rest_seed:,}
+- **Retries:** {seed_retries:,}
 - **Errors:** {seed_errors:,}
 
 """
@@ -1226,11 +1306,17 @@ class DaemonRunner:
 - **Drift Rate:** {drift_pct:.1f}%
 - **Heal Rate:** {heal_pct:.1f}%
 
+## REST Resilience (Phase 5.8)
+- **Total Retries:** {stats.total_rest_retry_calls:,}
+- **Seed Retries:** {stats.seed_retry_calls:,}
+- **429 Responses:** {stats.total_rest_429:,}
+- **5xx Responses:** {stats.total_rest_5xx:,}
+
 ## Errors
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon (Phase 5.7)*
+*Generated by pmq ops daemon (Phase 5.8)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)

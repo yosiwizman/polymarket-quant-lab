@@ -1911,6 +1911,79 @@ daemon_summary markdown now shows:
 
 > 💡 **Why Health Grace?** WSS connections take time to establish and receive first messages. Without grace, the first tick would see "unhealthy" connection and trigger REST fallbacks for all markets, defeating the purpose of WSS streaming.
 
+### REST Retry + Rate Limiting (Phase 5.8)
+
+Phase 5.8 makes cache seeding and all daemon REST usage resilient to transient REST failures (HTTP 429 / 5xx / timeouts / network errors) by adding:
+1. **Shared async REST "safety wrapper"**: Retry with exponential backoff + jitter; honors Retry-After when present
+2. **Global async rate limiter**: Token bucket to cap REST request rate across all daemon tasks
+
+#### Retry Behavior
+
+Retryable failures:
+- HTTP 429 (rate limit)
+- HTTP 5xx (server errors)
+- Timeout/network exceptions
+
+Non-retryable failures (fail fast):
+- Other 4xx (except 429)
+
+Backoff:
+- Exponential: `base * 2^attempt`
+- Jitter: ±25% randomization
+- Capped at `backoff_max`
+- Respects Retry-After header if present (bounded by backoff_max)
+
+#### Rate Limiter
+
+Token bucket rate limiter applied BEFORE each REST request (and for each retry):
+- Refills tokens at `rest_rps` per second
+- Burst capacity of `rest_burst` tokens
+- Additive to existing concurrency controls (semaphores for seeding, etc.)
+
+#### Phase 5.8 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--rest-rps` | float | 8.0 | REST rate limit: requests per second |
+| `--rest-burst` | int | 8 | REST rate limit: burst capacity |
+| `--rest-retries` | int | 3 | REST retry: max retry attempts (not counting initial) |
+| `--rest-backoff-base` | float | 0.25 | REST retry: base backoff delay in seconds |
+| `--rest-backoff-max` | float | 3.0 | REST retry: maximum backoff delay in seconds |
+
+#### Example Usage
+
+```powershell
+# Default settings (recommended)
+poetry run pmq ops daemon --interval 60
+
+# More aggressive rate limiting
+poetry run pmq ops daemon --rest-rps 4 --rest-burst 4
+
+# More retries for flaky connections
+poetry run pmq ops daemon --rest-retries 5 --rest-backoff-max 5.0
+
+# Conservative settings for CI/testing
+poetry run pmq ops daemon --rest-rps 2 --rest-burst 2 --rest-retries 2
+```
+
+#### New Metrics (Phase 5.8)
+
+Coverage JSON and daemon summary now include:
+- `rest_retry_calls`: Total retry attempts across all REST calls (not counting initial attempt)
+- `seed_retry_calls`: Retry attempts during seeding only
+- `rest_429_count`: Total 429 responses observed
+- `rest_5xx_count`: Total 5xx responses observed
+
+#### Expected Results
+
+With Phase 5.8, a daemon run should show:
+- **seed_succeeded approaches seed_attempted** (transient failures are retried)
+- **seed_errors decrease** (retries recover from 429/5xx/timeout)
+- **rest_retry_calls > 0** when transient failures occur (retries are logged)
+- **Invariants still hold** (rest_total = sum of REST buckets)
+
+> 💡 **Why REST Resilience?** Polymarket's CLOB API can return 429 (rate limit) or 5xx errors during peak load. Without retry logic, these transient failures cause seed_errors to spike, reducing cache coverage. Phase 5.8 makes seeding and live REST fallbacks robust to these transient conditions.
+
 ## Project Structure
 
 ```
@@ -2170,6 +2243,15 @@ poetry run mypy src
 - [x] WSS health grace period (--wss-health-grace) to reduce rest_unhealthy at startup
 - [x] Coverage JSON includes seed metrics
 - [x] Daemon summary includes Cache Seeding section
+
+### Phase 5.8 ✓
+- [x] REST retry with exponential backoff + jitter for transient failures (429/5xx/timeout)
+- [x] Token bucket rate limiter for global REST request rate control
+- [x] New CLI flags: `--rest-rps`, `--rest-burst`, `--rest-retries`, `--rest-backoff-base`, `--rest-backoff-max`
+- [x] New metrics: `rest_retry_calls`, `seed_retry_calls`, `rest_429_count`, `rest_5xx_count`
+- [x] Shared REST safety wrapper used by seeding, reconciliation, and fallback REST calls
+- [x] Unit tests for retry behavior and rate limiter with deterministic clock
+- [x] Coverage JSON and daemon summary include REST resilience metrics
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

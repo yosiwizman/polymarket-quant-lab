@@ -4040,6 +4040,42 @@ def ops_daemon(
             help="WSS health grace period in seconds (default: 60) - assume healthy until grace expires",
         ),
     ] = 60.0,
+    # Phase 5.8: REST resilience flags
+    rest_rps: Annotated[
+        float,
+        typer.Option(
+            "--rest-rps",
+            help="REST rate limit: requests per second (default: 8)",
+        ),
+    ] = 8.0,
+    rest_burst: Annotated[
+        int,
+        typer.Option(
+            "--rest-burst",
+            help="REST rate limit: burst capacity (default: 8)",
+        ),
+    ] = 8,
+    rest_retries: Annotated[
+        int,
+        typer.Option(
+            "--rest-retries",
+            help="REST retry: max retry attempts for 429/5xx/timeout (default: 3)",
+        ),
+    ] = 3,
+    rest_backoff_base: Annotated[
+        float,
+        typer.Option(
+            "--rest-backoff-base",
+            help="REST retry: base backoff delay in seconds (default: 0.25)",
+        ),
+    ] = 0.25,
+    rest_backoff_max: Annotated[
+        float,
+        typer.Option(
+            "--rest-backoff-max",
+            help="REST retry: maximum backoff delay in seconds (default: 3.0)",
+        ),
+    ] = 3.0,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -4053,6 +4089,8 @@ def ops_daemon(
     - Two coverage metrics: effective (excludes reconcile/seed) and raw (Phase 5.6)
     - WSS health grace period to reduce rest_unhealthy at startup (Phase 5.7)
     - rest_seed correctly counted in exports when seeding runs (Phase 5.7)
+    - REST retry with exponential backoff for 429/5xx/timeout (Phase 5.8)
+    - Token bucket rate limiting for global REST request control (Phase 5.8)
     - Daily export artifacts (CSV, JSON, markdown)
     - Daily snapshot exports to gzip CSV (Phase 5.2)
     - Optional retention cleanup for old snapshots (Phase 5.2)
@@ -4074,6 +4112,7 @@ def ops_daemon(
         pmq ops daemon --reconcile-mid-bps 25 --reconcile-heal  # Phase 5.5
         pmq ops daemon --seed-cache --seed-max 100 --seed-concurrency 20  # Phase 5.6
         pmq ops daemon --wss-health-grace 90  # Phase 5.7: longer grace period
+        pmq ops daemon --rest-rps 10 --rest-burst 10 --rest-retries 5  # Phase 5.8
     """
     import asyncio
 
@@ -4125,6 +4164,12 @@ def ops_daemon(
         seed_timeout=seed_timeout,
         # Phase 5.7: WSS health grace
         wss_health_grace_seconds=wss_health_grace,
+        # Phase 5.8: REST resilience
+        rest_rps=rest_rps,
+        rest_burst=rest_burst,
+        rest_max_retries=rest_retries,
+        rest_backoff_base=rest_backoff_base,
+        rest_backoff_max=rest_backoff_max,
     )
 
     # Initialize dependencies
@@ -4167,7 +4212,7 @@ def ops_daemon(
     seed_str = "on" if seed_cache else "off"
     seed_max_str = str(seed_max) if seed_max else str(limit)
     console.print(
-        f"[bold green]Starting ops daemon (Phase 5.7)[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 5.8)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
@@ -4178,6 +4223,7 @@ def ops_daemon(
         f"Drift Thresholds: mid={reconcile_mid_bps}bps, spread={reconcile_spread_bps}bps, depth={reconcile_depth_pct}%\n"
         f"Cache Healing: {heal_str} (max {reconcile_max_heals}/tick)\n"
         f"Cache Seeding: {seed_str} (max {seed_max_str}, concurrency {seed_concurrency})\n"
+        f"REST Resilience: {rest_rps:.1f} rps, burst {rest_burst}, {rest_retries} retries\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"

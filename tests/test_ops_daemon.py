@@ -1891,7 +1891,7 @@ class TestReconciliationHealing:
     async def test_reconciliation_no_drift_increments_ok(
         self,
         dao: FakeDAO,
-        gamma_client: FakeGammaClient,
+        gamma_client: FakeGammaClient,  # noqa: ARG002
         wss_client: FakeWssClient,
         ob_fetcher: FakeOrderBookFetcher,
     ) -> None:

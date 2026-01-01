@@ -72,9 +72,7 @@ def _to_decimal(value: float | None) -> Decimal | None:
     return Decimal(str(value))
 
 
-def _compute_mid_diff_bps(
-    wss_mid: float | None, rest_mid: float | None
-) -> float | None:
+def _compute_mid_diff_bps(wss_mid: float | None, rest_mid: float | None) -> float | None:
     """Compute mid price difference in basis points.
 
     Formula: abs(wss_mid - rest_mid) / rest_mid * 10000
@@ -173,14 +171,10 @@ def compute_drift_metrics(
     metrics.mid_diff_bps = _compute_mid_diff_bps(wss_ob.mid_price, rest_ob.mid_price)
 
     # Compute spread difference
-    metrics.spread_diff_bps = _compute_spread_diff_bps(
-        wss_ob.spread_bps, rest_ob.spread_bps
-    )
+    metrics.spread_diff_bps = _compute_spread_diff_bps(wss_ob.spread_bps, rest_ob.spread_bps)
 
     # Compute depth difference
-    metrics.depth_diff_pct = _compute_depth_diff_pct(
-        wss_ob, rest_ob, thresholds.depth_levels
-    )
+    metrics.depth_diff_pct = _compute_depth_diff_pct(wss_ob, rest_ob, thresholds.depth_levels)
 
     # Check thresholds (OR conditions)
     drift_reasons: list[str] = []
@@ -188,16 +182,10 @@ def compute_drift_metrics(
     if metrics.mid_diff_bps is not None and metrics.mid_diff_bps > thresholds.mid_diff_bps:
         drift_reasons.append(f"mid={metrics.mid_diff_bps:.1f}bps")
 
-    if (
-        metrics.spread_diff_bps is not None
-        and metrics.spread_diff_bps > thresholds.spread_diff_bps
-    ):
+    if metrics.spread_diff_bps is not None and metrics.spread_diff_bps > thresholds.spread_diff_bps:
         drift_reasons.append(f"spread={metrics.spread_diff_bps:.1f}bps")
 
-    if (
-        metrics.depth_diff_pct is not None
-        and metrics.depth_diff_pct > thresholds.depth_diff_pct
-    ):
+    if metrics.depth_diff_pct is not None and metrics.depth_diff_pct > thresholds.depth_diff_pct:
         drift_reasons.append(f"depth={metrics.depth_diff_pct:.1f}%")
 
     if drift_reasons:

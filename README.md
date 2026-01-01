@@ -1348,6 +1348,118 @@ await client.close()
 
 > 💡 **When to Use WSS**: WebSocket mode is ideal for continuous collection sessions where lower latency and reduced API load are beneficial. REST mode is better for short collection runs or when network conditions are unreliable.
 
+### Continuous Snapshot Capture Daemon (Phase 5.1)
+
+Phase 5.1 provides a production-grade daemon for continuous market data capture with:
+- Resilient WSS connection with automatic REST fallback
+- Coverage tracking per tick (WSS hits, REST fallbacks, stale, missing)
+- Daily export artifacts (CSV, JSON, markdown) on UTC rollover
+- Clean shutdown on SIGINT/SIGTERM
+- Injectable dependencies for testability
+
+#### Basic Usage
+
+```powershell
+# Start daemon with defaults (60s interval, WSS mode, infinite runtime)
+poetry run pmq ops daemon
+
+# Run for 24 hours with custom interval
+poetry run pmq ops daemon --interval 60 --max-hours 24
+
+# Use REST-only mode (no WebSocket)
+poetry run pmq ops daemon --orderbook-source rest
+
+# Custom export directory
+poetry run pmq ops daemon --export-dir ./data/exports
+```
+
+#### CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--interval` | int | 60 | Snapshot interval in seconds |
+| `--limit` | int | 200 | Markets per cycle |
+| `--orderbook-source` | str | `wss` | `rest` or `wss` |
+| `--wss-staleness` | float | 30.0 | WSS staleness threshold (seconds) |
+| `--max-hours` | float | None | Max runtime (infinite if not set) |
+| `--export-dir` | Path | `exports` | Directory for daily exports |
+| `--with-orderbook/--no-orderbook` | bool | True | Fetch order book data |
+
+#### Daily Export Artifacts
+
+The daemon automatically exports artifacts at UTC day rollover (and on shutdown):
+
+| File | Description |
+|------|-------------|
+| `ticks_YYYY-MM-DD.csv` | Per-tick history with timestamps, counts, coverage |
+| `coverage_YYYY-MM-DD.json` | Daily coverage statistics (WSS%, fallbacks, errors) |
+| `daemon_summary_YYYY-MM-DD.md` | Human-readable daily summary |
+
+#### Coverage JSON Format
+
+```json
+{
+  "date": "2024-01-15",
+  "total_ticks": 1440,
+  "total_snapshots": 288000,
+  "wss_hits": 250000,
+  "rest_fallbacks": 30000,
+  "stale_count": 5000,
+  "missing_count": 3000,
+  "errors": 2,
+  "wss_coverage_pct": 89.3
+}
+```
+
+#### Graceful Shutdown
+
+The daemon handles SIGINT (Ctrl+C) and SIGTERM gracefully:
+1. Stops accepting new ticks
+2. Exports current day's artifacts
+3. Closes WSS connection
+4. Closes REST fetcher
+5. Logs "Daemon stopped"
+
+#### Production Deployment
+
+**Linux (systemd):**
+
+```ini
+# /etc/systemd/system/pmq-daemon.service
+[Unit]
+Description=Polymarket Quant Lab Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=pmq
+WorkingDirectory=/opt/polymarket-quant-lab
+ExecStart=/usr/bin/poetry run pmq ops daemon --interval 60 --export-dir /var/lib/pmq/exports
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl enable pmq-daemon
+sudo systemctl start pmq-daemon
+sudo journalctl -u pmq-daemon -f
+```
+
+**Windows (Task Scheduler):**
+
+1. Create a new Basic Task in Task Scheduler
+2. Trigger: At startup (or scheduled time)
+3. Action: Start a program
+4. Program: `poetry`
+5. Arguments: `run pmq ops daemon --interval 60 --max-hours 24`
+6. Start in: `C:\path\to\polymarket-quant-lab`
+
+> 💡 **Daemon vs Snapshots Run**: Use `pmq ops daemon` for production continuous capture. Use `pmq snapshots run` for shorter ad-hoc collection sessions. The daemon provides better coverage tracking and daily exports.
+
 ## Project Structure
 
 ```
@@ -1560,6 +1672,15 @@ poetry run mypy src
 - [x] WSS coverage statistics in CLI output
 - [x] Thread-safe cache access for concurrent reads
 - [x] Paper-only: no auth required (public Market channel only)
+
+### Phase 5.1 ✓
+- [x] Continuous snapshot capture daemon (`pmq ops daemon`)
+- [x] DaemonRunner with injectable dependencies (clock, sleep, WSS, DAO)
+- [x] Coverage tracking per tick (wss_hits, rest_fallbacks, stale, missing)
+- [x] Daily UTC rollover exports (CSV, JSON, markdown)
+- [x] Graceful shutdown on SIGINT/SIGTERM
+- [x] Systemd and Windows Task Scheduler deployment templates
+- [x] Unit tests with mocked dependencies
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

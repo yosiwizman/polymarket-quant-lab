@@ -161,9 +161,7 @@ class MarketWssClient:
         except Exception as e:
             logger.error(f"Failed to send subscribe: {e}")
 
-    def get_orderbook(
-        self, token_id: str, allow_stale: bool = False
-    ) -> OrderBookData | None:
+    def get_orderbook(self, token_id: str, allow_stale: bool = False) -> OrderBookData | None:
         """Get cached order book data for a token.
 
         Thread-safe. Returns None if not in cache or stale.
@@ -267,18 +265,14 @@ class MarketWssClient:
                 jitter = backoff * JITTER_FACTOR * (2 * random.random() - 1)
                 sleep_time = backoff + jitter
 
-                logger.warning(
-                    f"WebSocket error: {e}. Reconnecting in {sleep_time:.1f}s"
-                )
+                logger.warning(f"WebSocket error: {e}. Reconnecting in {sleep_time:.1f}s")
 
                 with self._lock:
                     self._stats.reconnect_count += 1
 
                 # Wait before reconnect (interruptible)
                 try:
-                    await asyncio.wait_for(
-                        self._stop_event.wait(), timeout=sleep_time
-                    )
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=sleep_time)
                     # Stop event was set, exit
                     break
                 except TimeoutError:

@@ -9,7 +9,7 @@ import asyncio
 import contextlib
 import json
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -172,9 +172,7 @@ class TestMessageParsing:
         assert ob.best_bid is None
 
     @pytest.mark.asyncio
-    async def test_handle_price_change_updates_existing(
-        self, client: MarketWssClient
-    ) -> None:
+    async def test_handle_price_change_updates_existing(self, client: MarketWssClient) -> None:
         """Price change should update existing cache entry."""
         # First, create an entry via book message
         book_msg = {

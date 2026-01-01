@@ -1308,7 +1308,9 @@ def snapshots_run(
 
     # Validate orderbook-source
     if orderbook_source not in ("rest", "wss"):
-        console.print(f"[red]Invalid --orderbook-source: {orderbook_source}. Must be 'rest' or 'wss'.[/red]")
+        console.print(
+            f"[red]Invalid --orderbook-source: {orderbook_source}. Must be 'rest' or 'wss'.[/red]"
+        )
         raise typer.Exit(1)
 
     # Check kill switch
@@ -1397,7 +1399,9 @@ def snapshots_run(
                     cycle_fallbacks = 0
 
                     if with_orderbook:
-                        console.print(f"[dim]Fetching order books ({orderbook_source.upper()})...[/dim]")
+                        console.print(
+                            f"[dim]Fetching order books ({orderbook_source.upper()})...[/dim]"
+                        )
                         orderbook_data = {}
 
                         for market in markets:
@@ -1420,7 +1424,9 @@ def snapshots_run(
                                     if wss_client:  # Track fallback only in WSS mode
                                         cycle_fallbacks += 1
                                 except Exception as e:
-                                    logger.debug(f"REST order book fetch failed for {market.id}: {e}")
+                                    logger.debug(
+                                        f"REST order book fetch failed for {market.id}: {e}"
+                                    )
 
                             if ob and ob.has_valid_book:
                                 orderbook_data[market.id] = ob.to_dict()
@@ -1433,7 +1439,9 @@ def snapshots_run(
                     snapshot_time = datetime.now(UTC).isoformat()
                     snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time, orderbook_data)
 
-                    msg = f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                    msg = (
+                        f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
+                    )
                     if with_orderbook:
                         msg += f" [dim]({ob_success_count} with order books)[/dim]"
                         if wss_client:
@@ -1511,11 +1519,15 @@ def snapshots_run(
                                             orderbook_data[market.id] = ob.to_dict()
                                             ob_success_count += 1
                                     except Exception as e:
-                                        logger.debug(f"Order book fetch failed for {market.id}: {e}")
+                                        logger.debug(
+                                            f"Order book fetch failed for {market.id}: {e}"
+                                        )
 
                         # Save snapshots
                         snapshot_time = datetime.now(UTC).isoformat()
-                        snapshot_count = dao.save_snapshots_bulk(markets, snapshot_time, orderbook_data)
+                        snapshot_count = dao.save_snapshots_bulk(
+                            markets, snapshot_time, orderbook_data
+                        )
 
                         msg = f"[green]✓ Saved {snapshot_count} snapshots at {snapshot_time[:19]}[/green]"
                         if with_orderbook:
@@ -1556,7 +1568,9 @@ def snapshots_run(
     elapsed = int((time.time() - start_time) / 60)
     summary = f"\n[bold]Completed {cycle_count} cycles in {elapsed} minutes[/bold]"
     if orderbook_source == "wss" and (wss_hits + wss_fallbacks) > 0:
-        wss_pct = (wss_hits / (wss_hits + wss_fallbacks)) * 100 if (wss_hits + wss_fallbacks) > 0 else 0
+        wss_pct = (
+            (wss_hits / (wss_hits + wss_fallbacks)) * 100 if (wss_hits + wss_fallbacks) > 0 else 0
+        )
         summary += f"\n[dim]WSS coverage: {wss_pct:.1f}% ({wss_hits} hits, {wss_fallbacks} REST fallbacks)[/dim]"
     console.print(summary)
 

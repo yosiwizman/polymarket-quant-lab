@@ -181,6 +181,20 @@ class FakeOrderBook:
         self.has_valid_book = valid
         self.best_bid = 0.45 if valid else None
         self.best_ask = 0.55 if valid else None
+        # Phase 5.5: Add attributes needed for drift detection
+        if valid and self.best_bid is not None and self.best_ask is not None:
+            self.mid_price: float | None = (self.best_bid + self.best_ask) / 2.0
+            self.spread_bps: float | None = (
+                (self.best_ask - self.best_bid) / self.mid_price * 10000
+                if self.mid_price > 0
+                else None
+            )
+        else:
+            self.mid_price = None
+            self.spread_bps = None
+        # Empty depth levels (no drift on depth by default)
+        self.bids: list[Any] = []
+        self.asks: list[Any] = []
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict."""
@@ -188,6 +202,8 @@ class FakeOrderBook:
             "token_id": self.token_id,
             "best_bid": self.best_bid,
             "best_ask": self.best_ask,
+            "mid_price": self.mid_price,
+            "spread_bps": self.spread_bps,
         }
 
 

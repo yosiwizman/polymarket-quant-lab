@@ -174,6 +174,7 @@ class DaemonRunner:
         # State
         self._running = False
         self._shutdown_requested = False
+        self._finalized = False
         self._current_day: str | None = None
         self._daily_stats: DailyStats | None = None
         self._total_ticks = 0
@@ -453,22 +454,50 @@ class DaemonRunner:
         logger.info(f"Exported summary to {md_path}")
 
     async def _finalize(self) -> None:
-        """Finalize daemon: export current day stats and close connections."""
+        """Finalize daemon: export current day stats and close connections.
+
+        This method is idempotent and bounded - each cleanup step has a timeout
+        to prevent hangs. Errors are logged but do not block other cleanup.
+        """
+        # Idempotency guard
+        if self._finalized:
+            return
+        self._finalized = True
+
         logger.info("Finalizing daemon...")
 
-        # Export current day's data if any
+        # Export current day's data if any (with timeout)
         if self._daily_stats and self._daily_stats.total_ticks > 0:
-            await self._export_daily_artifacts(self._daily_stats)
+            try:
+                await asyncio.wait_for(
+                    self._export_daily_artifacts(self._daily_stats),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                logger.warning("Daily export timed out after 5s")
+            except Exception as e:
+                logger.warning(f"Daily export failed: {e}")
 
-        # Close WSS connection
+        # Close WSS connection (with timeout)
         if self.wss_client:
-            await self.wss_client.close()
+            try:
+                await asyncio.wait_for(self.wss_client.close(), timeout=2.0)
+            except TimeoutError:
+                logger.warning("WSS client close timed out after 2s")
+            except Exception as e:
+                logger.warning(f"WSS client close failed: {e}")
 
-        # Close other resources
+        # Close other resources (sync, but wrap in try/except)
         if self.ob_fetcher:
-            self.ob_fetcher.close()
+            try:
+                self.ob_fetcher.close()
+            except Exception as e:
+                logger.warning(f"OrderBook fetcher close failed: {e}")
 
-        self.gamma_client.close()
+        try:
+            self.gamma_client.close()
+        except Exception as e:
+            logger.warning(f"Gamma client close failed: {e}")
 
         logger.info("Daemon finalized")
 

@@ -399,9 +399,13 @@ class TestGracefulShutdown:
             await asyncio.sleep(0.01)
             runner.request_shutdown()
 
-        await asyncio.gather(
-            runner.run(),
-            run_and_stop(),
+        # Use timeout to catch hangs as failures, not infinite waits
+        await asyncio.wait_for(
+            asyncio.gather(
+                runner.run(),
+                run_and_stop(),
+            ),
+            timeout=5.0,
         )
 
         # Should have stopped gracefully
@@ -434,14 +438,41 @@ class TestGracefulShutdown:
             sleep_fn=fake_sleep,
         )
 
-        # Request immediate shutdown
+        # Request immediate shutdown and run with timeout
         runner.request_shutdown()
-        await runner.run()
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         # All connections should be closed
         assert fake_gamma.closed
         assert fake_wss.closed
         assert fake_ob.closed
+
+    @pytest.mark.asyncio
+    async def test_finalize_is_idempotent(self, tmp_path: Path) -> None:
+        """Calling finalize multiple times should be safe."""
+        fake_clock = FakeClock(datetime.now(UTC))
+        fake_dao = FakeDAO()
+        fake_gamma = FakeGammaClient([FakeMarket("m1")])
+
+        config = DaemonConfig(
+            interval_seconds=1,
+            export_dir=tmp_path,
+            with_orderbook=False,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=fake_gamma,
+            clock=fake_clock,
+            sleep_fn=FakeSleep(),
+        )
+
+        # Call finalize directly multiple times
+        await asyncio.wait_for(runner._finalize(), timeout=2.0)
+        await asyncio.wait_for(runner._finalize(), timeout=2.0)  # Should be no-op
+
+        assert fake_gamma.closed
 
 
 # =============================================================================
@@ -811,7 +842,8 @@ class TestMaxHours:
 
         fake_sleep.__call__ = advancing_sleep
 
-        await runner.run()
+        # Use timeout to catch hangs as failures
+        await asyncio.wait_for(runner.run(), timeout=5.0)
 
         # Should have stopped due to max_hours
         assert not runner.is_running

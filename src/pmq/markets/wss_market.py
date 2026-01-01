@@ -7,6 +7,7 @@ data only).
 Phase 5.0: WebSocket microstructure feed integration.
 Phase 5.3: Application-level keepalive + adaptive staleness.
 Phase 5.4: Connection-level health tracking for health-gated fallback.
+Phase 5.7: Health grace period to reduce rest_unhealthy during startup.
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ DEFAULT_HEALTH_TIMEOUT_SECONDS = 60.0
 
 # Phase 5.4: Maximum book age before considered "very old" (safety cap, not for frequent fallback)
 DEFAULT_MAX_BOOK_AGE_SECONDS = 1800.0  # 30 minutes
+
+# Phase 5.7: Health grace period (assume healthy until grace expires)
+DEFAULT_HEALTH_GRACE_SECONDS = 60.0
 
 
 @dataclass
@@ -118,6 +122,7 @@ class MarketWssClient:
     staleness_seconds: float = DEFAULT_STALENESS_SECONDS
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SECONDS
     health_timeout_seconds: float = DEFAULT_HEALTH_TIMEOUT_SECONDS  # Phase 5.4
+    health_grace_seconds: float = DEFAULT_HEALTH_GRACE_SECONDS  # Phase 5.7
     _cache: dict[str, CacheEntry] = field(default_factory=dict)
     _stats: WssStats = field(default_factory=WssStats)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -131,6 +136,8 @@ class MarketWssClient:
     # Phase 5.4: Health tracking timestamps (monotonic time)
     _last_message_at: float = field(default=0.0)
     _last_pong_at: float = field(default=0.0)
+    # Phase 5.7: Connection start time for grace period
+    _connected_at: float = field(default=0.0)
 
     async def connect(self) -> None:
         """Establish WebSocket connection.
@@ -250,6 +257,9 @@ class MarketWssClient:
         Phase 5.4: Connection is healthy if we've received any message
         or PONG response within the health timeout period.
 
+        Phase 5.7: During the grace period after connect, assume healthy
+        even without messages. This reduces rest_unhealthy at startup.
+
         This should be used to determine REST fallback, NOT per-market cache age.
         Markets with quiet cache (no recent updates) should still be considered
         healthy if the connection itself is alive.
@@ -258,7 +268,7 @@ class MarketWssClient:
             health_timeout: Override health timeout (uses self.health_timeout_seconds if None)
 
         Returns:
-            True if connection is healthy (recent activity)
+            True if connection is healthy (recent activity or within grace period)
         """
         timeout = health_timeout or self.health_timeout_seconds
         now = time.monotonic()
@@ -267,6 +277,13 @@ class MarketWssClient:
         with self._lock:
             last_message = self._last_message_at
             last_pong = self._last_pong_at
+            connected_at = self._connected_at
+
+        # Phase 5.7: Within grace period, assume healthy
+        if connected_at > 0:
+            grace_elapsed = now - connected_at
+            if grace_elapsed < self.health_grace_seconds:
+                return True
 
         # Healthy if either timestamp is within timeout
         message_age = now - last_message if last_message > 0 else float("inf")
@@ -525,6 +542,9 @@ class MarketWssClient:
             close_timeout=5,
         ) as ws:
             self._ws = ws
+            # Phase 5.7: Record connection time for grace period
+            with self._lock:
+                self._connected_at = time.monotonic()
             self._connected.set()
             logger.info("WebSocket connected")
 

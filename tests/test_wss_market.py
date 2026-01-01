@@ -817,3 +817,163 @@ class TestPhase53Config:
         stats = client.get_stats()
         assert stats.keepalive_sent == 50
         assert stats.keepalive_failures == 1
+
+
+# =============================================================================
+# Phase 5.4: Health Tracking Tests
+# =============================================================================
+
+
+class TestHealthTracking:
+    """Tests for Phase 5.4 WSS connection health tracking."""
+
+    def test_default_health_timeout(self) -> None:
+        """Default health timeout should be DEFAULT_HEALTH_TIMEOUT_SECONDS."""
+        from pmq.markets.wss_market import DEFAULT_HEALTH_TIMEOUT_SECONDS
+
+        client = MarketWssClient()
+        assert client.health_timeout_seconds == DEFAULT_HEALTH_TIMEOUT_SECONDS
+
+    def test_custom_health_timeout(self) -> None:
+        """Custom health timeout should be accepted."""
+        client = MarketWssClient(health_timeout_seconds=30.0)
+        assert client.health_timeout_seconds == 30.0
+
+    def test_is_healthy_no_messages(self) -> None:
+        """is_healthy should return False if no messages received."""
+        client = MarketWssClient(health_timeout_seconds=60.0)
+        # _last_message_at and _last_pong_at are both 0.0 initially
+        assert not client.is_healthy()
+
+    def test_is_healthy_after_message(self) -> None:
+        """is_healthy should return True after receiving a message."""
+        client = MarketWssClient(health_timeout_seconds=60.0)
+        client._last_message_at = time.monotonic()
+        assert client.is_healthy()
+
+    def test_is_healthy_after_pong(self) -> None:
+        """is_healthy should return True after receiving a PONG."""
+        client = MarketWssClient(health_timeout_seconds=60.0)
+        client._last_pong_at = time.monotonic()
+        assert client.is_healthy()
+
+    def test_is_healthy_expired(self) -> None:
+        """is_healthy should return False if messages are too old."""
+        client = MarketWssClient(health_timeout_seconds=10.0)
+        client._last_message_at = time.monotonic() - 20.0  # 20s ago
+        assert not client.is_healthy()
+
+    def test_is_healthy_custom_timeout(self) -> None:
+        """is_healthy should accept custom timeout parameter."""
+        client = MarketWssClient(health_timeout_seconds=60.0)
+        client._last_message_at = time.monotonic() - 30.0  # 30s ago
+
+        # Should be healthy with default 60s timeout
+        assert client.is_healthy()
+        # Should be unhealthy with 20s timeout
+        assert not client.is_healthy(health_timeout=20.0)
+
+    @pytest.mark.asyncio
+    async def test_pong_updates_health_timestamp(self) -> None:
+        """PONG message should update _last_pong_at timestamp."""
+        client = MarketWssClient()
+
+        before = time.monotonic()
+        await client._handle_message("PONG")
+        after = time.monotonic()
+
+        assert before <= client._last_pong_at <= after
+        assert client._stats.pong_received == 1
+
+    @pytest.mark.asyncio
+    async def test_message_updates_health_timestamp(self) -> None:
+        """Any message should update _last_message_at timestamp."""
+        client = MarketWssClient()
+
+        before = time.monotonic()
+        await client._handle_message('{"type": "connected"}')
+        after = time.monotonic()
+
+        assert before <= client._last_message_at <= after
+
+
+class TestGetOrderbookIfHealthy:
+    """Tests for Phase 5.4 get_orderbook_if_healthy method."""
+
+    def test_returns_none_for_missing(self) -> None:
+        """Should return None for tokens not in cache."""
+        client = MarketWssClient()
+        ob = client.get_orderbook_if_healthy("0xnonexistent")
+        assert ob is None
+
+    def test_returns_data_regardless_of_age(self) -> None:
+        """Should return data regardless of age (no staleness check)."""
+        from pmq.markets.orderbook import OrderBookData
+
+        client = MarketWssClient(staleness_seconds=10.0)
+
+        # Add old cache entry (100s old, but staleness is 10s)
+        client._cache["0xold_token"] = CacheEntry(
+            data=OrderBookData(token_id="0xold_token", best_bid=0.5, best_ask=0.6),
+            updated_at=time.monotonic() - 100.0,
+        )
+
+        # get_orderbook_if_healthy ignores staleness, only max_book_age matters
+        ob = client.get_orderbook_if_healthy("0xold_token")
+        assert ob is not None
+        assert ob.best_bid == 0.5
+
+    def test_respects_max_book_age(self) -> None:
+        """Should return None if cache age exceeds max_book_age."""
+        from pmq.markets.orderbook import OrderBookData
+
+        client = MarketWssClient()
+
+        # Add cache entry older than max_book_age
+        client._cache["0xvery_old"] = CacheEntry(
+            data=OrderBookData(token_id="0xvery_old", best_bid=0.5, best_ask=0.6),
+            updated_at=time.monotonic() - 2000.0,  # ~33 minutes old
+        )
+
+        # Should return None with max_book_age=1800 (30 min)
+        ob = client.get_orderbook_if_healthy("0xvery_old", max_book_age=1800.0)
+        assert ob is None
+
+        # Should return data without max_book_age constraint
+        ob = client.get_orderbook_if_healthy("0xvery_old")
+        assert ob is not None
+
+
+class TestHasCachedBook:
+    """Tests for Phase 5.4 has_cached_book method."""
+
+    def test_returns_false_for_missing(self) -> None:
+        """Should return False for tokens not in cache."""
+        client = MarketWssClient()
+        assert not client.has_cached_book("0xnonexistent")
+
+    def test_returns_true_for_cached(self) -> None:
+        """Should return True for tokens in cache (regardless of age)."""
+        from pmq.markets.orderbook import OrderBookData
+
+        client = MarketWssClient()
+
+        # Add old cache entry
+        client._cache["0xcached"] = CacheEntry(
+            data=OrderBookData(token_id="0xcached"),
+            updated_at=time.monotonic() - 1000.0,
+        )
+
+        assert client.has_cached_book("0xcached")
+
+
+class TestStatsIncludePongReceived:
+    """Tests that Phase 5.4 pong_received stat is tracked."""
+
+    def test_get_stats_includes_pong_received(self) -> None:
+        """get_stats should include pong_received count."""
+        client = MarketWssClient()
+        client._stats.pong_received = 42
+
+        stats = client.get_stats()
+        assert stats.pong_received == 42

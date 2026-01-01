@@ -6,6 +6,7 @@ data only).
 
 Phase 5.0: WebSocket microstructure feed integration.
 Phase 5.3: Application-level keepalive + adaptive staleness.
+Phase 5.4: Connection-level health tracking for health-gated fallback.
 """
 
 from __future__ import annotations
@@ -37,11 +38,17 @@ MAX_BACKOFF_SECONDS = 60.0
 BACKOFF_MULTIPLIER = 2.0
 JITTER_FACTOR = 0.3  # ±30% jitter
 
-# Cache staleness threshold
+# Cache staleness threshold (deprecated in favor of health-based model in Phase 5.4)
 DEFAULT_STALENESS_SECONDS = 30.0
 
 # Phase 5.3: Application-level keepalive (Polymarket requires "PING" text frames)
 DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 10.0
+
+# Phase 5.4: Connection health timeout (unhealthy if no message/pong in this period)
+DEFAULT_HEALTH_TIMEOUT_SECONDS = 60.0
+
+# Phase 5.4: Maximum book age before considered "very old" (safety cap, not for frequent fallback)
+DEFAULT_MAX_BOOK_AGE_SECONDS = 1800.0  # 30 minutes
 
 
 @dataclass
@@ -75,6 +82,8 @@ class WssStats:
     # Phase 5.3: Keepalive stats
     keepalive_sent: int = 0
     keepalive_failures: int = 0
+    # Phase 5.4: Health tracking
+    pong_received: int = 0
 
 
 @dataclass
@@ -87,6 +96,11 @@ class MarketWssClient:
 
     Phase 5.3: Implements application-level keepalive ("PING" text frames)
     as required by Polymarket's WebSocket server for long-lived connections.
+
+    Phase 5.4: Connection-level health tracking. Use is_healthy() to determine
+    if the connection is alive (receiving messages/pongs). Markets that don't
+    emit updates frequently should NOT trigger REST fallback - only unhealthy
+    connections or missing cache entries should.
 
     Example:
         client = MarketWssClient()
@@ -103,6 +117,7 @@ class MarketWssClient:
 
     staleness_seconds: float = DEFAULT_STALENESS_SECONDS
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SECONDS
+    health_timeout_seconds: float = DEFAULT_HEALTH_TIMEOUT_SECONDS  # Phase 5.4
     _cache: dict[str, CacheEntry] = field(default_factory=dict)
     _stats: WssStats = field(default_factory=WssStats)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -113,6 +128,9 @@ class MarketWssClient:
     _keepalive_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _connected: asyncio.Event = field(default_factory=asyncio.Event)
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Phase 5.4: Health tracking timestamps (monotonic time)
+    _last_message_at: float = field(default=0.0)
+    _last_pong_at: float = field(default=0.0)
 
     async def connect(self) -> None:
         """Establish WebSocket connection.
@@ -226,6 +244,86 @@ class MarketWssClient:
             age = time.monotonic() - entry.updated_at
             return age > self.staleness_seconds
 
+    def is_healthy(self, health_timeout: float | None = None) -> bool:
+        """Check if the WebSocket connection is healthy.
+
+        Phase 5.4: Connection is healthy if we've received any message
+        or PONG response within the health timeout period.
+
+        This should be used to determine REST fallback, NOT per-market cache age.
+        Markets with quiet cache (no recent updates) should still be considered
+        healthy if the connection itself is alive.
+
+        Args:
+            health_timeout: Override health timeout (uses self.health_timeout_seconds if None)
+
+        Returns:
+            True if connection is healthy (recent activity)
+        """
+        timeout = health_timeout or self.health_timeout_seconds
+        now = time.monotonic()
+
+        # Check both message and pong timestamps
+        with self._lock:
+            last_message = self._last_message_at
+            last_pong = self._last_pong_at
+
+        # Healthy if either timestamp is within timeout
+        message_age = now - last_message if last_message > 0 else float("inf")
+        pong_age = now - last_pong if last_pong > 0 else float("inf")
+
+        return min(message_age, pong_age) <= timeout
+
+    def get_orderbook_if_healthy(
+        self, token_id: str, max_book_age: float | None = None
+    ) -> OrderBookData | None:
+        """Get cached order book only if it exists (ignore staleness).
+
+        Phase 5.4: For health-gated fallback model. Returns cached data
+        regardless of age (since market quietness != staleness), but
+        optionally enforces a maximum book age as a safety cap.
+
+        Use is_healthy() separately to determine if REST fallback is needed
+        due to connection issues.
+
+        Args:
+            token_id: The token ID to look up
+            max_book_age: Optional maximum age in seconds (safety cap)
+
+        Returns:
+            OrderBookData if in cache (and within max_book_age if specified)
+        """
+        with self._lock:
+            entry = self._cache.get(token_id)
+            if entry is None:
+                self._stats.cache_misses += 1
+                return None
+
+            # Apply optional safety cap on book age
+            if max_book_age is not None:
+                age = time.monotonic() - entry.updated_at
+                if age > max_book_age:
+                    self._stats.cache_stale += 1
+                    return None
+
+            self._stats.cache_hits += 1
+            return entry.data
+
+    def has_cached_book(self, token_id: str) -> bool:
+        """Check if we have any cached data for this token (regardless of age).
+
+        Phase 5.4: Used to determine if we need REST fetch for missing data
+        vs. just using cached data for quiet markets.
+
+        Args:
+            token_id: The token ID to check
+
+        Returns:
+            True if token exists in cache
+        """
+        with self._lock:
+            return token_id in self._cache
+
     def get_stats(self) -> WssStats:
         """Get connection statistics (thread-safe copy)."""
         with self._lock:
@@ -238,6 +336,7 @@ class MarketWssClient:
                 cache_stale=self._stats.cache_stale,
                 keepalive_sent=self._stats.keepalive_sent,
                 keepalive_failures=self._stats.keepalive_failures,
+                pong_received=self._stats.pong_received,
             )
 
     def get_cache_ages(self, token_ids: list[str] | None = None) -> CacheAgeStats:
@@ -444,16 +543,25 @@ class MarketWssClient:
 
     async def _handle_message(self, raw: str | bytes) -> None:
         """Parse and process incoming WebSocket message."""
+        now = time.monotonic()
+
+        # Phase 5.4: Update health timestamp on every message
         with self._lock:
             self._stats.messages_received += 1
+            self._last_message_at = now
 
         try:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
 
-            # Phase 5.3: Handle non-JSON keepalive responses ("PONG", etc.)
+            # Phase 5.3/5.4: Handle non-JSON keepalive responses ("PONG", etc.)
             raw_stripped = raw.strip().upper()
             if raw_stripped in ("PONG", "PING"):
+                # Phase 5.4: Track PONG specifically for health monitoring
+                if raw_stripped == "PONG":
+                    with self._lock:
+                        self._last_pong_at = now
+                        self._stats.pong_received += 1
                 logger.debug(f"Keepalive response: {raw_stripped}")
                 return
 
@@ -483,6 +591,11 @@ class MarketWssClient:
             await self._handle_price_change(data)
         elif msg_type in ("subscribed", "connected", "pong", "PONG"):
             # Control/keepalive response messages - log at debug level
+            # Phase 5.4: Track JSON pong as well
+            if msg_type in ("pong", "PONG"):
+                with self._lock:
+                    self._last_pong_at = time.monotonic()
+                    self._stats.pong_received += 1
             logger.debug(f"Control message: {msg_type}")
         else:
             # Log unknown message types at debug level

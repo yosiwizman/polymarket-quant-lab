@@ -9,6 +9,12 @@ Phase 5.1: Production-grade continuous data capture with:
 Phase 5.2: Extended with:
 - Daily snapshot exports (gzip CSV, atomic writes)
 - Optional retention cleanup (delete old snapshots after export)
+
+Phase 5.4: Health-gated fallback + REST reconciliation:
+- WSS health tracking (connection-level, not per-market staleness)
+- Quiet markets use cached data without REST fallback
+- REST fallback only on: missing cache OR unhealthy WSS connection
+- REST reconciliation sampler for drift detection
 """
 
 from __future__ import annotations
@@ -100,12 +106,22 @@ class TickStats:
     stale_count: int = 0
     missing_count: int = 0
     error: str | None = None
-    # Phase 5.3: Enhanced cache stats
-    wss_fresh: int = 0  # Fresh WSS cache hits
-    wss_stale: int = 0  # Stale WSS cache (triggered REST fallback)
+    # Phase 5.3: Enhanced cache stats (some deprecated in 5.4)
+    wss_fresh: int = 0  # Fresh WSS cache hits (age <= 2*interval)
+    wss_stale: int = 0  # Phase 5.3: Stale WSS cache (deprecated in 5.4 model)
     wss_missing: int = 0  # No WSS cache entry (triggered REST fallback)
     cache_age_median: float = 0.0  # Median cache age in seconds
     cache_age_max: float = 0.0  # Max cache age in seconds
+    # Phase 5.4: Health-gated model stats
+    wss_cache_used: int = 0  # Total WSS cache hits (regardless of age)
+    wss_cache_quiet: int = 0  # Cache used but age > 2*interval (quiet market)
+    wss_cache_very_old: int = 0  # Cache age > max_book_age (safety concern)
+    wss_unhealthy_count: int = 0  # REST fallbacks due to unhealthy connection
+    wss_healthy: bool = True  # Was WSS healthy during this tick?
+    # Phase 5.4: Reconciliation stats
+    reconciled_count: int = 0  # Number of tokens reconciled
+    drift_count: int = 0  # Number with detected drift
+    drift_max_spread: float = 0.0  # Max spread difference (bps)
 
 
 @dataclass
@@ -124,6 +140,9 @@ class DailyStats:
     start_time: str = ""
     end_time: str = ""
     tick_history: list[TickStats] = field(default_factory=list)
+    # Phase 5.4: Reconciliation aggregates
+    total_reconciled: int = 0
+    total_drift: int = 0
 
 
 def compute_adaptive_staleness(interval_seconds: int) -> float:
@@ -148,7 +167,7 @@ class DaemonConfig:
     interval_seconds: int = 60
     limit: int = 200
     orderbook_source: str = "wss"  # "rest" or "wss"
-    wss_staleness_seconds: float | None = None  # None = adaptive (Phase 5.3)
+    wss_staleness_seconds: float | None = None  # Deprecated in Phase 5.4 (use health model)
     max_hours: float | None = None
     export_dir: Path = field(default_factory=lambda: Path("exports"))
     with_orderbook: bool = True
@@ -157,9 +176,19 @@ class DaemonConfig:
     snapshot_export_format: str = "csv_gz"  # "csv_gz" (parquet requires extra deps)
     retention_days: int | None = None  # Delete snapshots older than N days after export
     snapshot_export_timeout: float = 60.0  # Timeout for snapshot export (seconds)
+    # Phase 5.4: Health-gated fallback settings
+    wss_health_timeout: float = 60.0  # Connection unhealthy if no message/pong in N seconds
+    max_book_age: float = 1800.0  # Safety cap: 30 minutes max cache age
+    reconcile_sample: int = 10  # Max tokens to reconcile per tick
+    reconcile_min_age: float = 300.0  # Only reconcile caches older than 5 minutes
+    reconcile_timeout: float = 5.0  # Timeout for reconciliation REST batch
 
     def get_effective_staleness(self) -> float:
-        """Get effective staleness threshold (adaptive if not explicitly set)."""
+        """Get effective staleness threshold (adaptive if not explicitly set).
+
+        Note: Phase 5.4 deprecates staleness-based fallback in favor of health-gated model.
+        This is kept for backwards compatibility with Phase 5.3 logging.
+        """
         if self.wss_staleness_seconds is not None:
             return self.wss_staleness_seconds
         return compute_adaptive_staleness(self.interval_seconds)
@@ -247,20 +276,20 @@ class DaemonRunner:
             else float("inf")
         )
 
-        # Phase 5.3: Log effective staleness threshold
-        effective_staleness = self.config.get_effective_staleness()
-        staleness_type = "explicit" if self.config.wss_staleness_seconds else "adaptive"
+        # Phase 5.4: Log config with health-based model
         logger.info(
             f"Daemon starting: interval={self.config.interval_seconds}s, "
             f"source={self.config.orderbook_source}, "
-            f"staleness={effective_staleness:.0f}s ({staleness_type}), "
+            f"health_timeout={self.config.wss_health_timeout:.0f}s, "
+            f"max_book_age={self.config.max_book_age:.0f}s, "
+            f"reconcile_sample={self.config.reconcile_sample}, "
             f"max_hours={self.config.max_hours or 'infinite'}"
         )
 
         # Connect WSS if enabled
         if self.wss_client and self.config.orderbook_source == "wss":
-            # Phase 5.3: Update WSS client staleness to match daemon config
-            self.wss_client.staleness_seconds = effective_staleness
+            # Phase 5.4: Set health timeout on WSS client
+            self.wss_client.health_timeout_seconds = self.config.wss_health_timeout
             await self.wss_client.connect()
             connected = await self.wss_client.wait_connected(timeout=10.0)
             if not connected:
@@ -294,7 +323,13 @@ class DaemonRunner:
             self._running = False
 
     async def _execute_tick(self) -> TickStats:
-        """Execute a single snapshot tick."""
+        """Execute a single snapshot tick.
+
+        Phase 5.4 health-gated fallback policy:
+        - If cache missing: REST fetch (missing_count++)
+        - Else if WSS unhealthy: REST fetch (wss_unhealthy_count++)
+        - Else: use cached book (wss_cache_used++), classify as fresh/quiet/very_old
+        """
         now = self.clock.now()
         tick_stats = TickStats(timestamp=now.isoformat())
         self._total_ticks += 1
@@ -314,8 +349,21 @@ class DaemonRunner:
             if self.wss_client and token_ids:
                 await self.wss_client.subscribe(token_ids)
 
-            # Phase 5.3: Get cache freshness stats before fetching orderbooks
+            # Phase 5.4: Check WSS health once per tick (connection-level, not per-market)
+            wss_healthy = True
+            if self.wss_client and self.config.orderbook_source == "wss":
+                wss_healthy = self.wss_client.is_healthy(self.config.wss_health_timeout)
+                tick_stats.wss_healthy = wss_healthy
+                if not wss_healthy:
+                    logger.warning("WSS connection unhealthy - using REST fallback for all markets")
+
+            # Get cache age stats for logging (Phase 5.3 compat)
             if self.wss_client and self.config.orderbook_source == "wss" and token_ids:
+                cache_ages = self.wss_client.get_cache_ages(token_ids)
+                tick_stats.cache_age_median = cache_ages.median_age
+                tick_stats.cache_age_max = cache_ages.max_age
+
+                # Phase 5.3 compat: compute freshness breakdown for logging
                 staleness_threshold = self.config.get_effective_staleness()
                 wss_fresh, wss_stale, wss_missing = self.wss_client.get_cache_freshness(
                     token_ids, staleness_threshold
@@ -324,15 +372,12 @@ class DaemonRunner:
                 tick_stats.wss_stale = wss_stale
                 tick_stats.wss_missing = wss_missing
 
-                # Get cache age stats
-                cache_ages = self.wss_client.get_cache_ages(token_ids)
-                tick_stats.cache_age_median = cache_ages.median_age
-                tick_stats.cache_age_max = cache_ages.max_age
-
-            # Fetch order books
+            # Fetch order books with Phase 5.4 health-gated policy
             orderbook_data: dict[str, Any] | None = None
             if self.config.with_orderbook:
                 orderbook_data = {}
+                fresh_threshold = 2.0 * self.config.interval_seconds
+
                 for market in markets:
                     token_id = market.yes_token_id
                     if not token_id:
@@ -340,28 +385,101 @@ class DaemonRunner:
                         continue
 
                     ob = None
+                    used_rest = False
 
-                    # Try WSS cache first
                     if self.wss_client and self.config.orderbook_source == "wss":
-                        ob = self.wss_client.get_orderbook(token_id)
-                        if ob and ob.has_valid_book:
-                            tick_stats.wss_hits += 1
+                        # Phase 5.4: Health-gated fallback logic
+                        has_cache = self.wss_client.has_cached_book(token_id)
 
-                    # Fallback to REST if WSS returned None (stale or missing)
-                    if ob is None and self.ob_fetcher:
+                        if not has_cache:
+                            # A) Missing cache - must REST fetch
+                            if self.ob_fetcher:
+                                try:
+                                    ob = self.ob_fetcher.fetch_order_book(token_id)
+                                    used_rest = True
+                                    tick_stats.wss_missing += 1
+                                except Exception as e:
+                                    logger.debug(f"REST fetch failed for {market.id}: {e}")
+                                    tick_stats.missing_count += 1
+                            else:
+                                tick_stats.missing_count += 1
+
+                        elif not wss_healthy:
+                            # B) Unhealthy WSS - REST fallback
+                            if self.ob_fetcher:
+                                try:
+                                    ob = self.ob_fetcher.fetch_order_book(token_id)
+                                    used_rest = True
+                                    tick_stats.wss_unhealthy_count += 1
+                                except Exception as e:
+                                    # Fall back to cached data if REST fails
+                                    ob = self.wss_client.get_orderbook_if_healthy(
+                                        token_id, max_book_age=self.config.max_book_age
+                                    )
+                                    logger.debug(
+                                        f"REST fallback failed, using cache for {market.id}: {e}"
+                                    )
+                            else:
+                                ob = self.wss_client.get_orderbook_if_healthy(
+                                    token_id, max_book_age=self.config.max_book_age
+                                )
+                        else:
+                            # C) Healthy WSS + has cache - use cached data
+                            ob = self.wss_client.get_orderbook_if_healthy(
+                                token_id, max_book_age=self.config.max_book_age
+                            )
+                            if ob:
+                                tick_stats.wss_cache_used += 1
+                                # Classify cache age
+                                cache_entry_ages = self.wss_client.get_cache_ages([token_id])
+                                if cache_entry_ages.count > 0:
+                                    age = cache_entry_ages.max_age  # Single entry
+                                    if age <= fresh_threshold:
+                                        tick_stats.wss_fresh += 1
+                                    elif age > self.config.max_book_age:
+                                        tick_stats.wss_cache_very_old += 1
+                                    else:
+                                        tick_stats.wss_cache_quiet += 1
+                            else:
+                                # Cache exceeded max_book_age safety cap
+                                tick_stats.wss_cache_very_old += 1
+                                if self.ob_fetcher:
+                                    try:
+                                        ob = self.ob_fetcher.fetch_order_book(token_id)
+                                        used_rest = True
+                                    except Exception as e:
+                                        logger.debug(f"REST fetch for very old cache failed: {e}")
+                                        tick_stats.missing_count += 1
+
+                    elif self.ob_fetcher:
+                        # REST-only mode
                         try:
                             ob = self.ob_fetcher.fetch_order_book(token_id)
-                            if self.config.orderbook_source == "wss":
-                                tick_stats.rest_fallbacks += 1
+                            used_rest = True
                         except Exception as e:
-                            logger.debug(f"REST fallback failed for {market.id}: {e}")
+                            logger.debug(f"REST fetch failed for {market.id}: {e}")
                             tick_stats.missing_count += 1
 
+                    # Track stats
                     if ob and ob.has_valid_book:
                         orderbook_data[market.id] = ob.to_dict()
                         tick_stats.orderbooks_success += 1
+                        if used_rest:
+                            tick_stats.rest_fallbacks += 1
+                        else:
+                            tick_stats.wss_hits += 1
 
-            # Phase 5.3: Compute stale_count from wss_stale + wss_missing for backwards compat
+            # Phase 5.4: Run REST reconciliation sampler
+            if (
+                self.wss_client
+                and self.ob_fetcher
+                and self.config.orderbook_source == "wss"
+                and wss_healthy
+                and self.config.reconcile_sample > 0
+            ):
+                await self._run_reconciliation(token_ids, tick_stats)
+
+            # Phase 5.3 compat: Compute stale_count
             tick_stats.stale_count = tick_stats.wss_stale + tick_stats.wss_missing
 
             # Save snapshots
@@ -373,18 +491,21 @@ class DaemonRunner:
             self.dao.set_runtime_state("daemon_last_tick", snapshot_time)
             self.dao.set_runtime_state("daemon_total_ticks", str(self._total_ticks))
 
-            # Phase 5.3: Enhanced logging with cache age stats
+            # Phase 5.4: Enhanced logging
             if self.config.orderbook_source == "wss":
                 wss_pct = (
                     (tick_stats.wss_hits / (tick_stats.wss_hits + tick_stats.rest_fallbacks) * 100)
                     if (tick_stats.wss_hits + tick_stats.rest_fallbacks) > 0
                     else 0.0
                 )
+                health_str = "healthy" if tick_stats.wss_healthy else "UNHEALTHY"
                 logger.info(
                     f"Tick {self._total_ticks}: {tick_stats.snapshots_saved} snapshots, "
                     f"{tick_stats.orderbooks_success} orderbooks | "
-                    f"WSS:{tick_stats.wss_hits} ({wss_pct:.0f}%) REST:{tick_stats.rest_fallbacks} | "
-                    f"cache: {tick_stats.cache_age_median:.1f}s median, {tick_stats.cache_age_max:.1f}s max"
+                    f"WSS[{health_str}]:{tick_stats.wss_hits} ({wss_pct:.0f}%) "
+                    f"REST:{tick_stats.rest_fallbacks} | "
+                    f"cache: {tick_stats.cache_age_median:.1f}s med, {tick_stats.cache_age_max:.1f}s max | "
+                    f"reconciled:{tick_stats.reconciled_count} drift:{tick_stats.drift_count}"
                 )
             else:
                 logger.info(
@@ -398,6 +519,84 @@ class DaemonRunner:
             self.dao.set_runtime_state("daemon_last_error", f"{now.isoformat()}: {e}")
 
         return tick_stats
+
+    async def _run_reconciliation(self, token_ids: list[str], tick_stats: TickStats) -> None:
+        """Run REST reconciliation sampler to detect drift.
+
+        Phase 5.4: Selects quiet caches (age >= reconcile_min_age) and
+        compares WSS cache vs REST to detect drift.
+        """
+        if not self.wss_client or not self.ob_fetcher:
+            return
+
+        # Select tokens with old enough cache
+        candidates: list[tuple[str, float]] = []  # (token_id, age)
+        for token_id in token_ids:
+            if self.wss_client.has_cached_book(token_id):
+                ages = self.wss_client.get_cache_ages([token_id])
+                if ages.count > 0 and ages.max_age >= self.config.reconcile_min_age:
+                    candidates.append((token_id, ages.max_age))
+
+        if not candidates:
+            return
+
+        # Sort by age descending, take up to reconcile_sample
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        to_reconcile = candidates[: self.config.reconcile_sample]
+
+        # Fetch REST with timeout
+        drift_count = 0
+        max_spread_diff = 0.0
+
+        try:
+            async with asyncio.timeout(self.config.reconcile_timeout):
+                for token_id, _age in to_reconcile:
+                    try:
+                        # Get WSS cached data
+                        wss_ob = self.wss_client.get_orderbook_if_healthy(token_id)
+                        if not wss_ob:
+                            continue
+
+                        # Fetch REST
+                        rest_ob = self.ob_fetcher.fetch_order_book(token_id)
+                        if not rest_ob or not rest_ob.has_valid_book:
+                            continue
+
+                        tick_stats.reconciled_count += 1
+
+                        # Compute drift
+                        drift_detected = False
+                        spread_diff = 0.0
+
+                        if wss_ob.best_bid and rest_ob.best_bid:
+                            bid_diff = abs(wss_ob.best_bid - rest_ob.best_bid)
+                            if bid_diff > 0.001:  # > 0.1% difference
+                                drift_detected = True
+                                spread_diff = max(spread_diff, bid_diff * 10000)  # bps
+
+                        if wss_ob.best_ask and rest_ob.best_ask:
+                            ask_diff = abs(wss_ob.best_ask - rest_ob.best_ask)
+                            if ask_diff > 0.001:
+                                drift_detected = True
+                                spread_diff = max(spread_diff, ask_diff * 10000)
+
+                        if drift_detected:
+                            drift_count += 1
+                            max_spread_diff = max(max_spread_diff, spread_diff)
+                            logger.debug(
+                                f"Reconciliation drift for {token_id}: "
+                                f"WSS bid={wss_ob.best_bid} ask={wss_ob.best_ask}, "
+                                f"REST bid={rest_ob.best_bid} ask={rest_ob.best_ask}"
+                            )
+
+                    except Exception as e:
+                        logger.debug(f"Reconciliation failed for {token_id}: {e}")
+
+        except TimeoutError:
+            logger.debug(f"Reconciliation timed out after {self.config.reconcile_timeout}s")
+
+        tick_stats.drift_count = drift_count
+        tick_stats.drift_max_spread = max_spread_diff
 
     def _update_daily_stats(self, tick_stats: TickStats) -> None:
         """Update daily statistics with tick data."""
@@ -419,6 +618,9 @@ class DaemonRunner:
             self._daily_stats.total_rest_fallbacks += tick_stats.rest_fallbacks
             self._daily_stats.total_stale += tick_stats.stale_count
             self._daily_stats.total_missing += tick_stats.missing_count
+            # Phase 5.4: Reconciliation aggregates
+            self._daily_stats.total_reconciled += tick_stats.reconciled_count
+            self._daily_stats.total_drift += tick_stats.drift_count
             if tick_stats.error:
                 self._daily_stats.total_errors += 1
             self._daily_stats.end_time = tick_stats.timestamp
@@ -584,6 +786,16 @@ class DaemonRunner:
 
         # Export coverage JSON
         coverage_path = export_dir / f"coverage_{date_str}.json"
+        wss_coverage_pct = (
+            (stats.total_wss_hits / (stats.total_wss_hits + stats.total_rest_fallbacks) * 100)
+            if (stats.total_wss_hits + stats.total_rest_fallbacks) > 0
+            else 0.0
+        )
+        drift_pct = (
+            (stats.total_drift / stats.total_reconciled * 100)
+            if stats.total_reconciled > 0
+            else 0.0
+        )
         coverage_data = {
             "date": stats.date,
             "total_ticks": stats.total_ticks,
@@ -596,11 +808,11 @@ class DaemonRunner:
             "errors": stats.total_errors,
             "start_time": stats.start_time,
             "end_time": stats.end_time,
-            "wss_coverage_pct": (
-                (stats.total_wss_hits / (stats.total_wss_hits + stats.total_rest_fallbacks) * 100)
-                if (stats.total_wss_hits + stats.total_rest_fallbacks) > 0
-                else 0.0
-            ),
+            "wss_coverage_pct": wss_coverage_pct,
+            # Phase 5.4: Reconciliation stats
+            "reconciled_count": stats.total_reconciled,
+            "drift_count": stats.total_drift,
+            "drift_pct": drift_pct,
         }
         with open(coverage_path, "w", encoding="utf-8") as f:
             json.dump(coverage_data, f, indent=2)
@@ -621,6 +833,12 @@ class DaemonRunner:
                         "rest_fallbacks",
                         "stale_count",
                         "missing_count",
+                        # Phase 5.4 fields
+                        "wss_healthy",
+                        "wss_cache_used",
+                        "wss_cache_quiet",
+                        "reconciled_count",
+                        "drift_count",
                         "error",
                     ],
                 )
@@ -636,6 +854,11 @@ class DaemonRunner:
                             "rest_fallbacks": tick.rest_fallbacks,
                             "stale_count": tick.stale_count,
                             "missing_count": tick.missing_count,
+                            "wss_healthy": tick.wss_healthy,
+                            "wss_cache_used": tick.wss_cache_used,
+                            "wss_cache_quiet": tick.wss_cache_quiet,
+                            "reconciled_count": tick.reconciled_count,
+                            "drift_count": tick.drift_count,
                             "error": tick.error or "",
                         }
                     )
@@ -643,7 +866,6 @@ class DaemonRunner:
 
         # Export markdown summary
         md_path = export_dir / f"daemon_summary_{date_str}.md"
-        wss_pct = coverage_data["wss_coverage_pct"]
         md_content = f"""# Daemon Summary - {date_str}
 
 ## Overview
@@ -659,15 +881,20 @@ class DaemonRunner:
 ## Order Book Source Statistics
 - **WSS Hits:** {stats.total_wss_hits:,}
 - **REST Fallbacks:** {stats.total_rest_fallbacks:,}
-- **WSS Coverage:** {wss_pct:.1f}%
+- **WSS Coverage:** {wss_coverage_pct:.1f}%
 - **Stale Count:** {stats.total_stale:,}
 - **Missing Count:** {stats.total_missing:,}
+
+## Reconciliation (Phase 5.4)
+- **Reconciled Count:** {stats.total_reconciled:,}
+- **Drift Detected:** {stats.total_drift:,}
+- **Drift Percentage:** {drift_pct:.1f}%
 
 ## Errors
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon*
+*Generated by pmq ops daemon (Phase 5.4)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)

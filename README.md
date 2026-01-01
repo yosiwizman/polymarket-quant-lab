@@ -1643,6 +1643,74 @@ poetry run pmq ops daemon --interval 60 --max-hours 0.25
 # Or monitor per-tick logs for wss_fresh vs rest_fallback ratio
 ```
 
+### WSS Health-Gated Fallback + REST Reconciliation (Phase 5.4)
+
+Phase 5.4 fixes false-positive "stale" detection for quiet markets by switching to a connection-level health model:
+- **Problem**: Polymarket WSS sends updates only when orders change. Quiet markets may go minutes without updates—not because data is stale, but because nothing happened.
+- **Solution**: Instead of per-market staleness, use WSS connection health (last message/pong received).
+
+#### Health-Gated Decision Logic
+
+For each token on each tick:
+1. **Missing** → REST fetch (never received a book for this token)
+2. **WSS Unhealthy** → REST fetch (no message/pong in `health_timeout` seconds)
+3. **Very Old Cache** → REST fetch (book age > `max_book_age`)
+4. **Otherwise** → Use cached book (classify as fresh or quiet)
+
+This dramatically reduces REST fallbacks for markets that are simply quiet.
+
+#### REST Reconciliation Sampler
+
+To detect silent drift (cached data diverges from REST truth), Phase 5.4 adds periodic reconciliation:
+- Samples `reconcile_sample` tokens per tick (those with cache age ≥ `reconcile_min_age`)
+- Fetches REST and compares bid/ask prices
+- Tracks drift count and max spread deviation
+- Reports reconciliation stats in daily exports
+
+#### Phase 5.4 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--wss-health-timeout` | float | 60.0 | Seconds without message → unhealthy |
+| `--max-book-age` | float | 1800.0 | Max cache age before forced REST (30 min) |
+| `--reconcile-sample` | int | 5 | Tokens to reconcile per tick (0 = disabled) |
+| `--reconcile-min-age` | float | 300.0 | Min cache age to be eligible for reconciliation (5 min) |
+| `--reconcile-timeout` | float | 5.0 | Timeout for reconciliation REST fetches |
+
+#### Example Usage
+
+```powershell
+# Run with health-gated fallback (default in Phase 5.4)
+poetry run pmq ops daemon --interval 60
+
+# Adjust health timeout for flaky connections
+poetry run pmq ops daemon --wss-health-timeout 120 --max-book-age 3600
+
+# Disable reconciliation (faster ticks)
+poetry run pmq ops daemon --reconcile-sample 0
+
+# Aggressive reconciliation for drift detection
+poetry run pmq ops daemon --reconcile-sample 20 --reconcile-min-age 120
+```
+
+#### Expected Results
+
+With Phase 5.4, a 20-minute daemon run should show:
+- **wss_coverage_pct ≥ 90%** (vs ~20% with per-market staleness)
+- **rest_fallbacks** mostly from missing/unhealthy, not quiet markets
+- **drift_count** typically 0 (WSS and REST agree)
+
+#### Tick Logging (Phase 5.4)
+
+```
+Tick completed: markets=200, snapshots=200
+  wss_healthy=True, wss_cache_used=180, wss_cache_quiet=15, wss_cache_very_old=2
+  wss_missing=3, wss_unhealthy=0, rest_fallbacks=5
+  reconciled=5, drift=0, drift_max_spread=0.000
+```
+
+> 💡 **Why Health-Gated?** Per-market staleness assumes regular updates—but prediction markets are event-driven. A market with no trades may not emit updates for hours, yet its cached data is still valid. Health-gating checks the connection itself, not individual market activity.
+
 ## Project Structure
 
 ```
@@ -1864,6 +1932,24 @@ poetry run mypy src
 - [x] Graceful shutdown on SIGINT/SIGTERM
 - [x] Systemd and Windows Task Scheduler deployment templates
 - [x] Unit tests with mocked dependencies
+
+### Phase 5.2 ✓
+- [x] Snapshot exports to gzip CSV on daily rollover
+- [x] Retention cleanup (`--retention-days`) to manage database size
+- [x] `pmq ops status` command for monitoring
+
+### Phase 5.3 ✓
+- [x] Application-level keepalive (PING every 10s) for Polymarket WSS
+- [x] Adaptive staleness threshold (3× interval, min 60s)
+- [x] Enhanced tick logging with freshness breakdown
+- [x] Cache age statistics (median, max) for observability
+
+### Phase 5.4 ✓
+- [x] WSS health-gated fallback (connection-level health, not per-market staleness)
+- [x] REST reconciliation sampler for drift detection
+- [x] 2-layer policy: missing → REST, unhealthy → REST, else use cache
+- [x] New CLI flags: `--wss-health-timeout`, `--max-book-age`, `--reconcile-sample`
+- [x] Reduced false REST fallbacks for quiet markets
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

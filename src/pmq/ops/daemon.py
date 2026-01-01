@@ -696,6 +696,10 @@ class DaemonRunner:
         if self._seeded:
             return self._seed_count  # Already seeded
 
+        # Capture in local vars for type narrowing (mypy doesn't track across nested functions)
+        wss_client = self.wss_client
+        ob_fetcher = self.ob_fetcher
+
         logger.info("Cache seeding started...")
 
         # Get initial market list
@@ -707,7 +711,7 @@ class DaemonRunner:
             return 0
 
         # Find tokens missing from cache
-        missing_tokens = [tid for tid in token_ids if not self.wss_client.has_cached_book(tid)]
+        missing_tokens = [tid for tid in token_ids if not wss_client.has_cached_book(tid)]
 
         if not missing_tokens:
             logger.info("Cache seeding: all tokens already cached")
@@ -735,11 +739,11 @@ class DaemonRunner:
                     loop = asyncio.get_event_loop()
                     ob = await loop.run_in_executor(
                         None,
-                        self.ob_fetcher.fetch_order_book,
-                        token_id,  # type: ignore[union-attr]
+                        ob_fetcher.fetch_order_book,
+                        token_id,
                     )
                     if ob and ob.has_valid_book:
-                        self.wss_client.update_cache(token_id, ob)  # type: ignore[union-attr]
+                        wss_client.update_cache(token_id, ob)
                         return True
                 except Exception as e:
                     logger.debug(f"Seed failed for {token_id[:16]}...: {e}")

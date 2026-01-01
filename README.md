@@ -1258,6 +1258,96 @@ Old databases are automatically migrated when opened.
 
 > 💡 **Why Microstructure?** Heuristic-based spread and liquidity estimates can be inaccurate. Real order book data ensures constraints filter pairs based on actual market conditions, leading to more realistic evaluation results.
 
+### WebSocket Order Book Streaming (Phase 5.0)
+
+Phase 5.0 adds real-time WebSocket streaming for order book data as an alternative to REST polling. This provides:
+- Lower latency order book updates
+- Reduced API request volume
+- Automatic reconnection with exponential backoff
+- Graceful fallback to REST when WebSocket data is stale
+
+#### Order Book Source Selection
+
+```powershell
+# REST polling (default, Phase 4.9 behavior)
+poetry run pmq snapshots run --interval 60 --orderbook-source rest
+
+# WebSocket streaming with REST fallback
+poetry run pmq snapshots run --interval 60 --orderbook-source wss
+
+# Adjust staleness threshold (default: 30s)
+poetry run pmq snapshots run --orderbook-source wss --wss-staleness 15
+```
+
+#### How It Works
+
+1. **WSS Mode (`--orderbook-source wss`)**:
+   - Opens single WebSocket connection to `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+   - Subscribes to order book updates for all tracked markets
+   - Maintains in-memory cache of latest OrderBookData per token
+   - On each snapshot cycle, reads from cache instead of REST polling
+   - Falls back to REST if cache entry is stale (older than `--wss-staleness`)
+
+2. **REST Mode (`--orderbook-source rest`, default)**:
+   - Fetches order book via REST for each market on every cycle
+   - Same behavior as Phase 4.9
+
+#### WebSocket Statistics
+
+When using WSS mode, the CLI reports coverage statistics:
+
+```
+Completed 10 cycles in 10 minutes
+WSS coverage: 85.0% (170 hits, 30 REST fallbacks)
+```
+
+#### Reconnection Behavior
+
+The WebSocket client implements production-grade resilience:
+- **Exponential Backoff**: 1s → 2s → 4s → ... → 60s max
+- **Jitter**: ±30% randomization to prevent thundering herd
+- **Automatic Resubscription**: Re-subscribes to all assets after reconnect
+- **Graceful Shutdown**: Clean disconnect on Ctrl+C
+
+#### New CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--orderbook-source` | str | `rest` | Order book source: `rest` or `wss` |
+| `--wss-staleness` | float | 30.0 | WSS cache staleness threshold in seconds |
+
+#### MarketWssClient API
+
+For programmatic use:
+
+```python
+from pmq.markets import MarketWssClient
+
+client = MarketWssClient(staleness_seconds=30.0)
+await client.connect()
+await client.wait_connected(timeout=10.0)
+await client.subscribe(["0xtoken1", "0xtoken2"])
+
+# Read from cache (thread-safe)
+ob = client.get_orderbook("0xtoken1")
+if ob and ob.has_valid_book:
+    print(f"Best bid: {ob.best_bid}, spread: {ob.spread_bps} bps")
+
+# Check staleness
+if client.is_stale("0xtoken1"):
+    print("Cache is stale, use REST fallback")
+
+# Get stats
+stats = client.get_stats()
+print(f"Messages: {stats.messages_received}, Reconnects: {stats.reconnect_count}")
+
+await client.close()
+```
+
+> ⚠️ **Paper Only**: Phase 5.0 uses the public Market WebSocket channel only (no auth required). No wallet auth, private keys, or order placement is added. The User WebSocket channel (which requires auth) is not used.
+
+> 💡 **When to Use WSS**: WebSocket mode is ideal for continuous collection sessions where lower latency and reduced API load are beneficial. REST mode is better for short collection runs or when network conditions are unreliable.
+
 ## Project Structure
 
 ```
@@ -1461,12 +1551,21 @@ poetry run mypy src
 - [x] Microstructure section in evaluation reports
 - [x] Paper-only: no wallet auth or order placement
 
-### Phase 5 (Future)
+### Phase 5.0 ✓
+- [x] Market WebSocket client for real-time order book streaming
+- [x] `--orderbook-source {rest,wss}` flag for snapshot collection
+- [x] In-memory cache with staleness detection
+- [x] Automatic reconnection with exponential backoff + jitter
+- [x] Fallback to REST when WSS data is stale/missing
+- [x] WSS coverage statistics in CLI output
+- [x] Thread-safe cache access for concurrent reads
+- [x] Paper-only: no auth required (public Market channel only)
+
+### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration
 - [ ] Real order placement via py-clob-client
 - [ ] Wallet integration (Polygon)
 - [ ] Advanced signal strategies
-- [ ] Real-time WebSocket feeds
 
 ## License
 

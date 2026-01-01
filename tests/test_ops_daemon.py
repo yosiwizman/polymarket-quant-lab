@@ -191,6 +191,22 @@ class FakeOrderBook:
         }
 
 
+class FakeCacheAgeStats:
+    """Fake cache age stats for testing."""
+
+    def __init__(
+        self,
+        min_age: float | None = None,
+        max_age: float | None = None,
+        median_age: float | None = None,
+        count: int = 0,
+    ) -> None:
+        self.min_age = min_age
+        self.max_age = max_age
+        self.median_age = median_age
+        self.count = count
+
+
 class FakeWssClient:
     """Fake WSS client for testing."""
 
@@ -200,6 +216,8 @@ class FakeWssClient:
         self._subscribed: set[str] = set()
         self._connected = True
         self.closed = False
+        self.staleness_seconds: float = 60.0  # Phase 5.3: staleness threshold
+        self._cache_ages: dict[str, float] = {}  # token_id -> age in seconds
 
     async def connect(self) -> None:
         """Simulate connect."""
@@ -224,10 +242,49 @@ class FakeWssClient:
     def add_orderbook(self, token_id: str, valid: bool = True) -> None:
         """Add orderbook to cache."""
         self._orderbooks[token_id] = FakeOrderBook(token_id, valid)
+        # Default to fresh cache age (0 seconds old)
+        if token_id not in self._cache_ages:
+            self._cache_ages[token_id] = 0.0
 
     def mark_stale(self, token_id: str) -> None:
         """Mark token as stale."""
         self._stale_tokens.add(token_id)
+
+    def set_cache_age(self, token_id: str, age: float) -> None:
+        """Set cache age for a token."""
+        self._cache_ages[token_id] = age
+
+    def get_cache_freshness(self, token_ids: list[str], threshold: float) -> tuple[int, int, int]:
+        """Get cache freshness breakdown (Phase 5.3).
+
+        Returns:
+            Tuple of (fresh, stale, missing) counts
+        """
+        fresh = 0
+        stale = 0
+        missing = 0
+        for token_id in token_ids:
+            if token_id not in self._orderbooks:
+                missing += 1
+            elif token_id in self._stale_tokens or self._cache_ages.get(token_id, 0.0) > threshold:
+                stale += 1
+            else:
+                fresh += 1
+        return (fresh, stale, missing)
+
+    def get_cache_ages(self, token_ids: list[str]) -> FakeCacheAgeStats:
+        """Get cache age statistics (Phase 5.3)."""
+        ages = [self._cache_ages.get(tid, 0.0) for tid in token_ids if tid in self._orderbooks]
+        if not ages:
+            return FakeCacheAgeStats()
+        ages_sorted = sorted(ages)
+        median = ages_sorted[len(ages_sorted) // 2]
+        return FakeCacheAgeStats(
+            min_age=min(ages),
+            max_age=max(ages),
+            median_age=median,
+            count=len(ages),
+        )
 
     async def close(self) -> None:
         """Close connection."""
@@ -1291,3 +1348,71 @@ class TestDaemonConfigPhase52:
         """snapshot_export_timeout should have reasonable default."""
         config = DaemonConfig()
         assert config.snapshot_export_timeout == 60.0
+
+
+# =============================================================================
+# Phase 5.3: Adaptive Staleness Tests
+# =============================================================================
+
+
+class TestAdaptiveStaleness:
+    """Tests for Phase 5.3 adaptive staleness threshold."""
+
+    def test_adaptive_staleness_default(self) -> None:
+        """wss_staleness_seconds should default to None (adaptive)."""
+        config = DaemonConfig()
+        assert config.wss_staleness_seconds is None
+
+    def test_adaptive_staleness_computation_60s_interval(self) -> None:
+        """Adaptive staleness for 60s interval should be max(180, 60) = 180."""
+        config = DaemonConfig(interval_seconds=60)
+        assert config.get_effective_staleness() == 180.0
+
+    def test_adaptive_staleness_computation_10s_interval(self) -> None:
+        """Adaptive staleness for 10s interval should be max(30, 60) = 60."""
+        config = DaemonConfig(interval_seconds=10)
+        assert config.get_effective_staleness() == 60.0
+
+    def test_adaptive_staleness_computation_120s_interval(self) -> None:
+        """Adaptive staleness for 120s interval should be max(360, 60) = 360."""
+        config = DaemonConfig(interval_seconds=120)
+        assert config.get_effective_staleness() == 360.0
+
+    def test_explicit_staleness_overrides_adaptive(self) -> None:
+        """Explicit wss_staleness_seconds should override adaptive."""
+        config = DaemonConfig(interval_seconds=60, wss_staleness_seconds=45.0)
+        assert config.get_effective_staleness() == 45.0
+
+
+# =============================================================================
+# Phase 5.3: TickStats Enhanced Fields Tests
+# =============================================================================
+
+
+class TestTickStatsPhase53:
+    """Tests for Phase 5.3 TickStats enhanced fields."""
+
+    def test_tick_stats_has_cache_age_fields(self) -> None:
+        """TickStats should have cache age tracking fields."""
+        stats = TickStats(timestamp="2024-01-01T00:00:00Z")
+        assert stats.wss_fresh == 0
+        assert stats.wss_stale == 0
+        assert stats.wss_missing == 0
+        assert stats.cache_age_median == 0.0
+        assert stats.cache_age_max == 0.0
+
+    def test_tick_stats_cache_age_values(self) -> None:
+        """TickStats should accept cache age values."""
+        stats = TickStats(
+            timestamp="2024-01-01T00:00:00Z",
+            wss_fresh=150,
+            wss_stale=30,
+            wss_missing=20,
+            cache_age_median=5.5,
+            cache_age_max=25.0,
+        )
+        assert stats.wss_fresh == 150
+        assert stats.wss_stale == 30
+        assert stats.wss_missing == 20
+        assert stats.cache_age_median == 5.5
+        assert stats.cache_age_max == 25.0

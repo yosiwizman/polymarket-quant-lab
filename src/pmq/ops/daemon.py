@@ -100,6 +100,12 @@ class TickStats:
     stale_count: int = 0
     missing_count: int = 0
     error: str | None = None
+    # Phase 5.3: Enhanced cache stats
+    wss_fresh: int = 0  # Fresh WSS cache hits
+    wss_stale: int = 0  # Stale WSS cache (triggered REST fallback)
+    wss_missing: int = 0  # No WSS cache entry (triggered REST fallback)
+    cache_age_median: float = 0.0  # Median cache age in seconds
+    cache_age_max: float = 0.0  # Max cache age in seconds
 
 
 @dataclass
@@ -120,6 +126,21 @@ class DailyStats:
     tick_history: list[TickStats] = field(default_factory=list)
 
 
+def compute_adaptive_staleness(interval_seconds: int) -> float:
+    """Compute adaptive staleness threshold based on daemon interval.
+
+    Phase 5.3: Default staleness = max(3 * interval, 60 seconds).
+    This prevents pathological staleness where cache is always considered stale.
+
+    Args:
+        interval_seconds: Daemon tick interval
+
+    Returns:
+        Recommended staleness threshold in seconds
+    """
+    return max(3.0 * interval_seconds, 60.0)
+
+
 @dataclass
 class DaemonConfig:
     """Configuration for daemon runner."""
@@ -127,7 +148,7 @@ class DaemonConfig:
     interval_seconds: int = 60
     limit: int = 200
     orderbook_source: str = "wss"  # "rest" or "wss"
-    wss_staleness_seconds: float = 30.0
+    wss_staleness_seconds: float | None = None  # None = adaptive (Phase 5.3)
     max_hours: float | None = None
     export_dir: Path = field(default_factory=lambda: Path("exports"))
     with_orderbook: bool = True
@@ -136,6 +157,12 @@ class DaemonConfig:
     snapshot_export_format: str = "csv_gz"  # "csv_gz" (parquet requires extra deps)
     retention_days: int | None = None  # Delete snapshots older than N days after export
     snapshot_export_timeout: float = 60.0  # Timeout for snapshot export (seconds)
+
+    def get_effective_staleness(self) -> float:
+        """Get effective staleness threshold (adaptive if not explicitly set)."""
+        if self.wss_staleness_seconds is not None:
+            return self.wss_staleness_seconds
+        return compute_adaptive_staleness(self.interval_seconds)
 
 
 # =============================================================================
@@ -220,14 +247,20 @@ class DaemonRunner:
             else float("inf")
         )
 
+        # Phase 5.3: Log effective staleness threshold
+        effective_staleness = self.config.get_effective_staleness()
+        staleness_type = "explicit" if self.config.wss_staleness_seconds else "adaptive"
         logger.info(
             f"Daemon starting: interval={self.config.interval_seconds}s, "
             f"source={self.config.orderbook_source}, "
+            f"staleness={effective_staleness:.0f}s ({staleness_type}), "
             f"max_hours={self.config.max_hours or 'infinite'}"
         )
 
         # Connect WSS if enabled
         if self.wss_client and self.config.orderbook_source == "wss":
+            # Phase 5.3: Update WSS client staleness to match daemon config
+            self.wss_client.staleness_seconds = effective_staleness
             await self.wss_client.connect()
             connected = await self.wss_client.wait_connected(timeout=10.0)
             if not connected:
@@ -274,11 +307,27 @@ class DaemonRunner:
             # Upsert market data
             self.dao.upsert_markets(markets)
 
+            # Build token list for WSS operations
+            token_ids = [m.yes_token_id for m in markets if m.yes_token_id]
+
             # Subscribe to WSS if enabled
-            if self.wss_client:
-                token_ids = [m.yes_token_id for m in markets if m.yes_token_id]
-                if token_ids:
-                    await self.wss_client.subscribe(token_ids)
+            if self.wss_client and token_ids:
+                await self.wss_client.subscribe(token_ids)
+
+            # Phase 5.3: Get cache freshness stats before fetching orderbooks
+            if self.wss_client and self.config.orderbook_source == "wss" and token_ids:
+                staleness_threshold = self.config.get_effective_staleness()
+                wss_fresh, wss_stale, wss_missing = self.wss_client.get_cache_freshness(
+                    token_ids, staleness_threshold
+                )
+                tick_stats.wss_fresh = wss_fresh
+                tick_stats.wss_stale = wss_stale
+                tick_stats.wss_missing = wss_missing
+
+                # Get cache age stats
+                cache_ages = self.wss_client.get_cache_ages(token_ids)
+                tick_stats.cache_age_median = cache_ages.median_age
+                tick_stats.cache_age_max = cache_ages.max_age
 
             # Fetch order books
             orderbook_data: dict[str, Any] | None = None
@@ -297,10 +346,8 @@ class DaemonRunner:
                         ob = self.wss_client.get_orderbook(token_id)
                         if ob and ob.has_valid_book:
                             tick_stats.wss_hits += 1
-                        elif self.wss_client.is_stale(token_id):
-                            tick_stats.stale_count += 1
 
-                    # Fallback to REST
+                    # Fallback to REST if WSS returned None (stale or missing)
                     if ob is None and self.ob_fetcher:
                         try:
                             ob = self.ob_fetcher.fetch_order_book(token_id)
@@ -314,6 +361,9 @@ class DaemonRunner:
                         orderbook_data[market.id] = ob.to_dict()
                         tick_stats.orderbooks_success += 1
 
+            # Phase 5.3: Compute stale_count from wss_stale + wss_missing for backwards compat
+            tick_stats.stale_count = tick_stats.wss_stale + tick_stats.wss_missing
+
             # Save snapshots
             snapshot_time = now.isoformat()
             snapshot_count = self.dao.save_snapshots_bulk(markets, snapshot_time, orderbook_data)
@@ -323,11 +373,24 @@ class DaemonRunner:
             self.dao.set_runtime_state("daemon_last_tick", snapshot_time)
             self.dao.set_runtime_state("daemon_total_ticks", str(self._total_ticks))
 
-            logger.info(
-                f"Tick {self._total_ticks}: {tick_stats.snapshots_saved} snapshots, "
-                f"{tick_stats.orderbooks_success} orderbooks "
-                f"(WSS:{tick_stats.wss_hits}, REST:{tick_stats.rest_fallbacks})"
-            )
+            # Phase 5.3: Enhanced logging with cache age stats
+            if self.config.orderbook_source == "wss":
+                wss_pct = (
+                    (tick_stats.wss_hits / (tick_stats.wss_hits + tick_stats.rest_fallbacks) * 100)
+                    if (tick_stats.wss_hits + tick_stats.rest_fallbacks) > 0
+                    else 0.0
+                )
+                logger.info(
+                    f"Tick {self._total_ticks}: {tick_stats.snapshots_saved} snapshots, "
+                    f"{tick_stats.orderbooks_success} orderbooks | "
+                    f"WSS:{tick_stats.wss_hits} ({wss_pct:.0f}%) REST:{tick_stats.rest_fallbacks} | "
+                    f"cache: {tick_stats.cache_age_median:.1f}s median, {tick_stats.cache_age_max:.1f}s max"
+                )
+            else:
+                logger.info(
+                    f"Tick {self._total_ticks}: {tick_stats.snapshots_saved} snapshots, "
+                    f"{tick_stats.orderbooks_success} orderbooks (REST mode)"
+                )
 
         except Exception as e:
             tick_stats.error = str(e)

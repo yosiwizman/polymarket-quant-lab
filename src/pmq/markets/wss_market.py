@@ -5,6 +5,7 @@ real-time order book updates. No authentication required (market
 data only).
 
 Phase 5.0: WebSocket microstructure feed integration.
+Phase 5.3: Application-level keepalive + adaptive staleness.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import random
+import statistics
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,6 +40,9 @@ JITTER_FACTOR = 0.3  # ±30% jitter
 # Cache staleness threshold
 DEFAULT_STALENESS_SECONDS = 30.0
 
+# Phase 5.3: Application-level keepalive (Polymarket requires "PING" text frames)
+DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 10.0
+
 
 @dataclass
 class CacheEntry:
@@ -45,6 +50,16 @@ class CacheEntry:
 
     data: OrderBookData
     updated_at: float  # time.monotonic() value
+
+
+@dataclass
+class CacheAgeStats:
+    """Statistics about cache entry ages."""
+
+    min_age: float = 0.0
+    max_age: float = 0.0
+    median_age: float = 0.0
+    count: int = 0
 
 
 @dataclass
@@ -57,6 +72,9 @@ class WssStats:
     cache_hits: int = 0
     cache_misses: int = 0
     cache_stale: int = 0
+    # Phase 5.3: Keepalive stats
+    keepalive_sent: int = 0
+    keepalive_failures: int = 0
 
 
 @dataclass
@@ -66,6 +84,9 @@ class MarketWssClient:
     Subscribes to order book updates and maintains an in-memory
     cache of latest OrderBookData per token_id. Thread-safe for
     reading from cache while the event loop runs.
+
+    Phase 5.3: Implements application-level keepalive ("PING" text frames)
+    as required by Polymarket's WebSocket server for long-lived connections.
 
     Example:
         client = MarketWssClient()
@@ -81,6 +102,7 @@ class MarketWssClient:
     """
 
     staleness_seconds: float = DEFAULT_STALENESS_SECONDS
+    keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SECONDS
     _cache: dict[str, CacheEntry] = field(default_factory=dict)
     _stats: WssStats = field(default_factory=WssStats)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -88,6 +110,7 @@ class MarketWssClient:
     _subscribed_assets: set[str] = field(default_factory=set)
     _running: bool = field(default=False)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _keepalive_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _connected: asyncio.Event = field(default_factory=asyncio.Event)
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -213,7 +236,67 @@ class MarketWssClient:
                 cache_hits=self._stats.cache_hits,
                 cache_misses=self._stats.cache_misses,
                 cache_stale=self._stats.cache_stale,
+                keepalive_sent=self._stats.keepalive_sent,
+                keepalive_failures=self._stats.keepalive_failures,
             )
+
+    def get_cache_ages(self, token_ids: list[str] | None = None) -> CacheAgeStats:
+        """Get statistics about cache entry ages.
+
+        Args:
+            token_ids: Optional list of tokens to check (all cached if None)
+
+        Returns:
+            CacheAgeStats with min/max/median ages in seconds
+        """
+        now = time.monotonic()
+        with self._lock:
+            if token_ids is None:
+                entries = list(self._cache.values())
+            else:
+                entries = [self._cache[tid] for tid in token_ids if tid in self._cache]
+
+            if not entries:
+                return CacheAgeStats()
+
+            ages = [now - entry.updated_at for entry in entries]
+
+        return CacheAgeStats(
+            min_age=min(ages),
+            max_age=max(ages),
+            median_age=statistics.median(ages) if ages else 0.0,
+            count=len(ages),
+        )
+
+    def get_cache_freshness(
+        self, token_ids: list[str], staleness_threshold: float | None = None
+    ) -> tuple[int, int, int]:
+        """Get freshness breakdown for given tokens.
+
+        Args:
+            token_ids: List of tokens to check
+            staleness_threshold: Override staleness threshold (uses self.staleness_seconds if None)
+
+        Returns:
+            Tuple of (fresh_count, stale_count, missing_count)
+        """
+        threshold = staleness_threshold or self.staleness_seconds
+        now = time.monotonic()
+        fresh = 0
+        stale = 0
+        missing = 0
+
+        with self._lock:
+            for token_id in token_ids:
+                entry = self._cache.get(token_id)
+                if entry is None:
+                    missing += 1
+                elif (now - entry.updated_at) > threshold:
+                    stale += 1
+                else:
+                    fresh += 1
+
+        return fresh, stale, missing
 
     def get_cached_token_ids(self) -> list[str]:
         """Get list of token IDs currently in cache (thread-safe)."""
@@ -227,6 +310,9 @@ class MarketWssClient:
 
         self._running = False
         self._stop_event.set()
+
+        # Stop keepalive task first
+        await self._stop_keepalive()
 
         if self._ws is not None:
             try:
@@ -246,6 +332,44 @@ class MarketWssClient:
 
         logger.info("WebSocket client stopped")
 
+    async def _start_keepalive(self) -> None:
+        """Start the keepalive background task."""
+        await self._stop_keepalive()  # Ensure no duplicate tasks
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        logger.debug(f"Keepalive task started (interval={self.keepalive_interval}s)")
+
+    async def _stop_keepalive(self) -> None:
+        """Stop the keepalive background task."""
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._keepalive_task
+            self._keepalive_task = None
+            logger.debug("Keepalive task stopped")
+
+    async def _keepalive_loop(self) -> None:
+        """Background task that sends 'PING' text frames periodically.
+
+        Polymarket's WebSocket server expects application-level keepalive
+        messages (literal "PING" text) to maintain long-lived connections.
+        """
+        while self._running and not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(self.keepalive_interval)
+
+                if self._ws is not None and self._running:
+                    await self._ws.send("PING")
+                    with self._lock:
+                        self._stats.keepalive_sent += 1
+                    logger.debug("Sent keepalive PING")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                with self._lock:
+                    self._stats.keepalive_failures += 1
+                logger.debug(f"Keepalive send failed: {e}")
+
     async def _run_forever(self) -> None:
         """Main loop: connect, receive, reconnect on failure."""
         backoff = INITIAL_BACKOFF_SECONDS
@@ -260,6 +384,9 @@ class MarketWssClient:
             except Exception as e:
                 if not self._running:
                     break
+
+                # Stop keepalive on disconnect
+                await self._stop_keepalive()
 
                 # Add jitter to backoff
                 jitter = backoff * JITTER_FACTOR * (2 * random.random() - 1)
@@ -281,6 +408,8 @@ class MarketWssClient:
                 # Exponential backoff
                 backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF_SECONDS)
 
+        # Cleanup on exit
+        await self._stop_keepalive()
         self._connected.clear()
 
     async def _connect_and_receive(self) -> None:
@@ -289,15 +418,19 @@ class MarketWssClient:
 
         logger.info(f"Connecting to {WSS_ENDPOINT}")
 
+        # Disable library-level ping since we use application-level keepalive
         async with websockets.connect(
             WSS_ENDPOINT,
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=None,  # Disable websockets library ping
+            ping_timeout=None,
             close_timeout=5,
         ) as ws:
             self._ws = ws
             self._connected.set()
             logger.info("WebSocket connected")
+
+            # Start application-level keepalive (Phase 5.3)
+            await self._start_keepalive()
 
             # Re-subscribe to any previously subscribed assets
             if self._subscribed_assets:
@@ -318,13 +451,23 @@ class MarketWssClient:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
 
+            # Phase 5.3: Handle non-JSON keepalive responses ("PONG", etc.)
+            raw_stripped = raw.strip().upper()
+            if raw_stripped in ("PONG", "PING"):
+                logger.debug(f"Keepalive response: {raw_stripped}")
+                return
+
             data = json.loads(raw)
             await self._process_message(data)
 
         except json.JSONDecodeError as e:
-            logger.debug(f"JSON parse error: {e}")
-            with self._lock:
-                self._stats.parse_errors += 1
+            # Don't count simple text responses as parse errors
+            if len(raw) < 20:  # Short non-JSON likely control message
+                logger.debug(f"Non-JSON message: {raw!r}")
+            else:
+                logger.debug(f"JSON parse error: {e}")
+                with self._lock:
+                    self._stats.parse_errors += 1
         except Exception as e:
             logger.debug(f"Message handling error: {e}")
             with self._lock:
@@ -338,7 +481,8 @@ class MarketWssClient:
             await self._handle_book_message(data)
         elif msg_type == "price_change":
             await self._handle_price_change(data)
-        elif msg_type in ("subscribed", "connected", "pong"):
+        elif msg_type in ("subscribed", "connected", "pong", "PONG"):
+            # Control/keepalive response messages - log at debug level
             logger.debug(f"Control message: {msg_type}")
         else:
             # Log unknown message types at debug level

@@ -3850,7 +3850,7 @@ def statarb_walkforward(
 
 
 # =============================================================================
-# Operations Commands (Phase 5.1, 5.2)
+# Operations Commands (Phase 5.1, 5.2, 5.3)
 # =============================================================================
 
 ops_app = typer.Typer(help="Operations commands for production data capture")
@@ -3875,12 +3875,12 @@ def ops_daemon(
         ),
     ] = "wss",
     wss_staleness_seconds: Annotated[
-        float,
+        float | None,
         typer.Option(
             "--wss-staleness",
-            help="WSS cache staleness threshold in seconds",
+            help="WSS cache staleness threshold in seconds (default: adaptive = max(3*interval, 60))",
         ),
-    ] = 30.0,
+    ] = None,  # Phase 5.3: None = adaptive
     max_hours: Annotated[
         float | None,
         typer.Option(
@@ -3929,6 +3929,8 @@ def ops_daemon(
 
     Production-grade data capture with:
     - Resilient WSS connection with REST fallback
+    - Application-level keepalive ("PING") for stable long-lived WSS (Phase 5.3)
+    - Adaptive staleness threshold: max(3*interval, 60s) by default (Phase 5.3)
     - Coverage tracking per tick (wss_hits, rest_fallbacks, stale, missing)
     - Daily export artifacts (CSV, JSON, markdown)
     - Daily snapshot exports to gzip CSV (Phase 5.2)
@@ -3946,7 +3948,7 @@ def ops_daemon(
         pmq ops daemon --orderbook-source rest --max-hours 24
         pmq ops daemon --export-dir ./data/exports
         pmq ops daemon --retention-days 30  # Keep 30 days of snapshots
-        pmq ops daemon --no-snapshot-export  # Disable snapshot export
+        pmq ops daemon --wss-staleness 120  # Explicit staleness (override adaptive)
     """
     import asyncio
 
@@ -3996,7 +3998,9 @@ def ops_daemon(
     if with_orderbook and orderbook_source == "wss":
         from pmq.markets.wss_market import MarketWssClient
 
-        wss_client = MarketWssClient(staleness_seconds=wss_staleness_seconds)
+        # Phase 5.3: Use adaptive staleness if not explicitly set
+        effective_staleness = config.get_effective_staleness()
+        wss_client = MarketWssClient(staleness_seconds=effective_staleness)
 
     # Create runner
     runner = DaemonRunner(
@@ -4012,11 +4016,16 @@ def ops_daemon(
 
     # Print startup info
     retention_str = f"{retention_days} days" if retention_days else "disabled"
+    effective_staleness = config.get_effective_staleness()
+    staleness_str = f"{effective_staleness:.0f}s" + (
+        " (adaptive)" if wss_staleness_seconds is None else ""
+    )
     console.print(
         f"[bold green]Starting ops daemon[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
+        f"WSS Staleness: {staleness_str}\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"

@@ -3849,5 +3849,158 @@ def statarb_walkforward(
     console.print(f"  slippage_bps: {config.get('slippage_bps', '?')}")
 
 
+# =============================================================================
+# Operations Commands (Phase 5.1)
+# =============================================================================
+
+ops_app = typer.Typer(help="Operations commands for production data capture")
+app.add_typer(ops_app, name="ops")
+
+
+@ops_app.command("daemon")
+def ops_daemon(
+    interval: Annotated[
+        int,
+        typer.Option("--interval", "-i", help="Snapshot interval in seconds"),
+    ] = 60,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Number of markets to fetch per cycle"),
+    ] = 200,
+    orderbook_source: Annotated[
+        str,
+        typer.Option(
+            "--orderbook-source",
+            help="Order book data source: rest, wss (default)",
+        ),
+    ] = "wss",
+    wss_staleness_seconds: Annotated[
+        float,
+        typer.Option(
+            "--wss-staleness",
+            help="WSS cache staleness threshold in seconds",
+        ),
+    ] = 30.0,
+    max_hours: Annotated[
+        float | None,
+        typer.Option(
+            "--max-hours",
+            help="Maximum hours to run (default: infinite)",
+        ),
+    ] = None,
+    export_dir: Annotated[
+        Path,
+        typer.Option(
+            "--export-dir",
+            help="Directory for daily export artifacts",
+        ),
+    ] = Path("exports"),
+    with_orderbook: Annotated[
+        bool,
+        typer.Option(
+            "--with-orderbook/--no-orderbook",
+            help="Fetch order book data",
+        ),
+    ] = True,
+) -> None:
+    """Run continuous snapshot capture daemon.
+
+    Production-grade data capture with:
+    - Resilient WSS connection with REST fallback
+    - Coverage tracking per tick (wss_hits, rest_fallbacks, stale, missing)
+    - Daily export artifacts (CSV, JSON, markdown)
+    - Clean shutdown on SIGINT/SIGTERM
+
+    Artifacts exported daily (UTC rollover):
+    - exports/ticks_YYYY-MM-DD.csv - Per-tick history
+    - exports/coverage_YYYY-MM-DD.json - Coverage statistics
+    - exports/daemon_summary_YYYY-MM-DD.md - Human-readable summary
+
+    Example:
+        pmq ops daemon --interval 60 --limit 200
+        pmq ops daemon --orderbook-source rest --max-hours 24
+        pmq ops daemon --export-dir ./data/exports
+    """
+    import asyncio
+
+    from pmq.ops.daemon import DaemonConfig, DaemonRunner, setup_signal_handlers
+
+    # Validate orderbook-source
+    if orderbook_source not in ("rest", "wss"):
+        console.print(
+            f"[red]Invalid --orderbook-source: {orderbook_source}. Must be 'rest' or 'wss'.[/red]"
+        )
+        raise typer.Exit(1)
+
+    # Create config
+    config = DaemonConfig(
+        interval_seconds=interval,
+        limit=limit,
+        orderbook_source=orderbook_source,
+        wss_staleness_seconds=wss_staleness_seconds,
+        max_hours=max_hours,
+        export_dir=export_dir,
+        with_orderbook=with_orderbook,
+    )
+
+    # Initialize dependencies
+    dao = DAO()
+    gamma_client = GammaClient()
+
+    # OrderBook fetcher for REST fallback
+    ob_fetcher = None
+    if with_orderbook:
+        from pmq.markets.orderbook import OrderBookFetcher
+
+        ob_fetcher = OrderBookFetcher()
+
+    # WSS client for streaming
+    wss_client = None
+    if with_orderbook and orderbook_source == "wss":
+        from pmq.markets.wss_market import MarketWssClient
+
+        wss_client = MarketWssClient(staleness_seconds=wss_staleness_seconds)
+
+    # Create runner
+    runner = DaemonRunner(
+        config=config,
+        dao=dao,
+        gamma_client=gamma_client,
+        wss_client=wss_client,
+        ob_fetcher=ob_fetcher,
+    )
+
+    # Setup signal handlers
+    setup_signal_handlers(runner)
+
+    # Print startup info
+    console.print(
+        f"[bold green]Starting ops daemon[/bold green]\n"
+        f"Interval: {interval}s\n"
+        f"Limit: {limit} markets\n"
+        f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
+        f"Max Hours: {max_hours or 'infinite'}\n"
+        f"Export Dir: {export_dir}\n"
+    )
+
+    # Count active markets
+    try:
+        markets = gamma_client.list_markets(limit=limit)
+        active_count = sum(1 for m in markets if m.active and not m.closed)
+        console.print(f"[cyan]Markets available: {len(markets)} ({active_count} active)[/cyan]\n")
+    except Exception as e:
+        console.print(f"[yellow]Warning: Could not fetch initial market count: {e}[/yellow]\n")
+
+    console.print("[dim]Press Ctrl+C to stop gracefully[/dim]\n")
+
+    # Run async daemon
+    try:
+        asyncio.run(runner.run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted[/yellow]")
+
+    console.print("[green]Daemon stopped[/green]")
+
+
 if __name__ == "__main__":
     app()

@@ -4003,6 +4003,35 @@ def ops_daemon(
             help="Delete snapshots older than N days after export (off by default)",
         ),
     ] = None,
+    # Phase 5.6: Cache seeding flags
+    seed_cache: Annotated[
+        bool,
+        typer.Option(
+            "--seed-cache/--no-seed-cache",
+            help="Pre-populate cache at startup to reduce cold-start REST calls (default: on)",
+        ),
+    ] = True,
+    seed_max: Annotated[
+        int | None,
+        typer.Option(
+            "--seed-max",
+            help="Max tokens to seed at startup (default: same as --limit)",
+        ),
+    ] = None,
+    seed_concurrency: Annotated[
+        int,
+        typer.Option(
+            "--seed-concurrency",
+            help="Concurrent REST fetches during seeding (default: 10)",
+        ),
+    ] = 10,
+    seed_timeout: Annotated[
+        float,
+        typer.Option(
+            "--seed-timeout",
+            help="Timeout for cache seeding phase in seconds (default: 30)",
+        ),
+    ] = 30.0,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -4012,7 +4041,8 @@ def ops_daemon(
     - Health-gated fallback: REST only when WSS unhealthy OR cache missing (Phase 5.4)
     - Quiet markets use cached data without REST fallback (event-driven WSS model)
     - REST reconciliation with drift detection and cache healing (Phase 5.5)
-    - Two coverage metrics: effective (excludes reconcile) and raw (Phase 5.5)
+    - Cache seeding at startup to reduce cold-start REST calls (Phase 5.6)
+    - Two coverage metrics: effective (excludes reconcile/seed) and raw (Phase 5.6)
     - Daily export artifacts (CSV, JSON, markdown)
     - Daily snapshot exports to gzip CSV (Phase 5.2)
     - Optional retention cleanup for old snapshots (Phase 5.2)
@@ -4032,6 +4062,7 @@ def ops_daemon(
         pmq ops daemon --wss-health-timeout 60 --max-book-age 1800
         pmq ops daemon --reconcile-sample 10 --reconcile-min-age 300
         pmq ops daemon --reconcile-mid-bps 25 --reconcile-heal  # Phase 5.5
+        pmq ops daemon --seed-cache --seed-max 100 --seed-concurrency 20  # Phase 5.6
     """
     import asyncio
 
@@ -4076,6 +4107,11 @@ def ops_daemon(
         reconcile_depth_levels=reconcile_depth_levels,
         reconcile_heal=reconcile_heal,
         reconcile_max_heals=reconcile_max_heals,
+        # Phase 5.6: Cache seeding settings
+        seed_cache=seed_cache,
+        seed_max=seed_max,
+        seed_concurrency=seed_concurrency,
+        seed_timeout=seed_timeout,
     )
 
     # Initialize dependencies
@@ -4114,8 +4150,10 @@ def ops_daemon(
     # Print startup info
     retention_str = f"{retention_days} days" if retention_days else "disabled"
     heal_str = "on" if reconcile_heal else "off"
+    seed_str = "on" if seed_cache else "off"
+    seed_max_str = str(seed_max) if seed_max else str(limit)
     console.print(
-        f"[bold green]Starting ops daemon (Phase 5.5)[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 5.6)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
@@ -4124,6 +4162,7 @@ def ops_daemon(
         f"Reconcile: {reconcile_sample} samples, min age {reconcile_min_age:.0f}s\n"
         f"Drift Thresholds: mid={reconcile_mid_bps}bps, spread={reconcile_spread_bps}bps, depth={reconcile_depth_pct}%\n"
         f"Cache Healing: {heal_str} (max {reconcile_max_heals}/tick)\n"
+        f"Cache Seeding: {seed_str} (max {seed_max_str}, concurrency {seed_concurrency})\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"

@@ -129,6 +129,8 @@ class TickStats:
     rest_unhealthy: int = 0  # REST calls due to unhealthy connection
     rest_very_old: int = 0  # REST calls for very old cache
     rest_reconcile: int = 0  # REST calls for reconciliation sampling
+    # Phase 5.6: Cache seeding bucket
+    rest_seed: int = 0  # REST calls for initial cache seeding
     # Phase 5.5: Reconciliation stats (expanded from 5.4)
     reconciled_count: int = 0  # Number of tokens reconciled
     reconcile_ok_count: int = 0  # No drift detected
@@ -159,6 +161,8 @@ class DailyStats:
     total_rest_unhealthy: int = 0
     total_rest_very_old: int = 0
     total_rest_reconcile: int = 0
+    # Phase 5.6: Cache seeding bucket
+    total_rest_seed: int = 0
     # Phase 5.5: WSS cache buckets
     total_wss_cache_fresh: int = 0
     total_wss_cache_quiet: int = 0
@@ -213,6 +217,11 @@ class DaemonConfig:
     reconcile_depth_levels: int = 3  # Number of levels for depth comparison
     reconcile_heal: bool = True  # Replace cache with REST data on drift
     reconcile_max_heals: int = 25  # Max heals per tick (prevent storms)
+    # Phase 5.6: Cache seeding settings
+    seed_cache: bool = True  # Pre-populate cache at startup to reduce cold-start REST calls
+    seed_max: int | None = None  # Max tokens to seed (None = use limit)
+    seed_concurrency: int = 10  # Concurrent REST fetches during seeding
+    seed_timeout: float = 30.0  # Total timeout for seeding phase
 
     def get_effective_staleness(self) -> float:
         """Get effective staleness threshold (adaptive if not explicitly set).
@@ -279,6 +288,9 @@ class DaemonRunner:
         self._daily_stats: DailyStats | None = None
         self._total_ticks = 0
         self._start_time: datetime | None = None
+        # Phase 5.6: Seeding state
+        self._seeded = False
+        self._seed_count = 0  # Total REST calls for seeding
 
         # Ensure export directory exists
         self.config.export_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +337,15 @@ class DaemonRunner:
             connected = await self.wss_client.wait_connected(timeout=10.0)
             if not connected:
                 logger.warning("WSS connection timeout, will retry on first tick")
+
+        # Phase 5.6: Seed cache before first tick
+        if (
+            self.config.seed_cache
+            and self.wss_client
+            and self.ob_fetcher
+            and self.config.orderbook_source == "wss"
+        ):
+            await self._seed_cache()
 
         try:
             while not self._shutdown_requested:
@@ -656,6 +677,91 @@ class DaemonRunner:
         # Deprecated field for compat
         tick_stats.drift_max_spread = max_mid_diff_bps
 
+    async def _seed_cache(self) -> int:
+        """Pre-populate WSS cache with REST data to reduce cold-start missing.
+
+        Phase 5.6: Fetches orderbooks for tokens missing from cache at startup.
+        Uses concurrent REST fetches with configurable limits.
+
+        Returns:
+            Number of tokens seeded
+        """
+        # Check if seeding is enabled
+        if not self.config.seed_cache:
+            return 0
+
+        if not self.wss_client or not self.ob_fetcher:
+            return 0
+
+        if self._seeded:
+            return self._seed_count  # Already seeded
+
+        # Capture in local vars for type narrowing (mypy doesn't track across nested functions)
+        wss_client = self.wss_client
+        ob_fetcher = self.ob_fetcher
+
+        logger.info("Cache seeding started...")
+
+        # Get initial market list
+        markets = self.gamma_client.list_markets(limit=self.config.limit)
+        token_ids = [m.yes_token_id for m in markets if m.yes_token_id]
+
+        if not token_ids:
+            self._seeded = True
+            return 0
+
+        # Find tokens missing from cache
+        missing_tokens = [tid for tid in token_ids if not wss_client.has_cached_book(tid)]
+
+        if not missing_tokens:
+            logger.info("Cache seeding: all tokens already cached")
+            self._seeded = True
+            return 0
+
+        # Apply seed_max cap
+        seed_max = self.config.seed_max or self.config.limit
+        seed_max = min(seed_max, len(missing_tokens))
+        to_seed = missing_tokens[:seed_max]
+
+        logger.info(
+            f"Cache seeding: {len(to_seed)} tokens to seed (of {len(missing_tokens)} missing)"
+        )
+
+        seeded = 0
+        concurrency = self.config.seed_concurrency
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def seed_one(token_id: str) -> bool:
+            """Fetch and cache one token."""
+            async with semaphore:
+                try:
+                    # Run sync REST fetch in thread pool
+                    loop = asyncio.get_event_loop()
+                    ob = await loop.run_in_executor(
+                        None,
+                        ob_fetcher.fetch_order_book,
+                        token_id,
+                    )
+                    if ob and ob.has_valid_book:
+                        wss_client.update_cache(token_id, ob)
+                        return True
+                except Exception as e:
+                    logger.debug(f"Seed failed for {token_id[:16]}...: {e}")
+                return False
+
+        try:
+            async with asyncio.timeout(self.config.seed_timeout):
+                tasks = [seed_one(tid) for tid in to_seed]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                seeded = sum(1 for r in results if r is True)
+        except TimeoutError:
+            logger.warning(f"Cache seeding timed out after {self.config.seed_timeout}s")
+
+        self._seeded = True
+        self._seed_count = len(to_seed)  # Count attempts, not successes
+        logger.info(f"Cache seeding completed: {seeded}/{len(to_seed)} tokens cached")
+        return seeded
+
     def _update_daily_stats(self, tick_stats: TickStats) -> None:
         """Update daily statistics with tick data."""
         today = self.clock.now().strftime("%Y-%m-%d")
@@ -681,6 +787,8 @@ class DaemonRunner:
             self._daily_stats.total_rest_unhealthy += tick_stats.rest_unhealthy
             self._daily_stats.total_rest_very_old += tick_stats.rest_very_old
             self._daily_stats.total_rest_reconcile += tick_stats.rest_reconcile
+            # Phase 5.6: Cache seeding bucket
+            self._daily_stats.total_rest_seed += tick_stats.rest_seed
             # Phase 5.5: WSS cache buckets
             self._daily_stats.total_wss_cache_fresh += tick_stats.wss_fresh
             self._daily_stats.total_wss_cache_quiet += tick_stats.wss_cache_quiet
@@ -848,17 +956,26 @@ class DaemonRunner:
         return deleted
 
     async def _export_daily_artifacts(self, stats: DailyStats) -> None:
-        """Export daily artifacts: CSV, JSON, markdown (Phase 5.5)."""
+        """Export daily artifacts: CSV, JSON, markdown (Phase 5.6)."""
         date_str = stats.date
         export_dir = self.config.export_dir
 
-        # Phase 5.5: Compute two coverage metrics
-        # coverage_effective: excludes reconcile REST calls from denominator
+        # Phase 5.6: Compute REST bucket total (invariant)
+        rest_total = (
+            stats.total_rest_missing
+            + stats.total_rest_unhealthy
+            + stats.total_rest_very_old
+            + stats.total_rest_reconcile
+            + stats.total_rest_seed
+        )
+
+        # Phase 5.6: Compute two coverage metrics
+        # coverage_effective: excludes reconcile and seed REST calls from denominator
         wss_cache_total = stats.total_wss_cache_fresh + stats.total_wss_cache_quiet
-        rest_fallback_total = (
+        rest_fallback_real = (
             stats.total_rest_missing + stats.total_rest_unhealthy + stats.total_rest_very_old
         )
-        effective_denom = wss_cache_total + rest_fallback_total
+        effective_denom = wss_cache_total + rest_fallback_real
         coverage_effective_pct = (
             (wss_cache_total / effective_denom * 100) if effective_denom > 0 else 0.0
         )
@@ -902,7 +1019,10 @@ class DaemonRunner:
             "rest_unhealthy": stats.total_rest_unhealthy,
             "rest_very_old": stats.total_rest_very_old,
             "rest_reconcile": stats.total_rest_reconcile,
-            # Phase 5.5: Two coverage metrics
+            # Phase 5.6: Seeding and total
+            "rest_seed": stats.total_rest_seed,
+            "rest_total": rest_total,
+            # Phase 5.6: Two coverage metrics
             "coverage_effective_pct": coverage_effective_pct,
             "coverage_raw_pct": wss_coverage_pct,
             # Phase 5.5: Reconciliation stats
@@ -939,6 +1059,7 @@ class DaemonRunner:
                         "rest_unhealthy",
                         "rest_very_old",
                         "rest_reconcile",
+                        "rest_seed",
                         # WSS stats
                         "wss_healthy",
                         "wss_cache_used",
@@ -967,6 +1088,7 @@ class DaemonRunner:
                             "rest_unhealthy": tick.rest_unhealthy,
                             "rest_very_old": tick.rest_very_old,
                             "rest_reconcile": tick.rest_reconcile,
+                            "rest_seed": tick.rest_seed,
                             "wss_healthy": tick.wss_healthy,
                             "wss_cache_used": tick.wss_cache_used,
                             "wss_cache_quiet": tick.wss_cache_quiet,
@@ -1000,15 +1122,17 @@ class DaemonRunner:
 - **WSS Cache Quiet:** {stats.total_wss_cache_quiet:,}
 - **WSS Total Hits:** {stats.total_wss_hits:,}
 
-## REST Fallback Breakdown (Phase 5.5)
+## REST Fallback Breakdown (Phase 5.6)
 - **REST Missing:** {stats.total_rest_missing:,} (no cached book)
 - **REST Unhealthy:** {stats.total_rest_unhealthy:,} (WSS connection unhealthy)
 - **REST Very Old:** {stats.total_rest_very_old:,} (cache > max_book_age)
 - **REST Reconcile:** {stats.total_rest_reconcile:,} (reconciliation sampling)
-- **Total REST Fallbacks:** {stats.total_rest_fallbacks:,}
+- **REST Seed:** {stats.total_rest_seed:,} (initial cache seeding)
+- **REST Total:** {rest_total:,} (sum of buckets)
+- **Total REST Fallbacks (legacy):** {stats.total_rest_fallbacks:,}
 
-## Coverage Metrics (Phase 5.5)
-- **Coverage (Effective):** {coverage_effective_pct:.1f}% (excludes reconcile REST calls)
+## Coverage Metrics (Phase 5.6)
+- **Coverage (Effective):** {coverage_effective_pct:.1f}% (excludes reconcile/seed REST calls)
 - **Coverage (Raw):** {wss_coverage_pct:.1f}% (WSS hits / total)
 
 ## Reconciliation & Healing (Phase 5.5)
@@ -1023,7 +1147,7 @@ class DaemonRunner:
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon (Phase 5.5)*
+*Generated by pmq ops daemon (Phase 5.6)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)

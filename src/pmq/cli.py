@@ -3850,7 +3850,7 @@ def statarb_walkforward(
 
 
 # =============================================================================
-# Operations Commands (Phase 5.1)
+# Operations Commands (Phase 5.1, 5.2)
 # =============================================================================
 
 ops_app = typer.Typer(help="Operations commands for production data capture")
@@ -3902,6 +3902,28 @@ def ops_daemon(
             help="Fetch order book data",
         ),
     ] = True,
+    # Phase 5.2: Snapshot export and retention flags
+    snapshot_export: Annotated[
+        bool,
+        typer.Option(
+            "--snapshot-export/--no-snapshot-export",
+            help="Export snapshots to gzip CSV on day rollover",
+        ),
+    ] = True,
+    snapshot_export_format: Annotated[
+        str,
+        typer.Option(
+            "--snapshot-export-format",
+            help="Snapshot export format: csv_gz (default)",
+        ),
+    ] = "csv_gz",
+    retention_days: Annotated[
+        int | None,
+        typer.Option(
+            "--retention-days",
+            help="Delete snapshots older than N days after export (off by default)",
+        ),
+    ] = None,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -3909,17 +3931,22 @@ def ops_daemon(
     - Resilient WSS connection with REST fallback
     - Coverage tracking per tick (wss_hits, rest_fallbacks, stale, missing)
     - Daily export artifacts (CSV, JSON, markdown)
+    - Daily snapshot exports to gzip CSV (Phase 5.2)
+    - Optional retention cleanup for old snapshots (Phase 5.2)
     - Clean shutdown on SIGINT/SIGTERM
 
     Artifacts exported daily (UTC rollover):
     - exports/ticks_YYYY-MM-DD.csv - Per-tick history
     - exports/coverage_YYYY-MM-DD.json - Coverage statistics
     - exports/daemon_summary_YYYY-MM-DD.md - Human-readable summary
+    - exports/snapshots_YYYY-MM-DD.csv.gz - Snapshot data (Phase 5.2)
 
     Example:
         pmq ops daemon --interval 60 --limit 200
         pmq ops daemon --orderbook-source rest --max-hours 24
         pmq ops daemon --export-dir ./data/exports
+        pmq ops daemon --retention-days 30  # Keep 30 days of snapshots
+        pmq ops daemon --no-snapshot-export  # Disable snapshot export
     """
     import asyncio
 
@@ -3932,6 +3959,13 @@ def ops_daemon(
         )
         raise typer.Exit(1)
 
+    # Validate snapshot-export-format
+    if snapshot_export_format not in ("csv_gz",):
+        console.print(
+            f"[red]Invalid --snapshot-export-format: {snapshot_export_format}. Must be 'csv_gz'.[/red]"
+        )
+        raise typer.Exit(1)
+
     # Create config
     config = DaemonConfig(
         interval_seconds=interval,
@@ -3941,6 +3975,9 @@ def ops_daemon(
         max_hours=max_hours,
         export_dir=export_dir,
         with_orderbook=with_orderbook,
+        snapshot_export=snapshot_export,
+        snapshot_export_format=snapshot_export_format,
+        retention_days=retention_days,
     )
 
     # Initialize dependencies
@@ -3974,6 +4011,7 @@ def ops_daemon(
     setup_signal_handlers(runner)
 
     # Print startup info
+    retention_str = f"{retention_days} days" if retention_days else "disabled"
     console.print(
         f"[bold green]Starting ops daemon[/bold green]\n"
         f"Interval: {interval}s\n"
@@ -3981,6 +4019,8 @@ def ops_daemon(
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
+        f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"
+        f"Retention: {retention_str}\n"
     )
 
     # Count active markets
@@ -4000,6 +4040,95 @@ def ops_daemon(
         console.print("\n[yellow]Interrupted[/yellow]")
 
     console.print("[green]Daemon stopped[/green]")
+
+
+@ops_app.command("status")
+def ops_status(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output as JSON"),
+    ] = False,
+) -> None:
+    """Show operator status: DB stats, latest snapshots, daemon state.
+
+    Displays:
+    - Total snapshot count and latest snapshot time
+    - Latest daemon tick timestamp (from runtime_state)
+    - Coverage statistics from most recent export
+
+    Example:
+        pmq ops status
+        pmq ops status --json
+    """
+    import json as json_mod
+    from pathlib import Path
+
+    dao = DAO()
+
+    # Get snapshot stats
+    total_snapshots = dao.count_snapshots()
+    latest_snapshot_time = dao.get_latest_snapshot_time()
+
+    # Get daemon state from runtime_state
+    daemon_last_tick = dao.get_runtime_state("daemon_last_tick")
+    daemon_total_ticks = dao.get_runtime_state("daemon_total_ticks")
+    daemon_last_error = dao.get_runtime_state("daemon_last_error")
+
+    # Try to find latest coverage file
+    export_dir = Path("exports")
+    latest_coverage: dict[str, Any] | None = None
+    if export_dir.exists():
+        coverage_files = sorted(export_dir.glob("coverage_*.json"), reverse=True)
+        if coverage_files:
+            try:
+                with open(coverage_files[0]) as f:
+                    latest_coverage = json_mod.load(f)
+            except Exception:
+                pass
+
+    status = {
+        "snapshots": {
+            "total_count": total_snapshots,
+            "latest_time": latest_snapshot_time,
+        },
+        "daemon": {
+            "last_tick": daemon_last_tick,
+            "total_ticks": int(daemon_total_ticks) if daemon_total_ticks else None,
+            "last_error": daemon_last_error,
+        },
+        "latest_coverage": latest_coverage,
+    }
+
+    if json_output:
+        console.print(json_mod.dumps(status, indent=2))
+    else:
+        console.print("[bold]Polymarket Ops Status[/bold]\n")
+
+        # Snapshots section
+        console.print("[cyan]Snapshots:[/cyan]")
+        console.print(f"  Total: {total_snapshots:,}")
+        console.print(f"  Latest: {latest_snapshot_time or 'none'}")
+
+        # Daemon section
+        console.print("\n[cyan]Daemon:[/cyan]")
+        console.print(f"  Last tick: {daemon_last_tick or 'never'}")
+        console.print(f"  Total ticks: {daemon_total_ticks or 'n/a'}")
+        if daemon_last_error:
+            console.print(f"  [yellow]Last error: {daemon_last_error}[/yellow]")
+
+        # Coverage section
+        if latest_coverage:
+            console.print(
+                f"\n[cyan]Latest Coverage ({latest_coverage.get('date', 'unknown')}):[/cyan]"
+            )
+            console.print(f"  Ticks: {latest_coverage.get('total_ticks', 0):,}")
+            console.print(f"  Snapshots: {latest_coverage.get('total_snapshots', 0):,}")
+            console.print(f"  WSS hits: {latest_coverage.get('wss_hits', 0):,}")
+            console.print(f"  REST fallbacks: {latest_coverage.get('rest_fallbacks', 0):,}")
+            wss_pct = latest_coverage.get("wss_coverage_pct", 0.0)
+            console.print(f"  WSS coverage: {wss_pct:.1f}%")
+        else:
+            console.print("\n[dim]No coverage data found in exports/[/dim]")
 
 
 if __name__ == "__main__":

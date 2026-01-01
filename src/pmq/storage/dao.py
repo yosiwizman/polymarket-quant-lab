@@ -1019,6 +1019,65 @@ class DAO:
             row = self._db.fetch_one("SELECT COUNT(*) as count FROM market_snapshots")
         return row["count"] if row else 0
 
+    def get_snapshots_for_date(self, date_str: str) -> list[dict[str, Any]]:
+        """Get all snapshots for a given UTC date.
+
+        Args:
+            date_str: Date in YYYY-MM-DD format
+
+        Returns:
+            List of snapshot dicts ordered by snapshot_time
+        """
+        start_time = f"{date_str}T00:00:00"
+        end_time = f"{date_str}T23:59:59.999999"
+        rows = self._db.fetch_all(
+            """
+            SELECT * FROM market_snapshots
+            WHERE snapshot_time >= ? AND snapshot_time <= ?
+            ORDER BY snapshot_time ASC, market_id ASC
+            """,
+            (start_time, end_time),
+        )
+        return [dict(row) for row in rows]
+
+    def delete_snapshots_before(self, cutoff_time: str) -> int:
+        """Delete snapshots older than the cutoff time.
+
+        Used by retention cleanup to remove old data after export.
+
+        Args:
+            cutoff_time: ISO format timestamp (exclusive, deletes BEFORE this)
+
+        Returns:
+            Number of rows deleted
+        """
+        # First count how many we're about to delete
+        count_row = self._db.fetch_one(
+            "SELECT COUNT(*) as count FROM market_snapshots WHERE snapshot_time < ?",
+            (cutoff_time,),
+        )
+        count = count_row["count"] if count_row else 0
+
+        if count > 0:
+            self._db.execute(
+                "DELETE FROM market_snapshots WHERE snapshot_time < ?",
+                (cutoff_time,),
+            )
+            logger.info(f"Deleted {count} snapshots before {cutoff_time}")
+
+        return count
+
+    def get_latest_snapshot_time(self) -> str | None:
+        """Get the most recent snapshot timestamp.
+
+        Returns:
+            Latest snapshot_time or None if no snapshots
+        """
+        row = self._db.fetch_one(
+            "SELECT snapshot_time FROM market_snapshots ORDER BY snapshot_time DESC LIMIT 1"
+        )
+        return row["snapshot_time"] if row else None
+
     # =========================================================================
     # Backtest Runs
     # =========================================================================

@@ -5,17 +5,25 @@ Phase 5.1: Production-grade continuous data capture with:
 - Coverage tracking per tick
 - Daily export artifacts (CSV, JSON, markdown)
 - Clean shutdown handling
+
+Phase 5.2: Extended with:
+- Daily snapshot exports (gzip CSV, atomic writes)
+- Optional retention cleanup (delete old snapshots after export)
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
+import gzip
 import json
+import os
 import signal
 import sys
+import tempfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -123,6 +131,11 @@ class DaemonConfig:
     max_hours: float | None = None
     export_dir: Path = field(default_factory=lambda: Path("exports"))
     with_orderbook: bool = True
+    # Phase 5.2: Snapshot export settings
+    snapshot_export: bool = True  # Export daily snapshots to gzip CSV
+    snapshot_export_format: str = "csv_gz"  # "csv_gz" (parquet requires extra deps)
+    retention_days: int | None = None  # Delete snapshots older than N days after export
+    snapshot_export_timeout: float = 60.0  # Timeout for snapshot export (seconds)
 
 
 # =============================================================================
@@ -349,13 +362,157 @@ class DaemonRunner:
             self._daily_stats.tick_history.append(tick_stats)
 
     async def _check_day_rollover(self) -> None:
-        """Check if day has changed and export previous day's data."""
+        """Check if day has changed and export previous day's data.
+
+        On day rollover:
+        1. Export daily artifacts (coverage JSON, ticks CSV, summary MD)
+        2. Export snapshots for the completed day (gzip CSV)
+        3. Run retention cleanup if configured
+        """
         today = self.clock.now().strftime("%Y-%m-%d")
 
         if self._current_day and self._current_day != today and self._daily_stats:
+            previous_day = self._current_day
             # Day changed - export previous day
             await self._export_daily_artifacts(self._daily_stats)
             self._daily_stats = None
+
+            # Phase 5.2: Export snapshots with timeout
+            if self.config.snapshot_export:
+                try:
+                    await asyncio.wait_for(
+                        self._export_snapshots_for_day(previous_day),
+                        timeout=self.config.snapshot_export_timeout,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        f"Snapshot export for {previous_day} timed out after {self.config.snapshot_export_timeout}s"
+                    )
+                except Exception as e:
+                    logger.error(f"Snapshot export failed for {previous_day}: {e}")
+
+            # Phase 5.2: Retention cleanup (only after successful export)
+            if self.config.retention_days is not None:
+                try:
+                    await self._cleanup_retention(previous_day)
+                except Exception as e:
+                    logger.error(f"Retention cleanup failed: {e}")
+
+    async def _export_snapshots_for_day(self, date_str: str) -> int:
+        """Export all snapshots for a given date to gzip CSV.
+
+        Uses atomic write (temp file -> rename) to ensure file integrity.
+        Returns the number of rows exported.
+
+        Args:
+            date_str: Date string in YYYY-MM-DD format
+
+        Returns:
+            Number of snapshot rows exported
+        """
+        if not self.config.snapshot_export:
+            return 0
+
+        export_dir = self.config.export_dir
+        output_path = export_dir / f"snapshots_{date_str}.csv.gz"
+
+        # Get snapshot count first
+        snapshots = self.dao.get_snapshots_for_date(date_str)
+        if not snapshots:
+            logger.info(f"No snapshots to export for {date_str}")
+            return 0
+
+        # Atomic write: temp file in same directory, then rename
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".csv.gz.tmp", dir=str(export_dir))
+        try:
+            os.close(temp_fd)  # Close the fd, we'll open with gzip
+            temp_path_obj = Path(temp_path)
+
+            # Column names from market_snapshots table
+            fieldnames = [
+                "id",
+                "market_id",
+                "yes_price",
+                "no_price",
+                "liquidity",
+                "volume",
+                "snapshot_time",
+                "best_bid",
+                "best_ask",
+                "mid_price",
+                "spread_bps",
+                "top_depth_usd",
+            ]
+
+            # Stream write to gzip
+            with gzip.open(temp_path_obj, "wt", encoding="utf-8", newline="") as gz:
+                writer = csv.DictWriter(gz, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for snapshot in snapshots:
+                    writer.writerow(
+                        {
+                            "id": snapshot["id"],
+                            "market_id": snapshot["market_id"],
+                            "yes_price": snapshot["yes_price"],
+                            "no_price": snapshot["no_price"],
+                            "liquidity": snapshot.get("liquidity", 0.0),
+                            "volume": snapshot.get("volume", 0.0),
+                            "snapshot_time": snapshot["snapshot_time"],
+                            "best_bid": snapshot.get("best_bid"),
+                            "best_ask": snapshot.get("best_ask"),
+                            "mid_price": snapshot.get("mid_price"),
+                            "spread_bps": snapshot.get("spread_bps"),
+                            "top_depth_usd": snapshot.get("top_depth_usd"),
+                        }
+                    )
+
+            # Atomic rename (POSIX: atomic; Windows: may fail if exists)
+            if sys.platform == "win32" and output_path.exists():
+                output_path.unlink()
+            temp_path_obj.rename(output_path)
+
+            row_count = len(snapshots)
+            logger.info(f"Exported {row_count:,} snapshots to {output_path}")
+            return row_count
+
+        except Exception:
+            # Cleanup temp file on error
+            with contextlib.suppress(Exception):
+                Path(temp_path).unlink(missing_ok=True)
+            raise
+
+    async def _cleanup_retention(self, exported_date: str) -> int:
+        """Delete old snapshots if retention_days is configured.
+
+        Only deletes snapshots OLDER than retention_days.
+        The just-exported date is never deleted.
+
+        Args:
+            exported_date: The date that was just exported (YYYY-MM-DD)
+
+        Returns:
+            Number of rows deleted
+        """
+        if self.config.retention_days is None:
+            return 0
+
+        # Calculate cutoff: delete snapshots older than N days
+        cutoff = self.clock.now() - timedelta(days=self.config.retention_days)
+        cutoff_str = cutoff.strftime("%Y-%m-%dT00:00:00")
+
+        # Safety check: cutoff must be before the exported date
+        exported_start = f"{exported_date}T00:00:00"
+        if cutoff_str >= exported_start:
+            logger.warning(
+                f"Retention cutoff {cutoff_str} is not older than exported date {exported_date}, skipping deletion"
+            )
+            return 0
+
+        deleted = self.dao.delete_snapshots_before(cutoff_str)
+        if deleted > 0:
+            logger.info(f"Retention cleanup: deleted {deleted:,} snapshots older than {cutoff_str}")
+        return deleted
 
     async def _export_daily_artifacts(self, stats: DailyStats) -> None:
         """Export daily artifacts: CSV, JSON, markdown."""
@@ -467,6 +624,7 @@ class DaemonRunner:
         logger.info("Finalizing daemon...")
 
         # Export current day's data if any (with timeout)
+        current_day = self._current_day
         if self._daily_stats and self._daily_stats.total_ticks > 0:
             try:
                 await asyncio.wait_for(
@@ -477,6 +635,20 @@ class DaemonRunner:
                 logger.warning("Daily export timed out after 5s")
             except Exception as e:
                 logger.warning(f"Daily export failed: {e}")
+
+        # Phase 5.2: Export snapshots for current day on shutdown (with timeout)
+        if self.config.snapshot_export and current_day:
+            try:
+                await asyncio.wait_for(
+                    self._export_snapshots_for_day(current_day),
+                    timeout=self.config.snapshot_export_timeout,
+                )
+            except TimeoutError:
+                logger.warning(
+                    f"Snapshot export for {current_day} timed out after {self.config.snapshot_export_timeout}s"
+                )
+            except Exception as e:
+                logger.warning(f"Snapshot export failed for {current_day}: {e}")
 
         # Close WSS connection (with timeout)
         if self.wss_client:

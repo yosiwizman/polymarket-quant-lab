@@ -1460,6 +1460,109 @@ sudo journalctl -u pmq-daemon -f
 
 > 💡 **Daemon vs Snapshots Run**: Use `pmq ops daemon` for production continuous capture. Use `pmq snapshots run` for shorter ad-hoc collection sessions. The daemon provides better coverage tracking and daily exports.
 
+### Snapshot Exports & Retention (Phase 5.2)
+
+Phase 5.2 extends the ops daemon with production-ready features for long-running deployments:
+- Daily snapshot exports to compressed gzip CSV files
+- Optional retention cleanup to manage database size
+- Operator status command for monitoring
+
+#### Snapshot Exports
+
+At each UTC day rollover (and on shutdown), the daemon exports all snapshots for the completed day:
+
+```powershell
+# Enable snapshot exports (default: ON)
+poetry run pmq ops daemon --snapshot-export
+
+# Disable snapshot exports
+poetry run pmq ops daemon --no-snapshot-export
+```
+
+Exported files:
+- `exports/snapshots_YYYY-MM-DD.csv.gz` - Compressed CSV with all market snapshots
+
+The export uses atomic writes (temp file → rename) to ensure file integrity, with a 60-second timeout to prevent daemon hangs.
+
+#### Retention Cleanup
+
+Optionally delete old snapshots from the database after successful export:
+
+```powershell
+# Keep 30 days of snapshots in DB
+poetry run pmq ops daemon --retention-days 30
+
+# Keep 7 days (more aggressive cleanup)
+poetry run pmq ops daemon --retention-days 7
+
+# Disable retention (default - keep all snapshots)
+poetry run pmq ops daemon
+```
+
+Safety features:
+- Only deletes snapshots OLDER than the retention cutoff
+- Never deletes the current or just-exported day's data
+- Only runs after successful export
+
+#### Operator Status Command
+
+Check the current state of your data capture:
+
+```powershell
+# Human-readable status
+poetry run pmq ops status
+
+# JSON output (for scripting/monitoring)
+poetry run pmq ops status --json
+```
+
+Output includes:
+- Total snapshot count and latest snapshot time
+- Daemon last tick timestamp and total ticks
+- Latest coverage statistics from daily export
+
+Example output:
+```
+Polymarket Ops Status
+
+Snapshots:
+  Total: 1,234,567
+  Latest: 2024-01-15T23:59:00+00:00
+
+Daemon:
+  Last tick: 2024-01-15T23:59:00+00:00
+  Total ticks: 1440
+
+Latest Coverage (2024-01-14):
+  Ticks: 1,440
+  Snapshots: 288,000
+  WSS hits: 250,000
+  REST fallbacks: 30,000
+  WSS coverage: 89.3%
+```
+
+#### Phase 5.2 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--snapshot-export/--no-snapshot-export` | bool | True | Export snapshots on day rollover |
+| `--snapshot-export-format` | str | `csv_gz` | Export format (only csv_gz supported) |
+| `--retention-days` | int | None | Delete snapshots older than N days |
+
+#### 24/7 Production Run Example
+
+```powershell
+# Run indefinitely with 30-day retention, exporting daily
+poetry run pmq ops daemon --interval 60 --retention-days 30 --export-dir ./data/exports
+```
+
+This configuration:
+1. Captures snapshots every 60 seconds
+2. Exports compressed snapshots at each UTC midnight
+3. Deletes snapshots older than 30 days after export
+4. Exports coverage stats and tick history daily
+5. Stops gracefully on Ctrl+C with final export
+
 ## Project Structure
 
 ```

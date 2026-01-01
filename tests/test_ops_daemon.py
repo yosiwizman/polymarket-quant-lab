@@ -6,11 +6,17 @@ Tests cover:
 - Daily rollover export
 - REST fallback
 - Coverage counters
+
+Phase 5.2: Extended tests for:
+- Snapshot export to gzip CSV
+- Retention cleanup
+- Ops status command
 """
 
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -81,6 +87,9 @@ class FakeDAO:
         self.upserted_markets: list[Any] = []
         self.saved_snapshots: list[tuple[Any, str, Any]] = []
         self.runtime_state: dict[str, str] = {}
+        # Phase 5.2: Snapshot storage for export tests
+        self._snapshots_db: list[dict[str, Any]] = []
+        self.deleted_snapshots_before: list[str] = []
 
     def upsert_markets(self, markets: list[Any]) -> int:
         """Record upserted markets."""
@@ -100,6 +109,40 @@ class FakeDAO:
     def set_runtime_state(self, key: str, value: str) -> None:
         """Store runtime state."""
         self.runtime_state[key] = value
+
+    # Phase 5.2: New methods for snapshot export
+    def get_snapshots_for_date(self, date_str: str) -> list[dict[str, Any]]:
+        """Get all snapshots for a given date."""
+        start = f"{date_str}T00:00:00"
+        end = f"{date_str}T23:59:59"
+        return [s for s in self._snapshots_db if start <= s.get("snapshot_time", "") <= end]
+
+    def delete_snapshots_before(self, cutoff_time: str) -> int:
+        """Delete snapshots older than cutoff."""
+        self.deleted_snapshots_before.append(cutoff_time)
+        before_count = len(self._snapshots_db)
+        self._snapshots_db = [
+            s for s in self._snapshots_db if s.get("snapshot_time", "") >= cutoff_time
+        ]
+        return before_count - len(self._snapshots_db)
+
+    def add_test_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Add a test snapshot to the fake DB."""
+        self._snapshots_db.append(snapshot)
+
+    def count_snapshots(self) -> int:
+        """Count total snapshots."""
+        return len(self._snapshots_db)
+
+    def get_latest_snapshot_time(self) -> str | None:
+        """Get the most recent snapshot time."""
+        if not self._snapshots_db:
+            return None
+        return max(s.get("snapshot_time", "") for s in self._snapshots_db)
+
+    def get_runtime_state(self, key: str) -> str | None:
+        """Get runtime state value."""
+        return self.runtime_state.get(key)
 
 
 class FakeGammaClient:
@@ -892,3 +935,359 @@ class TestErrorHandling:
         assert tick_stats.error is not None
         assert "Test API error" in tick_stats.error
         assert "daemon_last_error" in fake_dao.runtime_state
+
+
+# =============================================================================
+# Phase 5.2: Snapshot Export Tests
+# =============================================================================
+
+
+class TestSnapshotExport:
+    """Tests for snapshot export to gzip CSV."""
+
+    @pytest.mark.asyncio
+    async def test_export_snapshots_creates_gzip_csv(self, tmp_path: Path) -> None:
+        """_export_snapshots_for_day should create gzip CSV file."""
+        fake_clock = FakeClock(datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()
+
+        # Add test snapshots for the day
+        for i in range(5):
+            fake_dao.add_test_snapshot(
+                {
+                    "id": i + 1,
+                    "market_id": f"market_{i}",
+                    "yes_price": 0.5 + (i * 0.01),
+                    "no_price": 0.5 - (i * 0.01),
+                    "liquidity": 1000.0,
+                    "volume": 500.0,
+                    "snapshot_time": f"2024-01-15T12:0{i}:00",
+                    "best_bid": 0.48,
+                    "best_ask": 0.52,
+                    "mid_price": 0.50,
+                    "spread_bps": 400.0,
+                    "top_depth_usd": 100.0,
+                }
+            )
+
+        config = DaemonConfig(
+            export_dir=tmp_path,
+            snapshot_export=True,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=FakeGammaClient(),
+            clock=fake_clock,
+        )
+
+        # Export snapshots
+        count = await runner._export_snapshots_for_day("2024-01-15")
+
+        assert count == 5
+        output_path = tmp_path / "snapshots_2024-01-15.csv.gz"
+        assert output_path.exists()
+
+        # Verify file contents
+        with gzip.open(output_path, "rt", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        # Header + 5 data rows
+        assert len(lines) == 6
+        assert "id,market_id,yes_price" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_export_snapshots_disabled(self, tmp_path: Path) -> None:
+        """_export_snapshots_for_day should skip when disabled."""
+        fake_clock = FakeClock(datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()
+        fake_dao.add_test_snapshot(
+            {
+                "id": 1,
+                "market_id": "test",
+                "yes_price": 0.5,
+                "no_price": 0.5,
+                "snapshot_time": "2024-01-15T12:00:00",
+            }
+        )
+
+        config = DaemonConfig(
+            export_dir=tmp_path,
+            snapshot_export=False,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=FakeGammaClient(),
+            clock=fake_clock,
+        )
+
+        count = await runner._export_snapshots_for_day("2024-01-15")
+
+        assert count == 0
+        output_path = tmp_path / "snapshots_2024-01-15.csv.gz"
+        assert not output_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_export_snapshots_empty_date(self, tmp_path: Path) -> None:
+        """_export_snapshots_for_day should handle empty date gracefully."""
+        fake_clock = FakeClock(datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()  # No snapshots added
+
+        config = DaemonConfig(
+            export_dir=tmp_path,
+            snapshot_export=True,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=FakeGammaClient(),
+            clock=fake_clock,
+        )
+
+        count = await runner._export_snapshots_for_day("2024-01-15")
+
+        assert count == 0
+        output_path = tmp_path / "snapshots_2024-01-15.csv.gz"
+        assert not output_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_export_snapshots_overwrites_existing(self, tmp_path: Path) -> None:
+        """_export_snapshots_for_day should overwrite existing file (Windows)."""
+        fake_clock = FakeClock(datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()
+        fake_dao.add_test_snapshot(
+            {
+                "id": 1,
+                "market_id": "test",
+                "yes_price": 0.5,
+                "no_price": 0.5,
+                "snapshot_time": "2024-01-15T12:00:00",
+            }
+        )
+
+        config = DaemonConfig(
+            export_dir=tmp_path,
+            snapshot_export=True,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=FakeGammaClient(),
+            clock=fake_clock,
+        )
+
+        # Create existing file
+        output_path = tmp_path / "snapshots_2024-01-15.csv.gz"
+        output_path.write_bytes(b"old data")
+
+        # Export should overwrite
+        count = await runner._export_snapshots_for_day("2024-01-15")
+
+        assert count == 1
+        # Verify it's valid gzip now
+        with gzip.open(output_path, "rt", encoding="utf-8") as f:
+            content = f.read()
+        assert "market_id" in content
+
+
+# =============================================================================
+# Phase 5.2: Retention Cleanup Tests
+# =============================================================================
+
+
+class TestRetentionCleanup:
+    """Tests for retention cleanup."""
+
+    @pytest.mark.asyncio
+    async def test_retention_deletes_old_snapshots(self, tmp_path: Path) -> None:
+        """_cleanup_retention should delete old snapshots."""
+        # Set clock to 2024-01-15
+        fake_clock = FakeClock(datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()
+
+        # Add old snapshots (should be deleted with 7-day retention)
+        for day in range(1, 10):
+            fake_dao.add_test_snapshot(
+                {
+                    "id": day,
+                    "market_id": f"market_{day}",
+                    "yes_price": 0.5,
+                    "no_price": 0.5,
+                    "snapshot_time": f"2024-01-0{day}T12:00:00",
+                }
+            )
+
+        config = DaemonConfig(
+            export_dir=tmp_path,
+            retention_days=7,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=FakeGammaClient(),
+            clock=fake_clock,
+        )
+
+        # Run retention cleanup for day 14 (yesterday)
+        await runner._cleanup_retention("2024-01-14")
+
+        # Should have called delete_snapshots_before
+        assert len(fake_dao.deleted_snapshots_before) == 1
+        # Cutoff is 2024-01-08 (15 - 7 days)
+        assert "2024-01-08T00:00:00" in fake_dao.deleted_snapshots_before[0]
+
+    @pytest.mark.asyncio
+    async def test_retention_disabled_by_default(self, tmp_path: Path) -> None:
+        """_cleanup_retention should do nothing when retention_days is None."""
+        fake_clock = FakeClock(datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()
+
+        config = DaemonConfig(
+            export_dir=tmp_path,
+            retention_days=None,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=FakeGammaClient(),
+            clock=fake_clock,
+        )
+
+        deleted = await runner._cleanup_retention("2024-01-14")
+
+        assert deleted == 0
+        assert len(fake_dao.deleted_snapshots_before) == 0
+
+    @pytest.mark.asyncio
+    async def test_retention_safety_check(self, tmp_path: Path) -> None:
+        """_cleanup_retention should not delete if cutoff is not older than exported date."""
+        # Set clock to 2024-01-10 (so cutoff with 1-day retention is 2024-01-09)
+        # Trying to export 2024-01-09 would have cutoff >= exported_date
+        fake_clock = FakeClock(datetime(2024, 1, 10, 12, 0, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()
+
+        config = DaemonConfig(
+            export_dir=tmp_path,
+            retention_days=1,  # Very short retention: cutoff = 2024-01-09
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=FakeGammaClient(),
+            clock=fake_clock,
+        )
+
+        # Try to run retention for the same day as cutoff (would delete today's data!)
+        # Cutoff is 2024-01-09, exported_date is 2024-01-09, so cutoff >= exported_date
+        deleted = await runner._cleanup_retention("2024-01-09")
+
+        # Safety check should prevent deletion (cutoff not older than exported date)
+        assert deleted == 0
+        assert len(fake_dao.deleted_snapshots_before) == 0
+
+
+# =============================================================================
+# Phase 5.2: Day Rollover with Snapshot Export Tests
+# =============================================================================
+
+
+class TestDayRolloverWithSnapshotExport:
+    """Tests for day rollover triggering snapshot export."""
+
+    @pytest.mark.asyncio
+    async def test_day_rollover_exports_snapshots(self, tmp_path: Path) -> None:
+        """Day rollover should export snapshots for the completed day."""
+        # Start on day 15
+        fake_clock = FakeClock(datetime(2024, 1, 15, 23, 59, 0, tzinfo=UTC))
+        fake_dao = FakeDAO()
+        fake_gamma = FakeGammaClient([FakeMarket("m1")])
+
+        # Add snapshot for day 15
+        fake_dao.add_test_snapshot(
+            {
+                "id": 1,
+                "market_id": "m1",
+                "yes_price": 0.5,
+                "no_price": 0.5,
+                "snapshot_time": "2024-01-15T23:59:00",
+            }
+        )
+
+        config = DaemonConfig(
+            interval_seconds=1,
+            export_dir=tmp_path,
+            with_orderbook=False,
+            snapshot_export=True,
+            retention_days=7,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=fake_gamma,
+            clock=fake_clock,
+            sleep_fn=FakeSleep(),
+        )
+
+        # Initialize daily stats for day 15
+        runner._current_day = "2024-01-15"
+        runner._daily_stats = DailyStats(
+            date="2024-01-15",
+            total_ticks=10,
+            total_snapshots=100,
+        )
+
+        # Simulate day change to 16
+        fake_clock.advance_day()
+
+        # Trigger rollover check
+        await runner._check_day_rollover()
+
+        # Verify snapshot export was created
+        snapshot_path = tmp_path / "snapshots_2024-01-15.csv.gz"
+        assert snapshot_path.exists()
+
+        # Verify retention was triggered
+        assert len(fake_dao.deleted_snapshots_before) == 1
+
+
+# =============================================================================
+# Phase 5.2: DaemonConfig Tests
+# =============================================================================
+
+
+class TestDaemonConfigPhase52:
+    """Tests for Phase 5.2 DaemonConfig options."""
+
+    def test_default_snapshot_export_enabled(self) -> None:
+        """snapshot_export should default to True."""
+        config = DaemonConfig()
+        assert config.snapshot_export is True
+
+    def test_default_snapshot_export_format(self) -> None:
+        """snapshot_export_format should default to csv_gz."""
+        config = DaemonConfig()
+        assert config.snapshot_export_format == "csv_gz"
+
+    def test_default_retention_days_none(self) -> None:
+        """retention_days should default to None (disabled)."""
+        config = DaemonConfig()
+        assert config.retention_days is None
+
+    def test_custom_retention_days(self) -> None:
+        """retention_days should accept custom value."""
+        config = DaemonConfig(retention_days=30)
+        assert config.retention_days == 30
+
+    def test_snapshot_export_timeout_default(self) -> None:
+        """snapshot_export_timeout should have reasonable default."""
+        config = DaemonConfig()
+        assert config.snapshot_export_timeout == 60.0

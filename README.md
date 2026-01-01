@@ -1711,6 +1711,79 @@ Tick completed: markets=200, snapshots=200
 
 > 💡 **Why Health-Gated?** Per-market staleness assumes regular updates—but prediction markets are event-driven. A market with no trades may not emit updates for hours, yet its cached data is still valid. Health-gating checks the connection itself, not individual market activity.
 
+### Drift Calibration + Cache Healing (Phase 5.5)
+
+Phase 5.5 makes reconciliation "meaningful" by replacing the strict 0.1% equality check with configurable drift thresholds and adding cache healing:
+- **Problem**: Phase 5.4's reconciliation reported 100% drift because even tiny floating-point differences counted as drift.
+- **Solution**: Compare robust top-of-book metrics (mid price, spread, depth) with configurable thresholds.
+
+#### Drift Detection Model
+
+Drift is detected when ANY of these thresholds are exceeded:
+- **Mid Price**: Difference > `reconcile_mid_bps` (default: 25 bps = 0.25%)
+- **Spread**: Absolute difference > `reconcile_spread_bps` (default: 25 bps)
+- **Depth**: Percentage difference > `reconcile_depth_pct` (default: 50%)
+
+This drastically reduces false positives from floating-point precision issues.
+
+#### Cache Healing
+
+When drift is detected, the daemon can "heal" the cache by replacing WSS data with REST data:
+
+```powershell
+# Default: healing enabled with cap of 25 heals per tick
+poetry run pmq ops daemon --interval 60
+
+# Disable healing (just detect drift)
+poetry run pmq ops daemon --no-reconcile-heal
+
+# More aggressive healing cap
+poetry run pmq ops daemon --reconcile-max-heals 50
+```
+
+Healing prevents drift from accumulating over time in long-running daemon sessions.
+
+#### Phase 5.5 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--reconcile-mid-bps` | float | 25.0 | Mid price drift threshold (bps) |
+| `--reconcile-spread-bps` | float | 25.0 | Spread drift threshold (bps) |
+| `--reconcile-depth-pct` | float | 50.0 | Depth drift threshold (%) |
+| `--reconcile-depth-levels` | int | 3 | Number of levels for depth comparison |
+| `--reconcile-heal/--no-reconcile-heal` | bool | True | Enable cache healing on drift |
+| `--reconcile-max-heals` | int | 25 | Max heals per tick (prevent storms) |
+
+#### Coverage Metrics (Phase 5.5)
+
+Daily exports now include two coverage metrics:
+- **coverage_effective_pct**: (WSS fresh + WSS quiet) / (total excluding reconcile REST calls)
+- **coverage_raw_pct**: WSS hits / total orderbooks
+
+Effective coverage excludes reconciliation REST calls since those are intentional sampling, not fallbacks.
+
+#### Tick Logging (Phase 5.5)
+
+```
+Tick 10: 200 snapshots, 195 orderbooks | WSS[healthy]:180 (90%) REST:15 |
+  cache: 5.2s med, 45.1s max | reconciled:10 ok:8 drift:2 healed:2
+```
+
+Reconciliation stats:
+- **reconciled**: Tokens compared (WSS vs REST)
+- **ok**: No drift detected (within thresholds)
+- **drift**: Drift detected (threshold exceeded)
+- **healed**: Cache replaced with REST data
+
+#### Expected Results
+
+With Phase 5.5, a 20-minute daemon run should show:
+- **drift_pct < 30%** (vs 100% before calibration)
+- **coverage_effective > 70%**
+- **reconcile_ok_count >> drift_count** (most comparisons match)
+
+> 💡 **Why Calibration?** Strict equality checks are too sensitive for floating-point data. Real order books have micro-variations that don't affect trading decisions. Phase 5.5's threshold-based detection focuses on differences that actually matter.
+
 ## Project Structure
 
 ```
@@ -1950,6 +2023,14 @@ poetry run mypy src
 - [x] 2-layer policy: missing → REST, unhealthy → REST, else use cache
 - [x] New CLI flags: `--wss-health-timeout`, `--max-book-age`, `--reconcile-sample`
 - [x] Reduced false REST fallbacks for quiet markets
+
+### Phase 5.5 ✓
+- [x] Drift calibration with configurable thresholds (mid/spread/depth)
+- [x] Cache healing: replace WSS data with REST on drift detection
+- [x] Max heals per tick cap to prevent healing storms
+- [x] Explicit REST fallback buckets (missing/unhealthy/very_old/reconcile)
+- [x] Two coverage metrics: effective (excl reconcile) and raw
+- [x] Enhanced reconciliation stats in tick logging and daily exports
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

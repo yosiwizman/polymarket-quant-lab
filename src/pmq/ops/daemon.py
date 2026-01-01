@@ -15,6 +15,12 @@ Phase 5.4: Health-gated fallback + REST reconciliation:
 - Quiet markets use cached data without REST fallback
 - REST fallback only on: missing cache OR unhealthy WSS connection
 - REST reconciliation sampler for drift detection
+
+Phase 5.5: Drift calibration + cache healing + metrics cleanup:
+- Robust drift detection using mid/spread/depth thresholds (not strict equality)
+- Cache healing: replace WSS cache with REST data when drift detected
+- Explicit REST fallback buckets (missing, unhealthy, very_old, reconcile)
+- Two coverage metrics: effective (excludes reconcile) and raw
 """
 
 from __future__ import annotations
@@ -103,25 +109,33 @@ class TickStats:
     orderbooks_success: int = 0
     wss_hits: int = 0
     rest_fallbacks: int = 0
-    stale_count: int = 0
+    stale_count: int = 0  # Deprecated in Phase 5.5 - kept for compat
     missing_count: int = 0
     error: str | None = None
-    # Phase 5.3: Enhanced cache stats (some deprecated in 5.4)
+    # Phase 5.3: Enhanced cache stats (some deprecated in 5.4/5.5)
     wss_fresh: int = 0  # Fresh WSS cache hits (age <= 2*interval)
-    wss_stale: int = 0  # Phase 5.3: Stale WSS cache (deprecated in 5.4 model)
+    wss_stale: int = 0  # Deprecated - use explicit buckets
     wss_missing: int = 0  # No WSS cache entry (triggered REST fallback)
     cache_age_median: float = 0.0  # Median cache age in seconds
     cache_age_max: float = 0.0  # Max cache age in seconds
-    # Phase 5.4: Health-gated model stats
+    # Phase 5.4/5.5: Health-gated model stats
     wss_cache_used: int = 0  # Total WSS cache hits (regardless of age)
     wss_cache_quiet: int = 0  # Cache used but age > 2*interval (quiet market)
     wss_cache_very_old: int = 0  # Cache age > max_book_age (safety concern)
     wss_unhealthy_count: int = 0  # REST fallbacks due to unhealthy connection
     wss_healthy: bool = True  # Was WSS healthy during this tick?
-    # Phase 5.4: Reconciliation stats
+    # Phase 5.5: Explicit REST fallback buckets
+    rest_missing: int = 0  # REST calls for missing cache
+    rest_unhealthy: int = 0  # REST calls due to unhealthy connection
+    rest_very_old: int = 0  # REST calls for very old cache
+    rest_reconcile: int = 0  # REST calls for reconciliation sampling
+    # Phase 5.5: Reconciliation stats (expanded from 5.4)
     reconciled_count: int = 0  # Number of tokens reconciled
-    drift_count: int = 0  # Number with detected drift
-    drift_max_spread: float = 0.0  # Max spread difference (bps)
+    reconcile_ok_count: int = 0  # No drift detected
+    reconcile_healed_count: int = 0  # Drift detected and cache healed
+    drift_count: int = 0  # Number with detected drift (= healed if heal enabled)
+    drift_max_mid_bps: float = 0.0  # Max mid price difference observed (bps)
+    drift_max_spread: float = 0.0  # Deprecated - use drift_max_mid_bps
 
 
 @dataclass
@@ -134,14 +148,24 @@ class DailyStats:
     total_orderbooks: int = 0
     total_wss_hits: int = 0
     total_rest_fallbacks: int = 0
-    total_stale: int = 0
+    total_stale: int = 0  # Deprecated - kept for compat
     total_missing: int = 0
     total_errors: int = 0
     start_time: str = ""
     end_time: str = ""
     tick_history: list[TickStats] = field(default_factory=list)
-    # Phase 5.4: Reconciliation aggregates
+    # Phase 5.5: Explicit REST fallback buckets
+    total_rest_missing: int = 0
+    total_rest_unhealthy: int = 0
+    total_rest_very_old: int = 0
+    total_rest_reconcile: int = 0
+    # Phase 5.5: WSS cache buckets
+    total_wss_cache_fresh: int = 0
+    total_wss_cache_quiet: int = 0
+    # Phase 5.5: Reconciliation aggregates (expanded from 5.4)
     total_reconciled: int = 0
+    total_reconcile_ok: int = 0
+    total_reconcile_healed: int = 0
     total_drift: int = 0
 
 
@@ -182,6 +206,13 @@ class DaemonConfig:
     reconcile_sample: int = 10  # Max tokens to reconcile per tick
     reconcile_min_age: float = 300.0  # Only reconcile caches older than 5 minutes
     reconcile_timeout: float = 5.0  # Timeout for reconciliation REST batch
+    # Phase 5.5: Drift thresholds and healing
+    reconcile_mid_bps: float = 25.0  # Mid price diff threshold (bps)
+    reconcile_spread_bps: float = 25.0  # Spread diff threshold (bps)
+    reconcile_depth_pct: float = 50.0  # Depth diff threshold (%)
+    reconcile_depth_levels: int = 3  # Number of levels for depth comparison
+    reconcile_heal: bool = True  # Replace cache with REST data on drift
+    reconcile_max_heals: int = 25  # Max heals per tick (prevent storms)
 
     def get_effective_staleness(self) -> float:
         """Get effective staleness threshold (adaptive if not explicitly set).
@@ -398,6 +429,7 @@ class DaemonRunner:
                                     ob = self.ob_fetcher.fetch_order_book(token_id)
                                     used_rest = True
                                     tick_stats.wss_missing += 1
+                                    tick_stats.rest_missing += 1  # Phase 5.5
                                 except Exception as e:
                                     logger.debug(f"REST fetch failed for {market.id}: {e}")
                                     tick_stats.missing_count += 1
@@ -411,6 +443,7 @@ class DaemonRunner:
                                     ob = self.ob_fetcher.fetch_order_book(token_id)
                                     used_rest = True
                                     tick_stats.wss_unhealthy_count += 1
+                                    tick_stats.rest_unhealthy += 1  # Phase 5.5
                                 except Exception as e:
                                     # Fall back to cached data if REST fails
                                     ob = self.wss_client.get_orderbook_if_healthy(
@@ -447,6 +480,7 @@ class DaemonRunner:
                                     try:
                                         ob = self.ob_fetcher.fetch_order_book(token_id)
                                         used_rest = True
+                                        tick_stats.rest_very_old += 1  # Phase 5.5
                                     except Exception as e:
                                         logger.debug(f"REST fetch for very old cache failed: {e}")
                                         tick_stats.missing_count += 1
@@ -491,7 +525,7 @@ class DaemonRunner:
             self.dao.set_runtime_state("daemon_last_tick", snapshot_time)
             self.dao.set_runtime_state("daemon_total_ticks", str(self._total_ticks))
 
-            # Phase 5.4: Enhanced logging
+            # Phase 5.5: Enhanced logging with healing info
             if self.config.orderbook_source == "wss":
                 wss_pct = (
                     (tick_stats.wss_hits / (tick_stats.wss_hits + tick_stats.rest_fallbacks) * 100)
@@ -499,13 +533,20 @@ class DaemonRunner:
                     else 0.0
                 )
                 health_str = "healthy" if tick_stats.wss_healthy else "UNHEALTHY"
+                # Phase 5.5: Show reconcile stats including heals
+                reconcile_str = (
+                    f"reconciled:{tick_stats.reconciled_count} "
+                    f"ok:{tick_stats.reconcile_ok_count} "
+                    f"drift:{tick_stats.drift_count} "
+                    f"healed:{tick_stats.reconcile_healed_count}"
+                )
                 logger.info(
                     f"Tick {self._total_ticks}: {tick_stats.snapshots_saved} snapshots, "
                     f"{tick_stats.orderbooks_success} orderbooks | "
                     f"WSS[{health_str}]:{tick_stats.wss_hits} ({wss_pct:.0f}%) "
                     f"REST:{tick_stats.rest_fallbacks} | "
                     f"cache: {tick_stats.cache_age_median:.1f}s med, {tick_stats.cache_age_max:.1f}s max | "
-                    f"reconciled:{tick_stats.reconciled_count} drift:{tick_stats.drift_count}"
+                    f"{reconcile_str}"
                 )
             else:
                 logger.info(
@@ -521,13 +562,24 @@ class DaemonRunner:
         return tick_stats
 
     async def _run_reconciliation(self, token_ids: list[str], tick_stats: TickStats) -> None:
-        """Run REST reconciliation sampler to detect drift.
+        """Run REST reconciliation sampler to detect and heal drift.
 
-        Phase 5.4: Selects quiet caches (age >= reconcile_min_age) and
-        compares WSS cache vs REST to detect drift.
+        Phase 5.5: Robust drift detection using configurable thresholds for
+        mid price, spread, and depth differences. Optionally heals cache
+        by replacing WSS data with REST data when drift is detected.
         """
+        from pmq.ops.drift import DriftThresholds, compute_drift_metrics
+
         if not self.wss_client or not self.ob_fetcher:
             return
+
+        # Build drift thresholds from config
+        thresholds = DriftThresholds(
+            mid_diff_bps=self.config.reconcile_mid_bps,
+            spread_diff_bps=self.config.reconcile_spread_bps,
+            depth_diff_pct=self.config.reconcile_depth_pct,
+            depth_levels=self.config.reconcile_depth_levels,
+        )
 
         # Select tokens with old enough cache
         candidates: list[tuple[str, float]] = []  # (token_id, age)
@@ -544,9 +596,9 @@ class DaemonRunner:
         candidates.sort(key=lambda x: x[1], reverse=True)
         to_reconcile = candidates[: self.config.reconcile_sample]
 
-        # Fetch REST with timeout
-        drift_count = 0
-        max_spread_diff = 0.0
+        # Track healing stats
+        heals_this_tick = 0
+        max_mid_diff_bps = 0.0
 
         try:
             async with asyncio.timeout(self.config.reconcile_timeout):
@@ -559,44 +611,50 @@ class DaemonRunner:
 
                         # Fetch REST
                         rest_ob = self.ob_fetcher.fetch_order_book(token_id)
+                        tick_stats.rest_reconcile += 1
+
                         if not rest_ob or not rest_ob.has_valid_book:
                             continue
 
                         tick_stats.reconciled_count += 1
 
-                        # Compute drift
-                        drift_detected = False
-                        spread_diff = 0.0
+                        # Phase 5.5: Use robust drift detection
+                        metrics = compute_drift_metrics(wss_ob, rest_ob, thresholds)
 
-                        if wss_ob.best_bid and rest_ob.best_bid:
-                            bid_diff = abs(wss_ob.best_bid - rest_ob.best_bid)
-                            if bid_diff > 0.001:  # > 0.1% difference
-                                drift_detected = True
-                                spread_diff = max(spread_diff, bid_diff * 10000)  # bps
+                        # Track max mid diff observed
+                        if metrics.mid_diff_bps is not None:
+                            max_mid_diff_bps = max(max_mid_diff_bps, metrics.mid_diff_bps)
 
-                        if wss_ob.best_ask and rest_ob.best_ask:
-                            ask_diff = abs(wss_ob.best_ask - rest_ob.best_ask)
-                            if ask_diff > 0.001:
-                                drift_detected = True
-                                spread_diff = max(spread_diff, ask_diff * 10000)
+                        if metrics.has_drift:
+                            tick_stats.drift_count += 1
 
-                        if drift_detected:
-                            drift_count += 1
-                            max_spread_diff = max(max_spread_diff, spread_diff)
-                            logger.debug(
-                                f"Reconciliation drift for {token_id}: "
-                                f"WSS bid={wss_ob.best_bid} ask={wss_ob.best_ask}, "
-                                f"REST bid={rest_ob.best_bid} ask={rest_ob.best_ask}"
-                            )
+                            # Phase 5.5: Cache healing
+                            if (
+                                self.config.reconcile_heal
+                                and heals_this_tick < self.config.reconcile_max_heals
+                            ):
+                                self.wss_client.update_cache(token_id, rest_ob)
+                                tick_stats.reconcile_healed_count += 1
+                                heals_this_tick += 1
+                                logger.debug(
+                                    f"Healed cache for {token_id[:16]}...: {metrics.drift_reason}"
+                                )
+                            else:
+                                logger.debug(
+                                    f"Drift detected (not healed) for {token_id[:16]}...: {metrics.drift_reason}"
+                                )
+                        else:
+                            tick_stats.reconcile_ok_count += 1
 
                     except Exception as e:
-                        logger.debug(f"Reconciliation failed for {token_id}: {e}")
+                        logger.debug(f"Reconciliation failed for {token_id[:16]}...: {e}")
 
         except TimeoutError:
             logger.debug(f"Reconciliation timed out after {self.config.reconcile_timeout}s")
 
-        tick_stats.drift_count = drift_count
-        tick_stats.drift_max_spread = max_spread_diff
+        tick_stats.drift_max_mid_bps = max_mid_diff_bps
+        # Deprecated field for compat
+        tick_stats.drift_max_spread = max_mid_diff_bps
 
     def _update_daily_stats(self, tick_stats: TickStats) -> None:
         """Update daily statistics with tick data."""
@@ -618,8 +676,18 @@ class DaemonRunner:
             self._daily_stats.total_rest_fallbacks += tick_stats.rest_fallbacks
             self._daily_stats.total_stale += tick_stats.stale_count
             self._daily_stats.total_missing += tick_stats.missing_count
-            # Phase 5.4: Reconciliation aggregates
+            # Phase 5.5: Explicit REST fallback buckets
+            self._daily_stats.total_rest_missing += tick_stats.rest_missing
+            self._daily_stats.total_rest_unhealthy += tick_stats.rest_unhealthy
+            self._daily_stats.total_rest_very_old += tick_stats.rest_very_old
+            self._daily_stats.total_rest_reconcile += tick_stats.rest_reconcile
+            # Phase 5.5: WSS cache buckets
+            self._daily_stats.total_wss_cache_fresh += tick_stats.wss_fresh
+            self._daily_stats.total_wss_cache_quiet += tick_stats.wss_cache_quiet
+            # Phase 5.5: Reconciliation aggregates (expanded from 5.4)
             self._daily_stats.total_reconciled += tick_stats.reconciled_count
+            self._daily_stats.total_reconcile_ok += tick_stats.reconcile_ok_count
+            self._daily_stats.total_reconcile_healed += tick_stats.reconcile_healed_count
             self._daily_stats.total_drift += tick_stats.drift_count
             if tick_stats.error:
                 self._daily_stats.total_errors += 1
@@ -780,45 +848,80 @@ class DaemonRunner:
         return deleted
 
     async def _export_daily_artifacts(self, stats: DailyStats) -> None:
-        """Export daily artifacts: CSV, JSON, markdown."""
+        """Export daily artifacts: CSV, JSON, markdown (Phase 5.5)."""
         date_str = stats.date
         export_dir = self.config.export_dir
 
-        # Export coverage JSON
-        coverage_path = export_dir / f"coverage_{date_str}.json"
+        # Phase 5.5: Compute two coverage metrics
+        # coverage_effective: excludes reconcile REST calls from denominator
+        wss_cache_total = stats.total_wss_cache_fresh + stats.total_wss_cache_quiet
+        rest_fallback_total = (
+            stats.total_rest_missing + stats.total_rest_unhealthy + stats.total_rest_very_old
+        )
+        effective_denom = wss_cache_total + rest_fallback_total
+        coverage_effective_pct = (
+            (wss_cache_total / effective_denom * 100) if effective_denom > 0 else 0.0
+        )
+
+        # coverage_raw: simple ratio of wss hits to total orderbooks
         wss_coverage_pct = (
             (stats.total_wss_hits / (stats.total_wss_hits + stats.total_rest_fallbacks) * 100)
             if (stats.total_wss_hits + stats.total_rest_fallbacks) > 0
             else 0.0
         )
+
+        # Drift percentage
         drift_pct = (
             (stats.total_drift / stats.total_reconciled * 100)
             if stats.total_reconciled > 0
             else 0.0
         )
+        heal_pct = (
+            (stats.total_reconcile_healed / stats.total_reconciled * 100)
+            if stats.total_reconciled > 0
+            else 0.0
+        )
+
+        # Export coverage JSON (Phase 5.5 schema)
+        coverage_path = export_dir / f"coverage_{date_str}.json"
         coverage_data = {
             "date": stats.date,
             "total_ticks": stats.total_ticks,
             "total_snapshots": stats.total_snapshots,
             "total_orderbooks": stats.total_orderbooks,
+            # Legacy fields (kept for compat)
             "wss_hits": stats.total_wss_hits,
             "rest_fallbacks": stats.total_rest_fallbacks,
             "stale_count": stats.total_stale,
             "missing_count": stats.total_missing,
+            "wss_coverage_pct": wss_coverage_pct,
+            # Phase 5.5: Explicit buckets
+            "wss_cache_fresh": stats.total_wss_cache_fresh,
+            "wss_cache_quiet": stats.total_wss_cache_quiet,
+            "rest_missing": stats.total_rest_missing,
+            "rest_unhealthy": stats.total_rest_unhealthy,
+            "rest_very_old": stats.total_rest_very_old,
+            "rest_reconcile": stats.total_rest_reconcile,
+            # Phase 5.5: Two coverage metrics
+            "coverage_effective_pct": coverage_effective_pct,
+            "coverage_raw_pct": wss_coverage_pct,
+            # Phase 5.5: Reconciliation stats
+            "reconciled_count": stats.total_reconciled,
+            "reconcile_ok": stats.total_reconcile_ok,
+            "reconcile_healed": stats.total_reconcile_healed,
+            "drift_count": stats.total_drift,
+            "drift_pct": drift_pct,
+            "heal_pct": heal_pct,
+            # Metadata
             "errors": stats.total_errors,
             "start_time": stats.start_time,
             "end_time": stats.end_time,
-            "wss_coverage_pct": wss_coverage_pct,
-            # Phase 5.4: Reconciliation stats
-            "reconciled_count": stats.total_reconciled,
-            "drift_count": stats.total_drift,
-            "drift_pct": drift_pct,
         }
         with open(coverage_path, "w", encoding="utf-8") as f:
             json.dump(coverage_data, f, indent=2)
         logger.info(f"Exported coverage to {coverage_path}")
 
-        # Export tick history CSV
+        # Export tick history CSV (Phase 5.5 schema)
         csv_path = export_dir / f"ticks_{date_str}.csv"
         if stats.tick_history:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -831,14 +934,22 @@ class DaemonRunner:
                         "orderbooks_success",
                         "wss_hits",
                         "rest_fallbacks",
-                        "stale_count",
-                        "missing_count",
-                        # Phase 5.4 fields
+                        # Phase 5.5: Explicit REST buckets
+                        "rest_missing",
+                        "rest_unhealthy",
+                        "rest_very_old",
+                        "rest_reconcile",
+                        # WSS stats
                         "wss_healthy",
                         "wss_cache_used",
                         "wss_cache_quiet",
+                        "wss_fresh",
+                        # Phase 5.5: Reconciliation
                         "reconciled_count",
+                        "reconcile_ok",
+                        "reconcile_healed",
                         "drift_count",
+                        "drift_max_mid_bps",
                         "error",
                     ],
                 )
@@ -852,19 +963,25 @@ class DaemonRunner:
                             "orderbooks_success": tick.orderbooks_success,
                             "wss_hits": tick.wss_hits,
                             "rest_fallbacks": tick.rest_fallbacks,
-                            "stale_count": tick.stale_count,
-                            "missing_count": tick.missing_count,
+                            "rest_missing": tick.rest_missing,
+                            "rest_unhealthy": tick.rest_unhealthy,
+                            "rest_very_old": tick.rest_very_old,
+                            "rest_reconcile": tick.rest_reconcile,
                             "wss_healthy": tick.wss_healthy,
                             "wss_cache_used": tick.wss_cache_used,
                             "wss_cache_quiet": tick.wss_cache_quiet,
+                            "wss_fresh": tick.wss_fresh,
                             "reconciled_count": tick.reconciled_count,
+                            "reconcile_ok": tick.reconcile_ok_count,
+                            "reconcile_healed": tick.reconcile_healed_count,
                             "drift_count": tick.drift_count,
+                            "drift_max_mid_bps": tick.drift_max_mid_bps,
                             "error": tick.error or "",
                         }
                     )
             logger.info(f"Exported ticks to {csv_path}")
 
-        # Export markdown summary
+        # Export markdown summary (Phase 5.5)
         md_path = export_dir / f"daemon_summary_{date_str}.md"
         md_content = f"""# Daemon Summary - {date_str}
 
@@ -878,23 +995,35 @@ class DaemonRunner:
 - **Total Snapshots:** {stats.total_snapshots:,}
 - **Total Orderbooks:** {stats.total_orderbooks:,}
 
-## Order Book Source Statistics
-- **WSS Hits:** {stats.total_wss_hits:,}
-- **REST Fallbacks:** {stats.total_rest_fallbacks:,}
-- **WSS Coverage:** {wss_coverage_pct:.1f}%
-- **Stale Count:** {stats.total_stale:,}
-- **Missing Count:** {stats.total_missing:,}
+## WSS Cache Statistics (Phase 5.5)
+- **WSS Cache Fresh:** {stats.total_wss_cache_fresh:,}
+- **WSS Cache Quiet:** {stats.total_wss_cache_quiet:,}
+- **WSS Total Hits:** {stats.total_wss_hits:,}
 
-## Reconciliation (Phase 5.4)
-- **Reconciled Count:** {stats.total_reconciled:,}
+## REST Fallback Breakdown (Phase 5.5)
+- **REST Missing:** {stats.total_rest_missing:,} (no cached book)
+- **REST Unhealthy:** {stats.total_rest_unhealthy:,} (WSS connection unhealthy)
+- **REST Very Old:** {stats.total_rest_very_old:,} (cache > max_book_age)
+- **REST Reconcile:** {stats.total_rest_reconcile:,} (reconciliation sampling)
+- **Total REST Fallbacks:** {stats.total_rest_fallbacks:,}
+
+## Coverage Metrics (Phase 5.5)
+- **Coverage (Effective):** {coverage_effective_pct:.1f}% (excludes reconcile REST calls)
+- **Coverage (Raw):** {wss_coverage_pct:.1f}% (WSS hits / total)
+
+## Reconciliation & Healing (Phase 5.5)
+- **Tokens Reconciled:** {stats.total_reconciled:,}
+- **OK (No Drift):** {stats.total_reconcile_ok:,}
 - **Drift Detected:** {stats.total_drift:,}
-- **Drift Percentage:** {drift_pct:.1f}%
+- **Cache Healed:** {stats.total_reconcile_healed:,}
+- **Drift Rate:** {drift_pct:.1f}%
+- **Heal Rate:** {heal_pct:.1f}%
 
 ## Errors
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon (Phase 5.4)*
+*Generated by pmq ops daemon (Phase 5.5)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)

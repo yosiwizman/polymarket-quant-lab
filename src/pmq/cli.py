@@ -3917,6 +3917,49 @@ def ops_daemon(
             help="Timeout for reconciliation REST batch (default: 5s)",
         ),
     ] = 5.0,
+    # Phase 5.5: Drift thresholds and healing
+    reconcile_mid_bps: Annotated[
+        float,
+        typer.Option(
+            "--reconcile-mid-bps",
+            help="Drift threshold: mid price difference (bps, default: 25)",
+        ),
+    ] = 25.0,
+    reconcile_spread_bps: Annotated[
+        float,
+        typer.Option(
+            "--reconcile-spread-bps",
+            help="Drift threshold: spread difference (bps, default: 25)",
+        ),
+    ] = 25.0,
+    reconcile_depth_pct: Annotated[
+        float,
+        typer.Option(
+            "--reconcile-depth-pct",
+            help="Drift threshold: depth difference (percent, default: 50)",
+        ),
+    ] = 50.0,
+    reconcile_depth_levels: Annotated[
+        int,
+        typer.Option(
+            "--reconcile-depth-levels",
+            help="Number of levels for depth comparison (default: 3)",
+        ),
+    ] = 3,
+    reconcile_heal: Annotated[
+        bool,
+        typer.Option(
+            "--reconcile-heal/--no-reconcile-heal",
+            help="Heal cache with REST data on drift (default: on)",
+        ),
+    ] = True,
+    reconcile_max_heals: Annotated[
+        int,
+        typer.Option(
+            "--reconcile-max-heals",
+            help="Max heals per tick to prevent storms (default: 25)",
+        ),
+    ] = 25,
     max_hours: Annotated[
         float | None,
         typer.Option(
@@ -3968,8 +4011,8 @@ def ops_daemon(
     - Application-level keepalive ("PING") for stable long-lived WSS (Phase 5.3)
     - Health-gated fallback: REST only when WSS unhealthy OR cache missing (Phase 5.4)
     - Quiet markets use cached data without REST fallback (event-driven WSS model)
-    - REST reconciliation sampler for drift detection (Phase 5.4)
-    - Coverage tracking per tick (wss_hits, rest_fallbacks, stale, missing)
+    - REST reconciliation with drift detection and cache healing (Phase 5.5)
+    - Two coverage metrics: effective (excludes reconcile) and raw (Phase 5.5)
     - Daily export artifacts (CSV, JSON, markdown)
     - Daily snapshot exports to gzip CSV (Phase 5.2)
     - Optional retention cleanup for old snapshots (Phase 5.2)
@@ -3988,6 +4031,7 @@ def ops_daemon(
         pmq ops daemon --retention-days 30  # Keep 30 days of snapshots
         pmq ops daemon --wss-health-timeout 60 --max-book-age 1800
         pmq ops daemon --reconcile-sample 10 --reconcile-min-age 300
+        pmq ops daemon --reconcile-mid-bps 25 --reconcile-heal  # Phase 5.5
     """
     import asyncio
 
@@ -4025,6 +4069,13 @@ def ops_daemon(
         reconcile_sample=reconcile_sample,
         reconcile_min_age=reconcile_min_age,
         reconcile_timeout=reconcile_timeout,
+        # Phase 5.5: Drift thresholds and healing
+        reconcile_mid_bps=reconcile_mid_bps,
+        reconcile_spread_bps=reconcile_spread_bps,
+        reconcile_depth_pct=reconcile_depth_pct,
+        reconcile_depth_levels=reconcile_depth_levels,
+        reconcile_heal=reconcile_heal,
+        reconcile_max_heals=reconcile_max_heals,
     )
 
     # Initialize dependencies
@@ -4062,14 +4113,17 @@ def ops_daemon(
 
     # Print startup info
     retention_str = f"{retention_days} days" if retention_days else "disabled"
+    heal_str = "on" if reconcile_heal else "off"
     console.print(
-        f"[bold green]Starting ops daemon (Phase 5.4)[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 5.5)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
         f"WSS Health Timeout: {wss_health_timeout:.0f}s\n"
         f"Max Book Age: {max_book_age:.0f}s\n"
         f"Reconcile: {reconcile_sample} samples, min age {reconcile_min_age:.0f}s\n"
+        f"Drift Thresholds: mid={reconcile_mid_bps}bps, spread={reconcile_spread_bps}bps, depth={reconcile_depth_pct}%\n"
+        f"Cache Healing: {heal_str} (max {reconcile_max_heals}/tick)\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"

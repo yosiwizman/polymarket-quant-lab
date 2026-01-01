@@ -181,6 +181,20 @@ class FakeOrderBook:
         self.has_valid_book = valid
         self.best_bid = 0.45 if valid else None
         self.best_ask = 0.55 if valid else None
+        # Phase 5.5: Add attributes needed for drift detection
+        if valid and self.best_bid is not None and self.best_ask is not None:
+            self.mid_price: float | None = (self.best_bid + self.best_ask) / 2.0
+            self.spread_bps: float | None = (
+                (self.best_ask - self.best_bid) / self.mid_price * 10000
+                if self.mid_price > 0
+                else None
+            )
+        else:
+            self.mid_price = None
+            self.spread_bps = None
+        # Empty depth levels (no drift on depth by default)
+        self.bids: list[Any] = []
+        self.asks: list[Any] = []
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict."""
@@ -188,6 +202,8 @@ class FakeOrderBook:
             "token_id": self.token_id,
             "best_bid": self.best_bid,
             "best_ask": self.best_ask,
+            "mid_price": self.mid_price,
+            "spread_bps": self.spread_bps,
         }
 
 
@@ -319,6 +335,12 @@ class FakeWssClient:
         """Close connection."""
         self._connected = False
         self.closed = True
+
+    # Phase 5.5: Cache update for healing
+    def update_cache(self, token_id: str, orderbook: FakeOrderBook) -> None:
+        """Update cache with new orderbook (for healing)."""
+        self._orderbooks[token_id] = orderbook
+        self._cache_ages[token_id] = 0.0  # Reset age after heal
 
 
 class FakeOrderBookFetcher:
@@ -1717,3 +1739,293 @@ class TestHealthGatedFallback:
         # token2 is fresh -> should use cache
         assert tick_stats.wss_cache_very_old >= 1
         assert ob_fetcher.fetch_count >= 1  # At least one REST call
+
+
+# =============================================================================
+# Phase 5.5: Drift Calibration and Cache Healing Tests
+# =============================================================================
+
+
+class TestPhase55Config:
+    """Tests for Phase 5.5 DaemonConfig fields."""
+
+    def test_default_drift_thresholds(self) -> None:
+        """Default drift thresholds should be set."""
+        config = DaemonConfig()
+        assert config.reconcile_mid_bps == 25.0
+        assert config.reconcile_spread_bps == 25.0
+        assert config.reconcile_depth_pct == 50.0
+        assert config.reconcile_depth_levels == 3
+
+    def test_default_heal_settings(self) -> None:
+        """Default healing should be enabled with cap."""
+        config = DaemonConfig()
+        assert config.reconcile_heal is True
+        assert config.reconcile_max_heals == 25
+
+    def test_custom_phase55_settings(self) -> None:
+        """Custom Phase 5.5 settings should be accepted."""
+        config = DaemonConfig(
+            reconcile_mid_bps=50.0,
+            reconcile_spread_bps=30.0,
+            reconcile_depth_pct=75.0,
+            reconcile_depth_levels=5,
+            reconcile_heal=False,
+            reconcile_max_heals=10,
+        )
+        assert config.reconcile_mid_bps == 50.0
+        assert config.reconcile_spread_bps == 30.0
+        assert config.reconcile_depth_pct == 75.0
+        assert config.reconcile_depth_levels == 5
+        assert config.reconcile_heal is False
+        assert config.reconcile_max_heals == 10
+
+
+class TestTickStatsPhase55:
+    """Tests for Phase 5.5 TickStats fields."""
+
+    def test_tick_stats_has_phase55_rest_buckets(self) -> None:
+        """TickStats should have explicit REST fallback buckets."""
+        stats = TickStats(timestamp="2024-01-01T00:00:00Z")
+        assert stats.rest_missing == 0
+        assert stats.rest_unhealthy == 0
+        assert stats.rest_very_old == 0
+        assert stats.rest_reconcile == 0
+
+    def test_tick_stats_has_reconcile_fields(self) -> None:
+        """TickStats should have reconciliation fields."""
+        stats = TickStats(timestamp="2024-01-01T00:00:00Z")
+        assert stats.reconcile_ok_count == 0
+        assert stats.reconcile_healed_count == 0
+        assert stats.drift_max_mid_bps == 0.0
+
+    def test_tick_stats_phase55_values(self) -> None:
+        """TickStats should accept Phase 5.5 values."""
+        stats = TickStats(
+            timestamp="2024-01-01T00:00:00Z",
+            rest_missing=5,
+            rest_unhealthy=0,
+            rest_very_old=2,
+            rest_reconcile=10,
+            reconcile_ok_count=7,
+            reconcile_healed_count=3,
+            drift_max_mid_bps=45.5,
+        )
+        assert stats.rest_missing == 5
+        assert stats.rest_very_old == 2
+        assert stats.rest_reconcile == 10
+        assert stats.reconcile_ok_count == 7
+        assert stats.reconcile_healed_count == 3
+        assert stats.drift_max_mid_bps == 45.5
+
+
+class TestDailyStatsPhase55:
+    """Tests for Phase 5.5 DailyStats fields."""
+
+    def test_daily_stats_has_phase55_fields(self) -> None:
+        """DailyStats should have Phase 5.5 REST/reconcile fields."""
+        stats = DailyStats(date="2024-01-01")
+        assert stats.total_rest_missing == 0
+        assert stats.total_rest_unhealthy == 0
+        assert stats.total_rest_very_old == 0
+        assert stats.total_rest_reconcile == 0
+        assert stats.total_wss_cache_fresh == 0
+        assert stats.total_wss_cache_quiet == 0
+        assert stats.total_reconcile_ok == 0
+        assert stats.total_reconcile_healed == 0
+
+
+class TestReconciliationHealing:
+    """Tests for Phase 5.5 drift detection and cache healing."""
+
+    @pytest.fixture
+    def dao(self) -> FakeDAO:
+        """Create fake DAO."""
+        return FakeDAO()
+
+    @pytest.fixture
+    def gamma_client(self) -> FakeGammaClient:
+        """Create fake Gamma client with markets."""
+        return FakeGammaClient(
+            markets=[
+                FakeMarket("market1", "0xtoken1"),
+                FakeMarket("market2", "0xtoken2"),
+            ]
+        )
+
+    @pytest.fixture
+    def wss_client(self) -> FakeWssClient:
+        """Create fake WSS client."""
+        return FakeWssClient()
+
+    @pytest.fixture
+    def ob_fetcher(self) -> FakeOrderBookFetcher:
+        """Create fake orderbook fetcher."""
+        return FakeOrderBookFetcher()
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_counts_rest_reconcile(
+        self,
+        dao: FakeDAO,
+        gamma_client: FakeGammaClient,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """Reconciliation should increment rest_reconcile counter."""
+        # Setup: old cache entries that qualify for reconciliation
+        wss_client.add_orderbook("0xtoken1", valid=True)
+        wss_client.add_orderbook("0xtoken2", valid=True)
+        wss_client.set_cache_age("0xtoken1", 600.0)  # 10 min (> 5 min min_age)
+        wss_client.set_cache_age("0xtoken2", 400.0)  # 6.7 min (> 5 min)
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            reconcile_sample=2,
+            reconcile_min_age=300.0,  # 5 min
+            reconcile_heal=False,  # Don't heal for this test
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # Should have REST reconcile calls
+        assert tick_stats.rest_reconcile >= 1
+        assert tick_stats.reconciled_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_no_drift_increments_ok(
+        self,
+        dao: FakeDAO,
+        gamma_client: FakeGammaClient,  # noqa: ARG002
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """No drift should increment reconcile_ok_count."""
+        # Setup: cache matches REST exactly
+        wss_client.add_orderbook("0xtoken1", valid=True)
+        wss_client.set_cache_age("0xtoken1", 600.0)  # Old enough to reconcile
+        wss_client.set_healthy(True)
+
+        # ob_fetcher returns similar orderbook (no drift)
+        ob_fetcher.add_orderbook("0xtoken1", valid=True)
+
+        # Single market for simplicity
+        gamma_single = FakeGammaClient(markets=[FakeMarket("market1", "0xtoken1")])
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            reconcile_sample=1,
+            reconcile_min_age=300.0,
+            reconcile_mid_bps=25.0,  # Tight threshold but same data = no drift
+            reconcile_heal=True,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_single,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # Should reconcile with no drift
+        assert tick_stats.reconciled_count >= 1
+        assert tick_stats.drift_count == 0
+        assert tick_stats.reconcile_ok_count >= 1
+        assert tick_stats.reconcile_healed_count == 0
+
+    @pytest.mark.asyncio
+    async def test_max_heals_cap_respected(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """reconcile_max_heals should cap healing per tick."""
+        # Setup: many old cache entries
+        markets = [FakeMarket(f"m{i}", f"0xtoken{i}") for i in range(10)]
+        gamma_many = FakeGammaClient(markets=markets)
+
+        for i in range(10):
+            token_id = f"0xtoken{i}"
+            wss_client.add_orderbook(token_id, valid=True)
+            wss_client.set_cache_age(token_id, 1000.0)  # Very old
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            reconcile_sample=10,  # Try to reconcile all
+            reconcile_min_age=300.0,
+            reconcile_heal=True,
+            reconcile_max_heals=3,  # Cap at 3 heals per tick
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_many,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # Max heals should be capped
+        # Note: actual heals depend on drift detection, but cap should be respected
+        assert tick_stats.reconcile_healed_count <= 3
+
+    @pytest.mark.asyncio
+    async def test_heal_disabled_no_healing(
+        self,
+        dao: FakeDAO,
+        gamma_client: FakeGammaClient,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+    ) -> None:
+        """reconcile_heal=False should disable healing."""
+        # Setup: old cache
+        wss_client.add_orderbook("0xtoken1", valid=True)
+        wss_client.set_cache_age("0xtoken1", 600.0)
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            orderbook_source="wss",
+            reconcile_sample=1,
+            reconcile_min_age=300.0,
+            reconcile_heal=False,  # Disabled
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        tick_stats = await runner._execute_tick()
+
+        # No healing should occur
+        assert tick_stats.reconcile_healed_count == 0

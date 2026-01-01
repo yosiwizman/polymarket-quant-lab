@@ -742,3 +742,15 @@ class MarketWssClient:
                 data=data,
                 updated_at=time.monotonic(),
             )
+
+    def update_cache(self, token_id: str, data: OrderBookData) -> None:
+        """Public method to update cache entry (for healing).
+
+        Phase 5.5: Used by reconciliation to heal cache when drift is detected.
+        Replaces the cached orderbook with REST-fetched data.
+
+        Args:
+            token_id: Token ID to update
+            data: OrderBookData from REST (source of truth)
+        """
+        self._update_cache(token_id, data)

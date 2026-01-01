@@ -4032,6 +4032,14 @@ def ops_daemon(
             help="Timeout for cache seeding phase in seconds (default: 30)",
         ),
     ] = 30.0,
+    # Phase 5.7: WSS health grace period
+    wss_health_grace: Annotated[
+        float,
+        typer.Option(
+            "--wss-health-grace",
+            help="WSS health grace period in seconds (default: 60) - assume healthy until grace expires",
+        ),
+    ] = 60.0,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -4043,6 +4051,8 @@ def ops_daemon(
     - REST reconciliation with drift detection and cache healing (Phase 5.5)
     - Cache seeding at startup to reduce cold-start REST calls (Phase 5.6)
     - Two coverage metrics: effective (excludes reconcile/seed) and raw (Phase 5.6)
+    - WSS health grace period to reduce rest_unhealthy at startup (Phase 5.7)
+    - rest_seed correctly counted in exports when seeding runs (Phase 5.7)
     - Daily export artifacts (CSV, JSON, markdown)
     - Daily snapshot exports to gzip CSV (Phase 5.2)
     - Optional retention cleanup for old snapshots (Phase 5.2)
@@ -4063,6 +4073,7 @@ def ops_daemon(
         pmq ops daemon --reconcile-sample 10 --reconcile-min-age 300
         pmq ops daemon --reconcile-mid-bps 25 --reconcile-heal  # Phase 5.5
         pmq ops daemon --seed-cache --seed-max 100 --seed-concurrency 20  # Phase 5.6
+        pmq ops daemon --wss-health-grace 90  # Phase 5.7: longer grace period
     """
     import asyncio
 
@@ -4112,6 +4123,8 @@ def ops_daemon(
         seed_max=seed_max,
         seed_concurrency=seed_concurrency,
         seed_timeout=seed_timeout,
+        # Phase 5.7: WSS health grace
+        wss_health_grace_seconds=wss_health_grace,
     )
 
     # Initialize dependencies
@@ -4130,9 +4143,10 @@ def ops_daemon(
     if with_orderbook and orderbook_source == "wss":
         from pmq.markets.wss_market import MarketWssClient
 
-        # Phase 5.4: Configure health timeout
+        # Phase 5.4/5.7: Configure health timeout and grace period
         wss_client = MarketWssClient(
             health_timeout_seconds=wss_health_timeout,
+            health_grace_seconds=wss_health_grace,
         )
 
     # Create runner
@@ -4153,11 +4167,12 @@ def ops_daemon(
     seed_str = "on" if seed_cache else "off"
     seed_max_str = str(seed_max) if seed_max else str(limit)
     console.print(
-        f"[bold green]Starting ops daemon (Phase 5.6)[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 5.7)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
         f"WSS Health Timeout: {wss_health_timeout:.0f}s\n"
+        f"WSS Health Grace: {wss_health_grace:.0f}s\n"
         f"Max Book Age: {max_book_age:.0f}s\n"
         f"Reconcile: {reconcile_sample} samples, min age {reconcile_min_age:.0f}s\n"
         f"Drift Thresholds: mid={reconcile_mid_bps}bps, spread={reconcile_spread_bps}bps, depth={reconcile_depth_pct}%\n"

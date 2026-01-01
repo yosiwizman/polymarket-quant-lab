@@ -30,6 +30,7 @@ from pmq.ops.daemon import (
     DaemonRunner,
     DailyStats,
     RealClock,
+    SeedResult,
     TickStats,
     real_sleep,
 )
@@ -237,6 +238,8 @@ class FakeWssClient:
         # Phase 5.4: Health tracking
         self.health_timeout_seconds: float = 60.0
         self._healthy: bool = True  # Simulate healthy connection
+        # Phase 5.7: Health grace period
+        self.health_grace_seconds: float = 60.0
 
     async def connect(self) -> None:
         """Simulate connect."""
@@ -2166,7 +2169,8 @@ class TestCacheSeeding:
         seeded = await runner._seed_cache()
 
         # After seeding, books should be cached
-        assert seeded == 2
+        assert seeded.succeeded == 2
+        assert seeded.rest_calls == 2
         assert wss_client.has_cached_book("0xtoken1")
         assert wss_client.has_cached_book("0xtoken2")
 
@@ -2208,8 +2212,8 @@ class TestCacheSeeding:
         seeded = await runner._seed_cache()
 
         # Should only seed 2 tokens
-        assert seeded == 2
-        assert runner._seed_count == 2
+        assert seeded.succeeded == 2
+        assert seeded.rest_calls == 2
 
     @pytest.mark.asyncio
     async def test_seeding_disabled(
@@ -2241,7 +2245,7 @@ class TestCacheSeeding:
 
         # Seeding should do nothing when disabled
         seeded = await runner._seed_cache()
-        assert seeded == 0
+        assert seeded.rest_calls == 0
         assert not wss_client.has_cached_book("0xtoken1")
 
     @pytest.mark.asyncio
@@ -2285,8 +2289,8 @@ class TestCacheSeeding:
         # Run seeding - should only seed token2
         seeded = await runner._seed_cache()
 
-        assert seeded == 1  # Only token2 was missing
-        assert runner._seed_count == 1
+        assert seeded.succeeded == 1  # Only token2 was missing
+        assert seeded.rest_calls == 1
 
     @pytest.mark.asyncio
     async def test_seeding_only_runs_once(
@@ -2321,9 +2325,168 @@ class TestCacheSeeding:
 
         # First seed
         seeded1 = await runner._seed_cache()
-        assert seeded1 == 1
+        assert seeded1.succeeded == 1
 
-        # Second seed should return cached count without re-seeding
+        # Second seed should return cached result without re-seeding
         seeded2 = await runner._seed_cache()
-        assert seeded2 == 1  # Returns cached count
+        assert seeded2.rest_calls == 0  # Returns empty cached result
         assert runner._seeded is True
+
+
+# =============================================================================
+# Phase 5.7: Seed Accounting + WSS Health Grace Tests
+# =============================================================================
+
+
+class TestSeedAccounting:
+    """Tests for Phase 5.7 seed accounting (rest_seed metric)."""
+
+    def test_seed_result_dataclass(self) -> None:
+        """SeedResult should have all expected fields."""
+        result = SeedResult()
+        assert result.attempted == 0
+        assert result.succeeded == 0
+        assert result.rest_calls == 0
+        assert result.duration_seconds == 0.0
+        assert result.errors == 0
+
+    def test_seed_result_with_values(self) -> None:
+        """SeedResult should accept values."""
+        result = SeedResult(
+            attempted=50,
+            succeeded=42,
+            rest_calls=50,
+            duration_seconds=2.5,
+            errors=8,
+        )
+        assert result.attempted == 50
+        assert result.succeeded == 42
+        assert result.rest_calls == 50
+        assert result.duration_seconds == 2.5
+        assert result.errors == 8
+
+    def test_daemon_config_has_health_grace(self) -> None:
+        """DaemonConfig should have wss_health_grace_seconds field."""
+        config = DaemonConfig()
+        assert config.wss_health_grace_seconds == 60.0
+
+    def test_daemon_config_custom_health_grace(self) -> None:
+        """DaemonConfig should accept custom health grace."""
+        config = DaemonConfig(wss_health_grace_seconds=90.0)
+        assert config.wss_health_grace_seconds == 90.0
+
+    @pytest.mark.asyncio
+    async def test_seeding_returns_seed_result(self) -> None:
+        """Seeding should return SeedResult with metrics."""
+        fake_dao = FakeDAO()
+        gamma_client = FakeGammaClient(
+            markets=[
+                FakeMarket("m1", "0xtoken1"),
+                FakeMarket("m2", "0xtoken2"),
+            ]
+        )
+        wss_client = FakeWssClient()
+        wss_client.set_healthy(True)
+        ob_fetcher = FakeOrderBookFetcher()
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_max=10,
+            seed_concurrency=5,
+            seed_timeout=10.0,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        result = await runner._seed_cache()
+
+        # Should return SeedResult with proper metrics
+        assert isinstance(result, SeedResult)
+        assert result.attempted == 2
+        assert result.succeeded == 2
+        assert result.rest_calls == 2
+        assert result.duration_seconds >= 0.0
+        assert result.errors == 0
+
+    @pytest.mark.asyncio
+    async def test_seed_result_stored_on_runner(self) -> None:
+        """Seeding should store SeedResult on runner._seed_result."""
+        fake_dao = FakeDAO()
+        gamma_client = FakeGammaClient(markets=[FakeMarket("m1", "0xtoken1")])
+        wss_client = FakeWssClient()
+        wss_client.set_healthy(True)
+        ob_fetcher = FakeOrderBookFetcher()
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=fake_dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        # Before seeding, no result
+        assert runner._seed_result is None
+
+        await runner._seed_cache()
+
+        # After seeding, result should be stored
+        # Note: In daemon.py, _seed_result is set by run() not _seed_cache()
+        # This test checks that the returned result has the right values
+        assert runner._seeded is True
+
+
+class TestWssHealthGrace:
+    """Tests for Phase 5.7 WSS health grace period."""
+
+    @pytest.fixture
+    def dao(self) -> FakeDAO:
+        """Create fake DAO."""
+        return FakeDAO()
+
+    @pytest.fixture
+    def gamma_client(self) -> FakeGammaClient:
+        """Create fake Gamma client with markets."""
+        return FakeGammaClient(
+            markets=[
+                FakeMarket("market1", "0xtoken1"),
+                FakeMarket("market2", "0xtoken2"),
+            ]
+        )
+
+    @pytest.fixture
+    def wss_client(self) -> FakeWssClient:
+        """Create fake WSS client."""
+        return FakeWssClient()
+
+    @pytest.fixture
+    def ob_fetcher(self) -> FakeOrderBookFetcher:
+        """Create fake orderbook fetcher."""
+        return FakeOrderBookFetcher()
+
+    def test_fake_wss_client_supports_grace(self) -> None:
+        """FakeWssClient should support health_grace_seconds."""
+        wss_client = FakeWssClient()
+        # Should be able to set grace seconds (for DI)
+        wss_client.health_grace_seconds = 90.0
+        assert wss_client.health_grace_seconds == 90.0

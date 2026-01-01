@@ -1853,6 +1853,64 @@ daemon_summary markdown now shows:
 
 > 💡 **Why Seeding?** On startup, the WSS cache is empty. Without seeding, the first tick would trigger REST calls for every token, causing `rest_missing` to spike. Seeding pre-populates the cache so the first tick behaves like subsequent ticks.
 
+### Seed Accounting + WSS Health Grace (Phase 5.7)
+
+Phase 5.7 addresses two issues observed in Phase 5.6:
+1. **rest_seed not counted**: Seeding REST calls weren't being recorded in `rest_seed` metric
+2. **rest_unhealthy spikes at startup**: WSS health check fails during startup before first messages arrive
+
+#### Seed Accounting
+
+Seeding now properly tracks REST calls:
+- `rest_seed` increments for each REST fetch during seeding
+- `SeedResult` dataclass captures attempted/succeeded/duration/errors
+- Coverage JSON includes `seed_attempted`, `seed_succeeded`, `seed_duration_seconds`, `seed_errors`
+- Daemon summary includes "Cache Seeding" section when seeding ran
+
+#### WSS Health Grace Period
+
+During startup, WSS connections need time to receive first messages. The health grace period prevents false unhealthy classifications:
+
+```powershell
+# Default: 60s grace period after connect
+poetry run pmq ops daemon --wss-health-grace 60
+
+# Longer grace for slow networks
+poetry run pmq ops daemon --wss-health-grace 90
+```
+
+During the grace period:
+- `is_healthy()` returns True even without messages
+- No REST fallbacks due to "unhealthy" connection
+- After grace expires, normal health timeout applies
+
+#### Phase 5.7 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--wss-health-grace` | float | 60.0 | Grace period before enforcing health timeout (seconds) |
+
+#### Expected Results
+
+With Phase 5.7, a daemon run should show:
+- **rest_seed > 0** when seeding runs (was 0 in Phase 5.6)
+- **rest_unhealthy ≈ 0** on tick 1 (grace prevents early failures)
+- **rest_total = sum of REST buckets** (invariant still holds)
+- **Cache Seeding section** in daemon_summary.md with duration/errors
+
+#### Daily Export Schema (Phase 5.7)
+
+coverage JSON now includes:
+- `seed_attempted`: Number of tokens we tried to seed
+- `seed_succeeded`: Number successfully cached
+- `seed_duration_seconds`: Total seeding time
+- `seed_errors`: Number of failed fetches
+
+daemon_summary markdown now shows:
+- Cache Seeding section (when seeding ran) with attempted/succeeded/duration/errors
+
+> 💡 **Why Health Grace?** WSS connections take time to establish and receive first messages. Without grace, the first tick would see "unhealthy" connection and trigger REST fallbacks for all markets, defeating the purpose of WSS streaming.
+
 ## Project Structure
 
 ```
@@ -2100,6 +2158,18 @@ poetry run mypy src
 - [x] Explicit REST fallback buckets (missing/unhealthy/very_old/reconcile)
 - [x] Two coverage metrics: effective (excl reconcile) and raw
 - [x] Enhanced reconciliation stats in tick logging and daily exports
+
+### Phase 5.6 ✓
+- [x] Cache seeding at startup to reduce cold-start REST calls
+- [x] REST bucket totals with rest_seed counter
+- [x] Seeding CLI flags (--seed-cache, --seed-max, --seed-concurrency, --seed-timeout)
+
+### Phase 5.7 ✓
+- [x] Seed accounting: rest_seed correctly counted in exports
+- [x] SeedResult dataclass with attempted/succeeded/duration/errors
+- [x] WSS health grace period (--wss-health-grace) to reduce rest_unhealthy at startup
+- [x] Coverage JSON includes seed metrics
+- [x] Daemon summary includes Cache Seeding section
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

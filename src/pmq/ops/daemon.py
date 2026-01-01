@@ -21,6 +21,11 @@ Phase 5.5: Drift calibration + cache healing + metrics cleanup:
 - Cache healing: replace WSS cache with REST data when drift detected
 - Explicit REST fallback buckets (missing, unhealthy, very_old, reconcile)
 - Two coverage metrics: effective (excludes reconcile) and raw
+
+Phase 5.7: Seed accounting + WSS health grace:
+- rest_seed correctly counted in exports when seeding runs
+- SeedResult dataclass for clear seeding metrics
+- WSS health grace window to reduce rest_unhealthy at startup
 """
 
 from __future__ import annotations
@@ -97,6 +102,17 @@ async def real_sleep(seconds: float) -> None:
 # =============================================================================
 # Data Classes
 # =============================================================================
+
+
+@dataclass
+class SeedResult:
+    """Result of cache seeding operation (Phase 5.7)."""
+
+    attempted: int = 0  # Number of tokens we tried to seed
+    succeeded: int = 0  # Number successfully cached
+    rest_calls: int = 0  # REST API calls made (= attempted)
+    duration_seconds: float = 0.0  # Total seeding time
+    errors: int = 0  # Number of failed fetches
 
 
 @dataclass
@@ -222,6 +238,10 @@ class DaemonConfig:
     seed_max: int | None = None  # Max tokens to seed (None = use limit)
     seed_concurrency: int = 10  # Concurrent REST fetches during seeding
     seed_timeout: float = 30.0  # Total timeout for seeding phase
+    # Phase 5.7: WSS health grace period
+    wss_health_grace_seconds: float = (
+        60.0  # Grace period after connect before enforcing health timeout
+    )
 
     def get_effective_staleness(self) -> float:
         """Get effective staleness threshold (adaptive if not explicitly set).
@@ -288,9 +308,9 @@ class DaemonRunner:
         self._daily_stats: DailyStats | None = None
         self._total_ticks = 0
         self._start_time: datetime | None = None
-        # Phase 5.6: Seeding state
+        # Phase 5.6/5.7: Seeding state
         self._seeded = False
-        self._seed_count = 0  # Total REST calls for seeding
+        self._seed_result: SeedResult | None = None  # Phase 5.7: Full seeding metrics
 
         # Ensure export directory exists
         self.config.export_dir.mkdir(parents=True, exist_ok=True)
@@ -333,19 +353,27 @@ class DaemonRunner:
         if self.wss_client and self.config.orderbook_source == "wss":
             # Phase 5.4: Set health timeout on WSS client
             self.wss_client.health_timeout_seconds = self.config.wss_health_timeout
+            # Phase 5.7: Set health grace period
+            self.wss_client.health_grace_seconds = self.config.wss_health_grace_seconds
             await self.wss_client.connect()
             connected = await self.wss_client.wait_connected(timeout=10.0)
             if not connected:
                 logger.warning("WSS connection timeout, will retry on first tick")
 
-        # Phase 5.6: Seed cache before first tick
+        # Phase 5.6/5.7: Seed cache before first tick
         if (
             self.config.seed_cache
             and self.wss_client
             and self.ob_fetcher
             and self.config.orderbook_source == "wss"
         ):
-            await self._seed_cache()
+            seed_result = await self._seed_cache()
+            self._seed_result = seed_result
+            # Phase 5.7: Initialize daily stats with seed metrics if needed
+            if seed_result.rest_calls > 0:
+                self._ensure_daily_stats_initialized()
+                if self._daily_stats:
+                    self._daily_stats.total_rest_seed += seed_result.rest_calls
 
         try:
             while not self._shutdown_requested:
@@ -677,30 +705,31 @@ class DaemonRunner:
         # Deprecated field for compat
         tick_stats.drift_max_spread = max_mid_diff_bps
 
-    async def _seed_cache(self) -> int:
+    async def _seed_cache(self) -> SeedResult:
         """Pre-populate WSS cache with REST data to reduce cold-start missing.
 
-        Phase 5.6: Fetches orderbooks for tokens missing from cache at startup.
+        Phase 5.6/5.7: Fetches orderbooks for tokens missing from cache at startup.
         Uses concurrent REST fetches with configurable limits.
 
         Returns:
-            Number of tokens seeded
+            SeedResult with detailed metrics (Phase 5.7)
         """
         # Check if seeding is enabled
         if not self.config.seed_cache:
-            return 0
+            return SeedResult()
 
         if not self.wss_client or not self.ob_fetcher:
-            return 0
+            return SeedResult()
 
         if self._seeded:
-            return self._seed_count  # Already seeded
+            return self._seed_result or SeedResult()  # Already seeded
 
         # Capture in local vars for type narrowing (mypy doesn't track across nested functions)
         wss_client = self.wss_client
         ob_fetcher = self.ob_fetcher
 
         logger.info("Cache seeding started...")
+        start_time = self.clock.monotonic()
 
         # Get initial market list
         markets = self.gamma_client.list_markets(limit=self.config.limit)
@@ -708,7 +737,7 @@ class DaemonRunner:
 
         if not token_ids:
             self._seeded = True
-            return 0
+            return SeedResult()
 
         # Find tokens missing from cache
         missing_tokens = [tid for tid in token_ids if not wss_client.has_cached_book(tid)]
@@ -716,7 +745,7 @@ class DaemonRunner:
         if not missing_tokens:
             logger.info("Cache seeding: all tokens already cached")
             self._seeded = True
-            return 0
+            return SeedResult()
 
         # Apply seed_max cap
         seed_max = self.config.seed_max or self.config.limit
@@ -728,6 +757,7 @@ class DaemonRunner:
         )
 
         seeded = 0
+        errors = 0
         concurrency = self.config.seed_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
@@ -754,13 +784,41 @@ class DaemonRunner:
                 tasks = [seed_one(tid) for tid in to_seed]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 seeded = sum(1 for r in results if r is True)
+                errors = sum(1 for r in results if r is False or isinstance(r, Exception))
         except TimeoutError:
             logger.warning(f"Cache seeding timed out after {self.config.seed_timeout}s")
+            # Count unfinished tasks as errors
+            errors = len(to_seed) - seeded
 
+        duration = self.clock.monotonic() - start_time
         self._seeded = True
-        self._seed_count = len(to_seed)  # Count attempts, not successes
-        logger.info(f"Cache seeding completed: {seeded}/{len(to_seed)} tokens cached")
-        return seeded
+
+        result = SeedResult(
+            attempted=len(to_seed),
+            succeeded=seeded,
+            rest_calls=len(to_seed),  # Each attempt = 1 REST call
+            duration_seconds=duration,
+            errors=errors,
+        )
+
+        logger.info(
+            f"Cache seeding completed: {seeded}/{len(to_seed)} tokens cached "
+            f"in {duration:.1f}s (rest_seed={result.rest_calls})"
+        )
+        return result
+
+    def _ensure_daily_stats_initialized(self) -> None:
+        """Ensure daily stats are initialized for today (Phase 5.7).
+
+        Used to initialize stats before first tick when seeding runs.
+        """
+        today = self.clock.now().strftime("%Y-%m-%d")
+        if self._current_day != today or self._daily_stats is None:
+            self._current_day = today
+            self._daily_stats = DailyStats(
+                date=today,
+                start_time=self.clock.now().isoformat(),
+            )
 
     def _update_daily_stats(self, tick_stats: TickStats) -> None:
         """Update daily statistics with tick data."""
@@ -956,7 +1014,7 @@ class DaemonRunner:
         return deleted
 
     async def _export_daily_artifacts(self, stats: DailyStats) -> None:
-        """Export daily artifacts: CSV, JSON, markdown (Phase 5.6)."""
+        """Export daily artifacts: CSV, JSON, markdown (Phase 5.7)."""
         date_str = stats.date
         export_dir = self.config.export_dir
 
@@ -999,7 +1057,14 @@ class DaemonRunner:
             else 0.0
         )
 
-        # Export coverage JSON (Phase 5.5 schema)
+        # Phase 5.7: Get seeding metrics if available
+        seed_result = self._seed_result
+        seed_attempted = seed_result.attempted if seed_result else 0
+        seed_succeeded = seed_result.succeeded if seed_result else 0
+        seed_duration = seed_result.duration_seconds if seed_result else 0.0
+        seed_errors = seed_result.errors if seed_result else 0
+
+        # Export coverage JSON (Phase 5.7 schema)
         coverage_path = export_dir / f"coverage_{date_str}.json"
         coverage_data = {
             "date": stats.date,
@@ -1019,9 +1084,14 @@ class DaemonRunner:
             "rest_unhealthy": stats.total_rest_unhealthy,
             "rest_very_old": stats.total_rest_very_old,
             "rest_reconcile": stats.total_rest_reconcile,
-            # Phase 5.6: Seeding and total
+            # Phase 5.6/5.7: Seeding and total
             "rest_seed": stats.total_rest_seed,
             "rest_total": rest_total,
+            # Phase 5.7: Seeding details
+            "seed_attempted": seed_attempted,
+            "seed_succeeded": seed_succeeded,
+            "seed_duration_seconds": seed_duration,
+            "seed_errors": seed_errors,
             # Phase 5.6: Two coverage metrics
             "coverage_effective_pct": coverage_effective_pct,
             "coverage_raw_pct": wss_coverage_pct,
@@ -1103,8 +1173,21 @@ class DaemonRunner:
                     )
             logger.info(f"Exported ticks to {csv_path}")
 
-        # Export markdown summary (Phase 5.5)
+        # Export markdown summary (Phase 5.7)
         md_path = export_dir / f"daemon_summary_{date_str}.md"
+
+        # Phase 5.7: Cache seeding section
+        seed_section = ""
+        if seed_attempted > 0:
+            seed_section = f"""## Cache Seeding (Phase 5.7)
+- **Attempted:** {seed_attempted:,}
+- **Succeeded:** {seed_succeeded:,}
+- **Duration:** {seed_duration:.1f}s
+- **REST Calls:** {stats.total_rest_seed:,}
+- **Errors:** {seed_errors:,}
+
+"""
+
         md_content = f"""# Daemon Summary - {date_str}
 
 ## Overview
@@ -1113,7 +1196,7 @@ class DaemonRunner:
 - **End:** {stats.end_time}
 - **Total Ticks:** {stats.total_ticks}
 
-## Snapshot Coverage
+{seed_section}## Snapshot Coverage
 - **Total Snapshots:** {stats.total_snapshots:,}
 - **Total Orderbooks:** {stats.total_orderbooks:,}
 
@@ -1122,7 +1205,7 @@ class DaemonRunner:
 - **WSS Cache Quiet:** {stats.total_wss_cache_quiet:,}
 - **WSS Total Hits:** {stats.total_wss_hits:,}
 
-## REST Fallback Breakdown (Phase 5.6)
+## REST Fallback Breakdown (Phase 5.7)
 - **REST Missing:** {stats.total_rest_missing:,} (no cached book)
 - **REST Unhealthy:** {stats.total_rest_unhealthy:,} (WSS connection unhealthy)
 - **REST Very Old:** {stats.total_rest_very_old:,} (cache > max_book_age)
@@ -1147,7 +1230,7 @@ class DaemonRunner:
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon (Phase 5.6)*
+*Generated by pmq ops daemon (Phase 5.7)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
@@ -1167,8 +1250,13 @@ class DaemonRunner:
         logger.info("Finalizing daemon...")
 
         # Export current day's data if any (with timeout)
+        # Phase 5.7: Also export if seeding ran even without ticks
         current_day = self._current_day
-        if self._daily_stats and self._daily_stats.total_ticks > 0:
+        has_data = self._daily_stats and (
+            self._daily_stats.total_ticks > 0 or self._daily_stats.total_rest_seed > 0
+        )
+        if has_data:
+            assert self._daily_stats is not None  # mypy: validated by has_data
             try:
                 await asyncio.wait_for(
                     self._export_daily_artifacts(self._daily_stats),

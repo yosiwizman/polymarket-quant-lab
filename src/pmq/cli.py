@@ -4040,6 +4040,64 @@ def ops_daemon(
             help="WSS health grace period in seconds (default: 60) - assume healthy until grace expires",
         ),
     ] = 60.0,
+    # Phase 5.8: REST resilience flags
+    rest_rps: Annotated[
+        float,
+        typer.Option(
+            "--rest-rps",
+            help="REST rate limit: requests per second (default: 8)",
+        ),
+    ] = 8.0,
+    rest_burst: Annotated[
+        int,
+        typer.Option(
+            "--rest-burst",
+            help="REST rate limit: burst capacity (default: 8)",
+        ),
+    ] = 8,
+    rest_retries: Annotated[
+        int,
+        typer.Option(
+            "--rest-retries",
+            help="REST retry: max retry attempts for 429/5xx/timeout (default: 3)",
+        ),
+    ] = 3,
+    rest_backoff_base: Annotated[
+        float,
+        typer.Option(
+            "--rest-backoff-base",
+            help="REST retry: base backoff delay in seconds (default: 0.25)",
+        ),
+    ] = 0.25,
+    rest_backoff_max: Annotated[
+        float,
+        typer.Option(
+            "--rest-backoff-max",
+            help="REST retry: maximum backoff delay in seconds (default: 3.0)",
+        ),
+    ] = 3.0,
+    # Phase 5.9: WSS-first seeding flags
+    seed_mode: Annotated[
+        str,
+        typer.Option(
+            "--seed-mode",
+            help="Seed mode: 'wss_first' (wait for WSS then REST fallback) or 'rest' (legacy)",
+        ),
+    ] = "wss_first",
+    seed_grace_seconds: Annotated[
+        float,
+        typer.Option(
+            "--seed-grace-seconds",
+            help="WSS-first: seconds to wait for WSS cache before REST fallback (default: 10)",
+        ),
+    ] = 10.0,
+    seed_skiplist_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--seed-skiplist-path",
+            help="Path to skiplist file for known-unseedable tokens (auto-maintained)",
+        ),
+    ] = None,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -4053,6 +4111,10 @@ def ops_daemon(
     - Two coverage metrics: effective (excludes reconcile/seed) and raw (Phase 5.6)
     - WSS health grace period to reduce rest_unhealthy at startup (Phase 5.7)
     - rest_seed correctly counted in exports when seeding runs (Phase 5.7)
+    - REST retry with exponential backoff for 429/5xx/timeout (Phase 5.8)
+    - Token bucket rate limiting for global REST request control (Phase 5.8)
+    - WSS-first seeding: wait for WSS cache, REST fallback only for misses (Phase 5.9)
+    - Seed outcome taxonomy: ok, unseedable_*, failed_unexpected (Phase 5.9)
     - Daily export artifacts (CSV, JSON, markdown)
     - Daily snapshot exports to gzip CSV (Phase 5.2)
     - Optional retention cleanup for old snapshots (Phase 5.2)
@@ -4074,6 +4136,9 @@ def ops_daemon(
         pmq ops daemon --reconcile-mid-bps 25 --reconcile-heal  # Phase 5.5
         pmq ops daemon --seed-cache --seed-max 100 --seed-concurrency 20  # Phase 5.6
         pmq ops daemon --wss-health-grace 90  # Phase 5.7: longer grace period
+        pmq ops daemon --rest-rps 10 --rest-burst 10 --rest-retries 5  # Phase 5.8
+        pmq ops daemon --seed-mode wss_first --seed-grace-seconds 12  # Phase 5.9
+        pmq ops daemon --seed-skiplist-path ./skiplist.json  # Phase 5.9
     """
     import asyncio
 
@@ -4090,6 +4155,13 @@ def ops_daemon(
     if snapshot_export_format not in ("csv_gz",):
         console.print(
             f"[red]Invalid --snapshot-export-format: {snapshot_export_format}. Must be 'csv_gz'.[/red]"
+        )
+        raise typer.Exit(1)
+
+    # Validate seed-mode (Phase 5.9)
+    if seed_mode not in ("rest", "wss_first"):
+        console.print(
+            f"[red]Invalid --seed-mode: {seed_mode}. Must be 'rest' or 'wss_first'.[/red]"
         )
         raise typer.Exit(1)
 
@@ -4125,6 +4197,16 @@ def ops_daemon(
         seed_timeout=seed_timeout,
         # Phase 5.7: WSS health grace
         wss_health_grace_seconds=wss_health_grace,
+        # Phase 5.8: REST resilience
+        rest_rps=rest_rps,
+        rest_burst=rest_burst,
+        rest_max_retries=rest_retries,
+        rest_backoff_base=rest_backoff_base,
+        rest_backoff_max=rest_backoff_max,
+        # Phase 5.9: WSS-first seeding
+        seed_mode=seed_mode,
+        seed_grace_seconds=seed_grace_seconds,
+        seed_skiplist_path=seed_skiplist_path,
     )
 
     # Initialize dependencies
@@ -4166,8 +4248,9 @@ def ops_daemon(
     heal_str = "on" if reconcile_heal else "off"
     seed_str = "on" if seed_cache else "off"
     seed_max_str = str(seed_max) if seed_max else str(limit)
+    skiplist_str = str(seed_skiplist_path) if seed_skiplist_path else "disabled"
     console.print(
-        f"[bold green]Starting ops daemon (Phase 5.7)[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 5.9)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
@@ -4177,7 +4260,9 @@ def ops_daemon(
         f"Reconcile: {reconcile_sample} samples, min age {reconcile_min_age:.0f}s\n"
         f"Drift Thresholds: mid={reconcile_mid_bps}bps, spread={reconcile_spread_bps}bps, depth={reconcile_depth_pct}%\n"
         f"Cache Healing: {heal_str} (max {reconcile_max_heals}/tick)\n"
-        f"Cache Seeding: {seed_str} (max {seed_max_str}, concurrency {seed_concurrency})\n"
+        f"Cache Seeding: {seed_str} (mode={seed_mode}, max={seed_max_str}, grace={seed_grace_seconds:.0f}s)\n"
+        f"Seed Skiplist: {skiplist_str}\n"
+        f"REST Resilience: {rest_rps:.1f} rps, burst {rest_burst}, {rest_retries} retries\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"

@@ -1911,6 +1911,224 @@ daemon_summary markdown now shows:
 
 > 💡 **Why Health Grace?** WSS connections take time to establish and receive first messages. Without grace, the first tick would see "unhealthy" connection and trigger REST fallbacks for all markets, defeating the purpose of WSS streaming.
 
+### REST Retry + Rate Limiting (Phase 5.8)
+
+Phase 5.8 makes cache seeding and all daemon REST usage resilient to transient REST failures (HTTP 429 / 5xx / timeouts / network errors) by adding:
+1. **Shared async REST "safety wrapper"**: Retry with exponential backoff + jitter; honors Retry-After when present
+2. **Global async rate limiter**: Token bucket to cap REST request rate across all daemon tasks
+
+#### Retry Behavior
+
+Retryable failures:
+- HTTP 429 (rate limit)
+- HTTP 5xx (server errors)
+- Timeout/network exceptions
+
+Non-retryable failures (fail fast):
+- Other 4xx (except 429)
+
+Backoff:
+- Exponential: `base * 2^attempt`
+- Jitter: ±25% randomization
+- Capped at `backoff_max`
+- Respects Retry-After header if present (bounded by backoff_max)
+
+#### Rate Limiter
+
+Token bucket rate limiter applied BEFORE each REST request (and for each retry):
+- Refills tokens at `rest_rps` per second
+- Burst capacity of `rest_burst` tokens
+- Additive to existing concurrency controls (semaphores for seeding, etc.)
+
+#### Phase 5.8 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--rest-rps` | float | 8.0 | REST rate limit: requests per second |
+| `--rest-burst` | int | 8 | REST rate limit: burst capacity |
+| `--rest-retries` | int | 3 | REST retry: max retry attempts (not counting initial) |
+| `--rest-backoff-base` | float | 0.25 | REST retry: base backoff delay in seconds |
+| `--rest-backoff-max` | float | 3.0 | REST retry: maximum backoff delay in seconds |
+
+#### Example Usage
+
+```powershell
+# Default settings (recommended)
+poetry run pmq ops daemon --interval 60
+
+# More aggressive rate limiting
+poetry run pmq ops daemon --rest-rps 4 --rest-burst 4
+
+# More retries for flaky connections
+poetry run pmq ops daemon --rest-retries 5 --rest-backoff-max 5.0
+
+# Conservative settings for CI/testing
+poetry run pmq ops daemon --rest-rps 2 --rest-burst 2 --rest-retries 2
+```
+
+#### New Metrics (Phase 5.8)
+
+Coverage JSON and daemon summary now include:
+- `rest_retry_calls`: Total retry attempts across all REST calls (not counting initial attempt)
+- `seed_retry_calls`: Retry attempts during seeding only
+- `rest_429_count`: Total 429 responses observed
+- `rest_5xx_count`: Total 5xx responses observed
+
+#### Expected Results
+
+With Phase 5.8, a daemon run should show:
+- **seed_succeeded approaches seed_attempted** (transient failures are retried)
+- **seed_errors decrease** (retries recover from 429/5xx/timeout)
+- **rest_retry_calls > 0** when transient failures occur (retries are logged)
+- **Invariants still hold** (rest_total = sum of REST buckets)
+
+> 💡 **Why REST Resilience?** Polymarket's CLOB API can return 429 (rate limit) or 5xx errors during peak load. Without retry logic, these transient failures cause seed_errors to spike, reducing cache coverage. Phase 5.8 makes seeding and live REST fallbacks robust to these transient conditions.
+
+### Seed Eligibility + WSS-First Seeding (Phase 5.9)
+
+Phase 5.9 optimizes cache seeding by using WSS-first strategy and classifies seed outcomes into explicit categories to make the `seed_errors` metric interpretable.
+
+#### WSS-First Seeding
+
+Instead of immediately making REST calls for all tokens, the daemon now:
+1. Subscribes to WSS (already done at daemon startup)
+2. Waits a grace period (default 10s) for WSS to populate cache
+3. Reads from WSS cache first
+4. Only makes REST calls for remaining missing tokens
+
+This significantly reduces REST API usage during seeding.
+
+#### Seed Outcome Taxonomy
+
+Seed outcomes are now classified into explicit categories:
+
+| Category | Description | Is Error? |
+|----------|-------------|----------|
+| `ok` | Successfully seeded with valid book data | No |
+| `unseedable_empty_book` | API returned 200 but no bids/asks | Expected |
+| `unseedable_not_found` | HTTP 404 (market doesn't exist) | Expected |
+| `unseedable_bad_request` | HTTP 400 (invalid token ID) | Expected |
+| `unseedable_other_4xx` | Other 4xx errors (except 429) | Expected |
+| `failed_unexpected` | Network errors, parsing issues, etc. | True Error |
+
+**Key insight**: `unseedable_*` outcomes are expected for closed markets, markets with no liquidity, or invalid token IDs. These are NOT true errors and don't warrant investigation. Only `failed_unexpected` outcomes indicate actual problems.
+
+#### Optional Skiplist
+
+For persistent deployments, an optional skiplist file caches known-unseedable tokens:
+- Automatically populated when `unseedable_*` outcomes occur
+- Entries expire after 24 hours (configurable TTL)
+- Skipped tokens bypass both WSS wait and REST fallback
+
+#### Phase 5.9 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--seed-mode` | str | `wss_first` | Seed mode: 'wss_first' (wait for WSS then REST fallback) or 'rest' (legacy) |
+| `--seed-grace-seconds` | float | 10.0 | WSS-first: seconds to wait for WSS cache before REST fallback |
+| `--seed-skiplist-path` | Path | None | Path to skiplist file for known-unseedable tokens (auto-maintained) |
+
+#### Example Usage
+
+```powershell
+# Default WSS-first seeding (recommended)
+poetry run pmq ops daemon --interval 60
+
+# Longer grace period for slow connections
+poetry run pmq ops daemon --seed-grace-seconds 15
+
+# Use skiplist to speed up repeated daemon runs
+poetry run pmq ops daemon --seed-skiplist-path ./skiplist.json
+
+# Legacy REST-only seeding (for comparison/debugging)
+poetry run pmq ops daemon --seed-mode rest
+```
+
+#### New Metrics (Phase 5.9)
+
+Coverage JSON and daemon summary now include:
+- `seed_from_wss`: Tokens seeded from WSS cache (no REST needed)
+- `seed_from_rest`: Tokens seeded via REST API fallback
+- `seed_unseedable`: Expected unseedable outcomes (empty books, 4xx errors)
+- `seed_failed_unexpected`: True unexpected failures (warrant investigation)
+- `seed_unseedable_kinds`: Breakdown by specific unseedable category
+
+Legacy `seed_errors` field is preserved for backward compatibility (= `seed_unseedable` + `seed_failed_unexpected`).
+
+#### Expected Results
+
+With Phase 5.9, a daemon run should show:
+- **seed_from_wss > 0** when WSS-first mode is enabled (tokens seeded without REST)
+- **rest_calls < seed_attempted** when WSS-first works (REST usage reduced)
+- **seed_unseedable >> seed_failed_unexpected** typically (most "errors" are expected)
+- **seed_failed_unexpected ≈ 0** in healthy runs (only investigate these)
+
+> 💡 **Why Seed Taxonomy?** Phase 5.8 showed 28 `seed_errors` but these were mostly expected 4xx responses for closed/invalid markets. Without classification, operators couldn't tell if these were problems. Phase 5.9 makes it clear: `seed_unseedable` is expected, only `seed_failed_unexpected` warrants investigation.
+
+### WSS Seed Bootstrap + Persistent Skiplist (Phase 6.0)
+
+Phase 6.0 fixes WSS-first seeding to actually seed from WSS at startup and makes skiplist persistence the default:
+1. **WSS Seed Bootstrap**: Subscribe to WSS BEFORE the grace wait (not after), so "book" messages populate the cache during grace
+2. **Persistent Skiplist Default**: Skiplist is now ON by default (`exports/seed_skiplist.json`), reducing repeat REST calls for known-unseedable tokens
+
+#### The Problem
+
+Phase 5.9's WSS-first seeding showed `seed_from_wss = 0` in validation runs. Investigation revealed:
+- The grace wait happened BEFORE subscribing to token_ids
+- Polymarket's WSS emits a "book" message when you FIRST subscribe to a market
+- By waiting before subscribing, the WSS cache was empty during grace → everything fell back to REST
+
+#### The Fix
+
+Phase 6.0 reorders the seeding logic:
+1. **Subscribe first**: Subscribe to all candidate token_ids via WSS
+2. **Polling wait**: Poll the WSS cache during grace period with early exit when all tokens are ready
+3. **REST fallback**: Only fetch via REST for tokens still missing after grace expires
+
+#### Persistent Skiplist Default
+
+Skiplist persistence is now ON by default:
+- Default path: `exports/seed_skiplist.json` when `--seed-skiplist-path` not provided
+- Disable with `--no-seed-skiplist` flag
+- Reduces REST API usage over long-running ops by skipping known-unseedable tokens
+
+#### Phase 6.0 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--seed-skiplist/--no-seed-skiplist` | bool | True | Enable/disable skiplist persistence |
+| `--seed-skiplist-path` | Path | `exports/seed_skiplist.json` | Path to skiplist file |
+| `--seed-bootstrap-poll-interval` | float | 0.2 | Polling interval during grace wait (seconds) |
+
+#### Example Usage
+
+```powershell
+# Default: WSS-first with persistent skiplist (recommended)
+poetry run pmq ops daemon --interval 60
+
+# Disable skiplist persistence
+poetry run pmq ops daemon --no-seed-skiplist
+
+# Custom skiplist path
+poetry run pmq ops daemon --seed-skiplist-path ./data/skiplist.json
+```
+
+#### New Metrics (Phase 6.0)
+
+Coverage JSON and daemon summary now include:
+- `seed_skipped_skiplist`: Tokens skipped due to skiplist (not attempted)
+- `seed_candidates_total`: Total candidate tokens before skiplist filtering
+
+#### Expected Results
+
+With Phase 6.0, a daemon run should show:
+- **seed_from_wss > 0** in typical runs (was 0 in Phase 5.9)
+- **seed_from_rest < seed_candidates_total** (REST usage significantly reduced)
+- **seed_skipped_skiplist > 0** after first run (known-unseedable tokens skipped)
+- **coverage_effective** maintained or improved
+
+> 💡 **Why Bootstrap Before Grace?** Polymarket's WSS emits "book" messages immediately upon subscription. By subscribing BEFORE the grace wait, the cache gets populated during grace. This is the key insight that makes WSS-first seeding actually work.
+
 ## Project Structure
 
 ```
@@ -2170,6 +2388,33 @@ poetry run mypy src
 - [x] WSS health grace period (--wss-health-grace) to reduce rest_unhealthy at startup
 - [x] Coverage JSON includes seed metrics
 - [x] Daemon summary includes Cache Seeding section
+
+### Phase 5.8 ✓
+- [x] REST retry with exponential backoff + jitter for transient failures (429/5xx/timeout)
+- [x] Token bucket rate limiter for global REST request rate control
+- [x] New CLI flags: `--rest-rps`, `--rest-burst`, `--rest-retries`, `--rest-backoff-base`, `--rest-backoff-max`
+- [x] New metrics: `rest_retry_calls`, `seed_retry_calls`, `rest_429_count`, `rest_5xx_count`
+- [x] Shared REST safety wrapper used by seeding, reconciliation, and fallback REST calls
+- [x] Unit tests for retry behavior and rate limiter with deterministic clock
+- [x] Coverage JSON and daemon summary include REST resilience metrics
+
+### Phase 5.9 ✓
+- [x] WSS-first seeding: Subscribe to WSS, wait grace period, read from cache, REST fallback only for misses
+- [x] Seed outcome taxonomy: Classifies outcomes as ok, unseedable_*, or failed_unexpected
+- [x] New metrics: `seed_from_wss`, `seed_from_rest`, `seed_unseedable`, `seed_failed_unexpected`, `seed_unseedable_kinds`
+- [x] New CLI flags: `--seed-mode`, `--seed-grace-seconds`, `--seed-skiplist-path`
+- [x] Optional skiplist for known-unseedable tokens (file-backed, TTL expiry)
+- [x] Backward compatible: legacy `seed_errors` field preserved
+- [x] Unit tests for taxonomy classification and skiplist behavior
+
+### Phase 6.0 ✓
+- [x] WSS seed bootstrap: Subscribe to WSS BEFORE grace wait to receive "book" messages
+- [x] Polling during grace: Poll WSS cache with early exit when all tokens ready
+- [x] Skiplist persistence ON by default (`exports/seed_skiplist.json`)
+- [x] New config: `seed_skiplist_enabled`, `seed_bootstrap_poll_interval`
+- [x] New metrics: `seed_skipped_skiplist`, `seed_candidates_total`
+- [x] Updated exports: coverage JSON and markdown include Phase 6.0 fields
+- [x] Unit tests for WSS bootstrap seeding and skiplist persistence defaults
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

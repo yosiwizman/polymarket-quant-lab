@@ -31,6 +31,19 @@ Phase 5.8: REST resilience:
 - Token bucket rate limiter for global REST request rate control
 - Retry with exponential backoff + jitter for transient failures (429/5xx/timeout)
 - New metrics: rest_retry_calls, seed_retry_calls, rest_429_count, rest_5xx_count
+
+Phase 5.9: Seed eligibility + error taxonomy + WSS-first seeding:
+- WSS-first seeding: Subscribe to WSS first, wait grace period, read from cache, REST fallback only for misses
+- Seed outcome taxonomy: Classifies outcomes as ok, unseedable_*, or failed_unexpected
+- New metrics: seed_from_wss, seed_from_rest, seed_unseedable, seed_failed_unexpected
+- Optional skiplist for known-unseedable tokens
+
+Phase 6.0: WSS seed bootstrap + persistent skiplist defaults:
+- Fixed WSS-first seeding: Subscribe to WSS BEFORE grace wait so "book" messages populate cache
+- Bootstrap wait polls for cache readiness with configurable interval (default 0.2s)
+- Skiplist persistence ON by default (exports/seed_skiplist.json)
+- New metric: seed_skipped_skiplist (tokens skipped due to skiplist)
+- Atomic skiplist writes for safety
 """
 
 from __future__ import annotations
@@ -44,6 +57,7 @@ import os
 import signal
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -109,19 +123,32 @@ async def real_sleep(seconds: float) -> None:
 # =============================================================================
 
 
+# Phase 6.0: Default skiplist path
+DEFAULT_SEED_SKIPLIST_FILENAME = "seed_skiplist.json"
+
+
 @dataclass
 class SeedResult:
-    """Result of cache seeding operation (Phase 5.7/5.8)."""
+    """Result of cache seeding operation (Phase 5.7/5.8/5.9/6.0)."""
 
-    attempted: int = 0  # Number of tokens we tried to seed
+    attempted: int = 0  # Number of tokens we tried to seed (after skiplist filter)
     succeeded: int = 0  # Number successfully cached
-    rest_calls: int = 0  # REST API calls made (= attempted)
+    rest_calls: int = 0  # REST API calls made (may be less than attempted if WSS-first)
     duration_seconds: float = 0.0  # Total seeding time
-    errors: int = 0  # Number of failed fetches
+    errors: int = 0  # Number of failed fetches (legacy, kept for backward compat)
     # Phase 5.8: Retry metrics
     retry_calls: int = 0  # Total retry attempts during seeding
     http_429_count: int = 0  # 429 responses seen
     http_5xx_count: int = 0  # 5xx responses seen
+    # Phase 5.9: Seed taxonomy fields
+    seed_from_wss: int = 0  # Tokens seeded from WSS cache (no REST needed)
+    seed_from_rest: int = 0  # Tokens seeded from REST calls
+    seed_unseedable: int = 0  # Expected unseedable outcomes (empty books, 4xx)
+    seed_failed_unexpected: int = 0  # True unexpected failures
+    seed_unseedable_kinds: dict[str, int] = field(default_factory=dict)  # Breakdown by kind
+    # Phase 6.0: Skiplist metric
+    seed_skipped_skiplist: int = 0  # Tokens skipped due to skiplist (known-unseedable)
+    seed_candidates_total: int = 0  # Total candidates before skiplist filter
 
 
 @dataclass
@@ -266,6 +293,15 @@ class DaemonConfig:
     rest_max_retries: int = 3  # Max retry attempts (not counting initial)
     rest_backoff_base: float = 0.25  # Base backoff delay in seconds
     rest_backoff_max: float = 3.0  # Maximum backoff delay in seconds
+    # Phase 5.9/6.0: WSS-first seeding settings
+    seed_mode: str = "wss_first"  # "rest" (legacy) or "wss_first" (Phase 5.9)
+    seed_grace_seconds: float = 10.0  # Time to wait for WSS cache to populate (8-12s recommended)
+    seed_skiplist_path: Path | None = (
+        None  # Path to skiplist (None = use default: exports/seed_skiplist.json)
+    )
+    seed_skiplist_enabled: bool = True  # Phase 6.0: Enable skiplist persistence (default ON)
+    # Phase 6.0: Bootstrap wait polling
+    seed_bootstrap_poll_interval: float = 0.2  # Interval for polling cache readiness during grace
 
     def get_effective_staleness(self) -> float:
         """Get effective staleness threshold (adaptive if not explicitly set).
@@ -371,7 +407,8 @@ class DaemonRunner:
     async def run(self) -> None:
         """Main daemon loop."""
         self._running = True
-        self._shutdown_requested = False
+        # Phase 6.0.1: Don't overwrite prior shutdown request (for testability)
+        # This allows tests to call request_shutdown() before run()
         self._start_time = self.clock.now()
         start_monotonic = self.clock.monotonic()
 
@@ -392,38 +429,49 @@ class DaemonRunner:
             f"max_hours={self.config.max_hours or 'infinite'}"
         )
 
-        # Connect WSS if enabled
-        if self.wss_client and self.config.orderbook_source == "wss":
-            # Phase 5.4: Set health timeout on WSS client
-            self.wss_client.health_timeout_seconds = self.config.wss_health_timeout
-            # Phase 5.7: Set health grace period
-            self.wss_client.health_grace_seconds = self.config.wss_health_grace_seconds
-            await self.wss_client.connect()
-            connected = await self.wss_client.wait_connected(timeout=10.0)
-            if not connected:
-                logger.warning("WSS connection timeout, will retry on first tick")
-
-        # Phase 5.6/5.7: Seed cache before first tick
-        if (
-            self.config.seed_cache
-            and self.wss_client
-            and self.ob_fetcher
-            and self.config.orderbook_source == "wss"
-        ):
-            seed_result = await self._seed_cache()
-            self._seed_result = seed_result
-            # Phase 5.7/5.8: Initialize daily stats with seed metrics if needed
-            if seed_result.rest_calls > 0:
-                self._ensure_daily_stats_initialized()
-                if self._daily_stats:
-                    self._daily_stats.total_rest_seed += seed_result.rest_calls
-                    # Phase 5.8: Propagate retry metrics from seeding
-                    self._daily_stats.seed_retry_calls += seed_result.retry_calls
-                    self._daily_stats.total_rest_retry_calls += seed_result.retry_calls
-                    self._daily_stats.total_rest_429 += seed_result.http_429_count
-                    self._daily_stats.total_rest_5xx += seed_result.http_5xx_count
-
+        # Phase 6.0.1: Wrap entire body in try/finally to ensure _finalize() is always called
         try:
+            # Phase 6.0.1: Check shutdown before any long operations
+            if self._shutdown_requested:
+                logger.info("Shutdown already requested, skipping startup")
+                return
+
+            # Connect WSS if enabled
+            if self.wss_client and self.config.orderbook_source == "wss":
+                # Phase 5.4: Set health timeout on WSS client
+                self.wss_client.health_timeout_seconds = self.config.wss_health_timeout
+                # Phase 5.7: Set health grace period
+                self.wss_client.health_grace_seconds = self.config.wss_health_grace_seconds
+                await self.wss_client.connect()
+                connected = await self.wss_client.wait_connected(timeout=10.0)
+                if not connected:
+                    logger.warning("WSS connection timeout, will retry on first tick")
+
+            # Phase 6.0.1: Check shutdown after WSS connect
+            if self._shutdown_requested:
+                logger.info("Shutdown requested during startup")
+                return
+
+            # Phase 5.6/5.7: Seed cache before first tick
+            if (
+                self.config.seed_cache
+                and self.wss_client
+                and self.ob_fetcher
+                and self.config.orderbook_source == "wss"
+            ):
+                seed_result = await self._seed_cache()
+                self._seed_result = seed_result
+                # Phase 5.7/5.8: Initialize daily stats with seed metrics if needed
+                if seed_result.rest_calls > 0:
+                    self._ensure_daily_stats_initialized()
+                    if self._daily_stats:
+                        self._daily_stats.total_rest_seed += seed_result.rest_calls
+                        # Phase 5.8: Propagate retry metrics from seeding
+                        self._daily_stats.seed_retry_calls += seed_result.retry_calls
+                        self._daily_stats.total_rest_retry_calls += seed_result.retry_calls
+                        self._daily_stats.total_rest_429 += seed_result.http_429_count
+                        self._daily_stats.total_rest_5xx += seed_result.http_5xx_count
+
             while not self._shutdown_requested:
                 # Check time limit
                 if self.clock.monotonic() >= end_monotonic:
@@ -446,7 +494,7 @@ class DaemonRunner:
         except asyncio.CancelledError:
             logger.info("Daemon cancelled")
         finally:
-            # Final export on shutdown
+            # Phase 6.0.1: _finalize() is always called, even on early return
             await self._finalize()
             self._running = False
 
@@ -754,16 +802,27 @@ class DaemonRunner:
         tick_stats.drift_max_spread = max_mid_diff_bps
 
     async def _seed_cache(self) -> SeedResult:
-        """Pre-populate WSS cache with REST data to reduce cold-start missing.
+        """Pre-populate WSS cache to reduce cold-start missing.
 
-        Phase 5.6/5.7/5.8: Fetches orderbooks for tokens missing from cache at startup.
-        Uses concurrent REST fetches with configurable limits.
-        Phase 5.8: Uses retry_rest_call with rate limiting for resilience.
+        Phase 5.9: WSS-first seeding with outcome taxonomy.
+        Phase 6.0: Fixed bootstrap - subscribe to WSS BEFORE grace wait.
+
+        - WSS-first mode: Subscribe to WSS first, wait grace period with polling,
+          read from cache, REST fallback only for misses
+        - REST mode (legacy): Use REST to seed all missing tokens
+        - Seed outcomes classified as: ok, unseedable_*, or failed_unexpected
 
         Returns:
-            SeedResult with detailed metrics (Phase 5.7/5.8)
+            SeedResult with detailed metrics including Phase 5.9/6.0 taxonomy fields
         """
         from pmq.ops.rest_resilience import RestCallStats, retry_rest_call
+        from pmq.ops.seed_taxonomy import (
+            SeedOutcome,
+            SeedOutcomeKind,
+            SeedOutcomeStats,
+            SeedSkiplist,
+            classify_orderbook_result,
+        )
 
         # Check if seeding is enabled
         if not self.config.seed_cache:
@@ -775,14 +834,32 @@ class DaemonRunner:
         if self._seeded:
             return self._seed_result or SeedResult()  # Already seeded
 
+        # Phase 6.0.1: Check shutdown before starting seeding
+        if self._shutdown_requested:
+            logger.info("Shutdown requested, skipping cache seeding")
+            return SeedResult()
+
         # Capture in local vars for type narrowing (mypy doesn't track across nested functions)
         wss_client = self.wss_client
         ob_fetcher = self.ob_fetcher
         resilience_config = self._rest_resilience_config
         rate_limiter = self._rate_limiter
+        seed_mode = self.config.seed_mode
 
-        logger.info("Cache seeding started...")
+        logger.info(f"Cache seeding started (mode={seed_mode})...")
         start_time = self.clock.monotonic()
+
+        # Phase 6.0: Determine skiplist path (default to exports/seed_skiplist.json)
+        skiplist: SeedSkiplist | None = None
+        skiplist_path = self.config.seed_skiplist_path
+        if skiplist_path is None and self.config.seed_skiplist_enabled:
+            # Use default path
+            skiplist_path = self.config.export_dir / DEFAULT_SEED_SKIPLIST_FILENAME
+
+        if skiplist_path is not None and self.config.seed_skiplist_enabled:
+            skiplist = SeedSkiplist(skiplist_path)
+            skiplist.load()
+            logger.info(f"Loaded seed skiplist with {len(skiplist)} entries from {skiplist_path}")
 
         # Get initial market list
         markets = self.gamma_client.list_markets(limit=self.config.limit)
@@ -792,87 +869,240 @@ class DaemonRunner:
             self._seeded = True
             return SeedResult()
 
-        # Find tokens missing from cache
-        missing_tokens = [tid for tid in token_ids if not wss_client.has_cached_book(tid)]
+        # Phase 6.0: Track candidates before skiplist filter
+        seed_candidates_total = len(token_ids)
+        seed_skipped_skiplist = 0
 
-        if not missing_tokens:
-            logger.info("Cache seeding: all tokens already cached")
-            self._seeded = True
-            return SeedResult()
+        # Phase 5.9/6.0: Filter out skiplisted tokens
+        if skiplist:
+            original_count = len(token_ids)
+            token_ids = [tid for tid in token_ids if not skiplist.should_skip(tid)]
+            seed_skipped_skiplist = original_count - len(token_ids)
+            if seed_skipped_skiplist > 0:
+                logger.info(f"Skipped {seed_skipped_skiplist} tokens from skiplist")
 
         # Apply seed_max cap
         seed_max = self.config.seed_max or self.config.limit
-        seed_max = min(seed_max, len(missing_tokens))
-        to_seed = missing_tokens[:seed_max]
+        to_seed = token_ids[:seed_max]
 
-        logger.info(
-            f"Cache seeding: {len(to_seed)} tokens to seed (of {len(missing_tokens)} missing)"
-        )
+        # Phase 5.9/6.0: WSS-first seeding with bootstrap fix
+        seed_from_wss = 0
+        to_rest_seed: list[str] = []
 
-        seeded = 0
-        errors = 0
+        if seed_mode == "wss_first":
+            # Phase 6.0 FIX: Subscribe to WSS BEFORE grace wait!
+            # Polymarket emits "book" message on subscribe, so we need to subscribe first
+            logger.info(f"WSS-first: subscribing to {len(to_seed)} tokens before grace wait...")
+            await wss_client.subscribe(to_seed)
+
+            # Phase 6.0.1: Check shutdown after subscribe
+            if self._shutdown_requested:
+                logger.info("Shutdown requested, aborting cache seeding")
+                self._seeded = True
+                return SeedResult()
+
+            # Bootstrap wait with polling for cache readiness
+            grace_seconds = self.config.seed_grace_seconds
+            poll_interval = self.config.seed_bootstrap_poll_interval
+            logger.info(
+                f"WSS-first: waiting up to {grace_seconds:.1f}s for cache population (poll={poll_interval:.2f}s)..."
+            )
+
+            ready_tokens: set[str] = set()
+            missing_tokens: set[str] = set(to_seed)
+
+            # Phase 6.0.1: Use iteration-bounded loop instead of time-bounded
+            # This ensures deterministic behavior under FakeClock/FakeSleep
+            max_iters = int(grace_seconds / poll_interval) if poll_interval > 0 else 0
+            iterations_done = 0
+
+            for _ in range(max_iters):
+                # Phase 6.0.1: Check shutdown each iteration
+                if self._shutdown_requested:
+                    logger.info("Shutdown requested during bootstrap grace wait")
+                    break
+
+                # Check which tokens became ready
+                for tid in list(missing_tokens):
+                    if wss_client.has_cached_book(tid):
+                        cached_ob = wss_client.get_orderbook(tid, allow_stale=True)
+                        if cached_ob and cached_ob.has_valid_book:
+                            ready_tokens.add(tid)
+                            missing_tokens.discard(tid)
+
+                # All ready, exit early
+                if not missing_tokens:
+                    logger.debug(f"All {len(ready_tokens)} tokens ready, exiting grace wait early")
+                    break
+
+                # Poll interval sleep
+                await self.sleep_fn(poll_interval)
+                iterations_done += 1
+
+            # Count results
+            seed_from_wss = len(ready_tokens)
+            to_rest_seed = list(missing_tokens)
+
+            # Phase 6.0.1: If shutdown requested, skip REST seeding
+            if self._shutdown_requested:
+                self._seeded = True
+                return SeedResult(
+                    seed_from_wss=seed_from_wss,
+                    seed_skipped_skiplist=seed_skipped_skiplist,
+                    seed_candidates_total=seed_candidates_total,
+                )
+
+            logger.info(
+                f"WSS-first: {seed_from_wss} from WSS cache, {len(to_rest_seed)} need REST fallback "
+                f"(iterations={iterations_done})"
+            )
+        else:
+            # Legacy REST mode: seed all missing tokens
+            to_rest_seed = [tid for tid in to_seed if not wss_client.has_cached_book(tid)]
+            logger.info(f"REST mode: {len(to_rest_seed)} tokens to seed")
+
+        if not to_rest_seed:
+            # All tokens seeded from WSS
+            duration = self.clock.monotonic() - start_time
+            self._seeded = True
+            result = SeedResult(
+                attempted=len(to_seed),
+                succeeded=seed_from_wss,
+                rest_calls=0,
+                duration_seconds=duration,
+                errors=0,
+                seed_from_wss=seed_from_wss,
+                seed_from_rest=0,
+                seed_unseedable=0,
+                seed_failed_unexpected=0,
+                seed_skipped_skiplist=seed_skipped_skiplist,
+                seed_candidates_total=seed_candidates_total,
+            )
+            logger.info(
+                f"Cache seeding completed: {seed_from_wss}/{len(to_seed)} from WSS in {duration:.1f}s "
+                f"(skiplist={seed_skipped_skiplist})"
+            )
+            return result
+
+        # REST seeding for remaining tokens
+        outcome_stats = SeedOutcomeStats()
+        seed_from_rest = 0
         total_retries = 0
         total_429 = 0
         total_5xx = 0
         concurrency = self.config.seed_concurrency
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def seed_one(token_id: str) -> tuple[bool, RestCallStats]:
-            """Fetch and cache one token with retry."""
+        # Factory function to create typed callables for each token (for mypy)
+        def make_fetch_fn(tid: str) -> Callable[[], Any]:
+            return lambda: ob_fetcher.fetch_order_book(tid)
+
+        async def seed_one(token_id: str) -> tuple[SeedOutcome, RestCallStats]:
+            """Fetch and cache one token with retry, return outcome."""
             async with semaphore:
-                # Phase 5.8: Use retry_rest_call with rate limiting
-                ob, stats = await retry_rest_call(
-                    call_fn=lambda: ob_fetcher.fetch_order_book(token_id),
-                    config=resilience_config,
-                    rate_limiter=rate_limiter,
-                )
-                if ob and ob.has_valid_book:
-                    wss_client.update_cache(token_id, ob)
-                    return True, stats
-                return False, stats
+                try:
+                    # Phase 5.8: Use retry_rest_call with rate limiting
+                    # Note: retry_rest_call expects sync callable, wraps in executor
+                    ob, stats = await retry_rest_call(
+                        call_fn=make_fetch_fn(token_id),
+                        config=resilience_config,
+                        rate_limiter=rate_limiter,
+                    )
+                    # Classify outcome
+                    outcome = classify_orderbook_result(ob, error=None)
+                    outcome = SeedOutcome(
+                        token_id=token_id,
+                        kind=outcome.kind,
+                        error_detail=outcome.error_detail,
+                    )
+                    if ob and ob.has_valid_book:
+                        wss_client.update_cache(token_id, ob)
+                    return outcome, stats
+                except Exception as e:
+                    # Classify exception
+                    outcome = classify_orderbook_result(None, error=e)
+                    outcome = SeedOutcome(
+                        token_id=token_id,
+                        kind=outcome.kind,
+                        error_detail=outcome.error_detail,
+                    )
+                    return outcome, RestCallStats()
 
         try:
             async with asyncio.timeout(self.config.seed_timeout):
-                tasks = [seed_one(tid) for tid in to_seed]
+                tasks = [seed_one(tid) for tid in to_rest_seed]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                for r in results:
+                for i, r in enumerate(results):
                     if isinstance(r, Exception):
-                        errors += 1
+                        # Unexpected exception from gather itself
+                        outcome = SeedOutcome(
+                            token_id=to_rest_seed[i],
+                            kind=SeedOutcomeKind.FAILED_UNEXPECTED,
+                            error_detail=f"{type(r).__name__}: {r}",
+                        )
+                        outcome_stats.add(outcome)
                     elif isinstance(r, tuple):
-                        success, stats = r
-                        if success:
-                            seeded += 1
-                        else:
-                            errors += 1
+                        outcome, stats = r
+                        outcome_stats.add(outcome)
+                        if outcome.is_success:
+                            seed_from_rest += 1
+                        # Update skiplist for unseedable tokens
+                        if skiplist and outcome.is_unseedable:
+                            skiplist.add(outcome)  # Pass full SeedOutcome object
                         # Aggregate retry stats
                         total_retries += stats.retry_count
                         total_429 += stats.http_429_count
                         total_5xx += stats.http_5xx_count
-                    else:
-                        errors += 1
         except TimeoutError:
             logger.warning(f"Cache seeding timed out after {self.config.seed_timeout}s")
-            # Count unfinished tasks as errors
-            errors = len(to_seed) - seeded
+            # Mark remaining as failed_unexpected
+            completed = outcome_stats.total
+            for tid in to_rest_seed[completed:]:
+                outcome = SeedOutcome(
+                    token_id=tid,
+                    kind=SeedOutcomeKind.FAILED_UNEXPECTED,
+                    error_detail="Seeding timeout",
+                )
+                outcome_stats.add(outcome)
+
+        # Save skiplist if updated
+        if skiplist and skiplist.dirty:
+            skiplist.save()
+            logger.info(f"Updated seed skiplist with {len(skiplist)} entries")
 
         duration = self.clock.monotonic() - start_time
         self._seeded = True
 
+        # Build result with Phase 5.9 fields
+        total_succeeded = seed_from_wss + seed_from_rest
+        # Legacy errors field = unseedable + failed_unexpected (for backward compat)
+        legacy_errors = outcome_stats.unseedable + outcome_stats.failed_unexpected
+
         result = SeedResult(
             attempted=len(to_seed),
-            succeeded=seeded,
-            rest_calls=len(to_seed),  # Each attempt = 1 REST call
+            succeeded=total_succeeded,
+            rest_calls=len(to_rest_seed),  # Only REST calls, not WSS-seeded
             duration_seconds=duration,
-            errors=errors,
+            errors=legacy_errors,  # Kept for backward compat
             # Phase 5.8: Retry metrics
             retry_calls=total_retries,
             http_429_count=total_429,
             http_5xx_count=total_5xx,
+            # Phase 5.9: Seed taxonomy fields
+            seed_from_wss=seed_from_wss,
+            seed_from_rest=seed_from_rest,
+            seed_unseedable=outcome_stats.unseedable,
+            seed_failed_unexpected=outcome_stats.failed_unexpected,
+            seed_unseedable_kinds=dict(outcome_stats.kinds),
+            # Phase 6.0: Skiplist metrics
+            seed_skipped_skiplist=seed_skipped_skiplist,
+            seed_candidates_total=seed_candidates_total,
         )
 
         logger.info(
-            f"Cache seeding completed: {seeded}/{len(to_seed)} tokens cached "
-            f"in {duration:.1f}s (rest_seed={result.rest_calls}, retries={total_retries})"
+            f"Cache seeding completed: {total_succeeded}/{len(to_seed)} "
+            f"(wss={seed_from_wss}, rest={seed_from_rest}, unseedable={outcome_stats.unseedable}, "
+            f"failed={outcome_stats.failed_unexpected}, skiplist={seed_skipped_skiplist}) in {duration:.1f}s"
         )
         return result
 
@@ -1130,14 +1360,23 @@ class DaemonRunner:
             else 0.0
         )
 
-        # Phase 5.7: Get seeding metrics if available
+        # Phase 5.7/5.9/6.0: Get seeding metrics if available
         seed_result = self._seed_result
         seed_attempted = seed_result.attempted if seed_result else 0
         seed_succeeded = seed_result.succeeded if seed_result else 0
         seed_duration = seed_result.duration_seconds if seed_result else 0.0
         seed_errors = seed_result.errors if seed_result else 0
+        # Phase 5.9: Seed taxonomy fields
+        seed_from_wss = seed_result.seed_from_wss if seed_result else 0
+        seed_from_rest = seed_result.seed_from_rest if seed_result else 0
+        seed_unseedable = seed_result.seed_unseedable if seed_result else 0
+        seed_failed_unexpected = seed_result.seed_failed_unexpected if seed_result else 0
+        seed_unseedable_kinds = seed_result.seed_unseedable_kinds if seed_result else {}
+        # Phase 6.0: Skiplist metrics
+        seed_skipped_skiplist = seed_result.seed_skipped_skiplist if seed_result else 0
+        seed_candidates_total = seed_result.seed_candidates_total if seed_result else 0
 
-        # Export coverage JSON (Phase 5.7 schema)
+        # Export coverage JSON (Phase 5.9 schema)
         coverage_path = export_dir / f"coverage_{date_str}.json"
         coverage_data = {
             "date": stats.date,
@@ -1160,11 +1399,20 @@ class DaemonRunner:
             # Phase 5.6/5.7: Seeding and total
             "rest_seed": stats.total_rest_seed,
             "rest_total": rest_total,
-            # Phase 5.7: Seeding details
+            # Phase 5.7/5.9: Seeding details
             "seed_attempted": seed_attempted,
             "seed_succeeded": seed_succeeded,
             "seed_duration_seconds": seed_duration,
-            "seed_errors": seed_errors,
+            "seed_errors": seed_errors,  # Legacy: unseedable + failed_unexpected
+            # Phase 5.9: Seed taxonomy
+            "seed_from_wss": seed_from_wss,
+            "seed_from_rest": seed_from_rest,
+            "seed_unseedable": seed_unseedable,
+            "seed_failed_unexpected": seed_failed_unexpected,
+            "seed_unseedable_kinds": seed_unseedable_kinds,
+            # Phase 6.0: Skiplist metrics
+            "seed_skipped_skiplist": seed_skipped_skiplist,
+            "seed_candidates_total": seed_candidates_total,
             # Phase 5.6: Two coverage metrics
             "coverage_effective_pct": coverage_effective_pct,
             "coverage_raw_pct": wss_coverage_pct,
@@ -1254,17 +1502,29 @@ class DaemonRunner:
         # Export markdown summary (Phase 5.7)
         md_path = export_dir / f"daemon_summary_{date_str}.md"
 
-        # Phase 5.7/5.8: Cache seeding section
+        # Phase 5.9/6.0: Cache seeding section with taxonomy
         seed_retries = seed_result.retry_calls if seed_result else 0
         seed_section = ""
-        if seed_attempted > 0:
-            seed_section = f"""## Cache Seeding (Phase 5.8)
+        if seed_attempted > 0 or seed_skipped_skiplist > 0:
+            # Build unseedable kinds breakdown
+            kinds_breakdown = ""
+            if seed_unseedable_kinds:
+                kinds_lines = [f"  - {k}: {v}" for k, v in seed_unseedable_kinds.items() if v > 0]
+                if kinds_lines:
+                    kinds_breakdown = "\n" + "\n".join(kinds_lines)
+            seed_section = f"""## Cache Seeding (Phase 6.0)
+- **Candidates Total:** {seed_candidates_total:,}
+- **Skipped (Skiplist):** {seed_skipped_skiplist:,}
 - **Attempted:** {seed_attempted:,}
 - **Succeeded:** {seed_succeeded:,}
+  - From WSS: {seed_from_wss:,}
+  - From REST: {seed_from_rest:,}
 - **Duration:** {seed_duration:.1f}s
 - **REST Calls:** {stats.total_rest_seed:,}
 - **Retries:** {seed_retries:,}
-- **Errors:** {seed_errors:,}
+- **Unseedable:** {seed_unseedable:,} (expected, non-retryable){kinds_breakdown}
+- **Failed Unexpected:** {seed_failed_unexpected:,}
+- **Legacy Errors:** {seed_errors:,}
 
 """
 
@@ -1316,7 +1576,7 @@ class DaemonRunner:
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon (Phase 5.8)*
+*Generated by pmq ops daemon (Phase 6.0)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)

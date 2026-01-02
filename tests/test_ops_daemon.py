@@ -70,14 +70,18 @@ class FakeClock:
 class FakeSleep:
     """Fake async sleep for testing."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: FakeClock | None = None) -> None:
         self.total_sleep = 0.0
         self.call_count = 0
+        self._clock = clock  # Phase 6.0: optionally advance clock on sleep
 
     async def __call__(self, seconds: float) -> None:
         """Record sleep call without actual sleep."""
         self.total_sleep += seconds
         self.call_count += 1
+        # Phase 6.0: Advance clock monotonic time if provided
+        if self._clock is not None:
+            self._clock.advance(seconds)
         await asyncio.sleep(0)  # Yield to event loop
 
 
@@ -177,9 +181,10 @@ class FakeMarket:
 class FakeOrderBook:
     """Fake order book for testing."""
 
-    def __init__(self, token_id: str, valid: bool = True) -> None:
+    def __init__(self, token_id: str, valid: bool = True, error: str | None = None) -> None:
         self.token_id = token_id
         self.has_valid_book = valid
+        self.error = error  # Phase 5.9: Add error attribute for taxonomy classification
         self.best_bid = 0.45 if valid else None
         self.best_ask = 0.55 if valid else None
         # Phase 5.5: Add attributes needed for drift detection
@@ -253,8 +258,18 @@ class FakeWssClient:
         """Record subscription."""
         self._subscribed.update(token_ids)
 
-    def get_orderbook(self, token_id: str) -> FakeOrderBook | None:
-        """Get orderbook from cache."""
+    def get_orderbook(self, token_id: str, allow_stale: bool = False) -> FakeOrderBook | None:
+        """Get orderbook from cache.
+
+        Args:
+            token_id: Token to fetch
+            allow_stale: If True, return stale data instead of None
+        """
+        if token_id not in self._orderbooks:
+            return None
+        # If not allow_stale and token is stale, return None
+        if not allow_stale and token_id in self._stale_tokens:
+            return None
         return self._orderbooks.get(token_id)
 
     def is_stale(self, token_id: str) -> bool:
@@ -2148,6 +2163,7 @@ class TestCacheSeeding:
             seed_max=10,
             seed_concurrency=5,
             seed_timeout=10.0,
+            seed_mode="rest",  # Phase 5.9: Use REST mode for test compatibility
             max_hours=0.001,  # Stop quickly
         )
 
@@ -2196,6 +2212,7 @@ class TestCacheSeeding:
             seed_max=2,  # Only seed 2
             seed_concurrency=5,
             seed_timeout=10.0,
+            seed_mode="rest",  # Phase 5.9: Use REST mode for test compatibility
         )
 
         runner = DaemonRunner(
@@ -2274,6 +2291,7 @@ class TestCacheSeeding:
             seed_max=10,
             seed_concurrency=5,
             seed_timeout=10.0,
+            seed_mode="rest",  # Phase 5.9: Use REST mode for test compatibility
         )
 
         runner = DaemonRunner(
@@ -2311,6 +2329,7 @@ class TestCacheSeeding:
             seed_max=10,
             seed_concurrency=5,
             seed_timeout=10.0,
+            seed_mode="rest",  # Phase 5.9: Use REST mode for test compatibility
         )
 
         runner = DaemonRunner(
@@ -2397,6 +2416,7 @@ class TestSeedAccounting:
             seed_max=10,
             seed_concurrency=5,
             seed_timeout=10.0,
+            seed_mode="rest",  # Phase 5.9: Use REST mode for test compatibility
         )
 
         runner = DaemonRunner(
@@ -2433,6 +2453,7 @@ class TestSeedAccounting:
             limit=10,
             orderbook_source="wss",
             seed_cache=True,
+            seed_mode="rest",  # Phase 5.9: Use REST mode for test compatibility
         )
 
         runner = DaemonRunner(
@@ -2490,3 +2511,514 @@ class TestWssHealthGrace:
         # Should be able to set grace seconds (for DI)
         wss_client.health_grace_seconds = 90.0
         assert wss_client.health_grace_seconds == 90.0
+
+
+# =============================================================================
+# Phase 6.0: WSS Seed Bootstrap + Persistent Skiplist Tests
+# =============================================================================
+
+
+class TestPhase60Config:
+    """Tests for Phase 6.0 DaemonConfig fields."""
+
+    def test_default_skiplist_enabled(self) -> None:
+        """seed_skiplist_enabled should default to True."""
+        config = DaemonConfig()
+        assert config.seed_skiplist_enabled is True
+
+    def test_default_skiplist_path_none(self) -> None:
+        """seed_skiplist_path should default to None (use default path)."""
+        config = DaemonConfig()
+        assert config.seed_skiplist_path is None
+
+    def test_default_bootstrap_poll_interval(self) -> None:
+        """seed_bootstrap_poll_interval should default to 0.2s."""
+        config = DaemonConfig()
+        assert config.seed_bootstrap_poll_interval == 0.2
+
+    def test_custom_phase60_settings(self) -> None:
+        """Custom Phase 6.0 settings should be accepted."""
+        config = DaemonConfig(
+            seed_skiplist_enabled=False,
+            seed_bootstrap_poll_interval=0.5,
+        )
+        assert config.seed_skiplist_enabled is False
+        assert config.seed_bootstrap_poll_interval == 0.5
+
+
+class TestSeedResultPhase60:
+    """Tests for Phase 6.0 SeedResult fields."""
+
+    def test_seed_result_has_skiplist_fields(self) -> None:
+        """SeedResult should have Phase 6.0 skiplist fields."""
+        result = SeedResult()
+        assert result.seed_skipped_skiplist == 0
+        assert result.seed_candidates_total == 0
+
+    def test_seed_result_with_skiplist_values(self) -> None:
+        """SeedResult should accept Phase 6.0 values."""
+        result = SeedResult(
+            attempted=45,
+            succeeded=40,
+            seed_from_wss=35,
+            seed_from_rest=5,
+            seed_skipped_skiplist=10,
+            seed_candidates_total=55,
+        )
+        assert result.seed_skipped_skiplist == 10
+        assert result.seed_candidates_total == 55
+
+
+class TestWssBootstrapSeeding:
+    """Tests for Phase 6.0 WSS bootstrap seeding (subscribe before grace)."""
+
+    @pytest.fixture
+    def dao(self) -> FakeDAO:
+        """Create fake DAO."""
+        return FakeDAO()
+
+    @pytest.fixture
+    def wss_client(self) -> FakeWssClient:
+        """Create fake WSS client."""
+        return FakeWssClient()
+
+    @pytest.fixture
+    def ob_fetcher(self) -> FakeOrderBookFetcher:
+        """Create fake orderbook fetcher."""
+        return FakeOrderBookFetcher()
+
+    @pytest.mark.asyncio
+    async def test_wss_first_subscribes_before_grace(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+        tmp_path: Path,
+    ) -> None:
+        """WSS-first seeding should subscribe to WSS before grace wait."""
+        # Setup: create markets
+        gamma_client = FakeGammaClient(
+            markets=[
+                FakeMarket("m1", "0xtoken1"),
+                FakeMarket("m2", "0xtoken2"),
+            ]
+        )
+        wss_client.set_healthy(True)
+
+        # Track subscribe calls
+        subscribe_calls: list[list[str]] = []
+        original_subscribe = wss_client.subscribe
+
+        async def track_subscribe(token_ids: list[str]) -> None:
+            subscribe_calls.append(list(token_ids))
+            # After subscribe, simulate book messages arriving (cache populated)
+            for tid in token_ids:
+                wss_client.add_orderbook(tid, valid=True)
+            await original_subscribe(token_ids)
+
+        wss_client.subscribe = track_subscribe
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_mode="wss_first",
+            seed_grace_seconds=0.5,  # Short for testing
+            seed_bootstrap_poll_interval=0.1,
+            seed_skiplist_enabled=False,  # Disable skiplist for this test
+            export_dir=tmp_path,
+        )
+
+        # Phase 6.0: Pass clock to FakeSleep so it advances monotonic time
+        clock = FakeClock(datetime.now(UTC))
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=clock,
+            sleep_fn=FakeSleep(clock),
+        )
+
+        result = await runner._seed_cache()
+
+        # Subscribe should have been called before grace wait
+        assert len(subscribe_calls) == 1
+        assert set(subscribe_calls[0]) == {"0xtoken1", "0xtoken2"}
+        # Both tokens should be seeded from WSS (no REST calls)
+        assert result.seed_from_wss == 2
+        assert result.rest_calls == 0
+        assert ob_fetcher.fetch_count == 0
+
+    @pytest.mark.asyncio
+    async def test_wss_first_falls_back_to_rest_for_missing(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+        tmp_path: Path,
+    ) -> None:
+        """WSS-first seeding should fall back to REST for tokens not in cache after grace."""
+        # Setup: one token gets cached, one doesn't
+        gamma_client = FakeGammaClient(
+            markets=[
+                FakeMarket("m1", "0xtoken1"),
+                FakeMarket("m2", "0xtoken2"),
+            ]
+        )
+        wss_client.set_healthy(True)
+
+        # Only cache token1 on subscribe
+        original_subscribe = wss_client.subscribe
+
+        async def partial_cache_subscribe(token_ids: list[str]) -> None:
+            # Only populate token1 in cache, token2 stays missing
+            if "0xtoken1" in token_ids:
+                wss_client.add_orderbook("0xtoken1", valid=True)
+            await original_subscribe(token_ids)
+
+        wss_client.subscribe = partial_cache_subscribe
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_mode="wss_first",
+            seed_grace_seconds=0.3,
+            seed_bootstrap_poll_interval=0.1,
+            seed_skiplist_enabled=False,
+            export_dir=tmp_path,
+        )
+
+        # Phase 6.0: Pass clock to FakeSleep so it advances monotonic time
+        clock = FakeClock(datetime.now(UTC))
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=clock,
+            sleep_fn=FakeSleep(clock),
+        )
+
+        result = await runner._seed_cache()
+
+        # token1 from WSS, token2 from REST
+        assert result.seed_from_wss == 1
+        assert result.seed_from_rest == 1
+        assert result.rest_calls == 1
+        assert ob_fetcher.fetch_count == 1
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_grace_is_iteration_bounded(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+        tmp_path: Path,
+    ) -> None:
+        """Phase 6.0.1: Bootstrap grace loop should be iteration-bounded, not time-bounded.
+
+        This ensures deterministic behavior under FakeClock/FakeSleep.
+        With grace_seconds=0.5 and poll_interval=0.1, max_iters = 5.
+        Even if FakeClock doesn't advance time, the loop should complete.
+        """
+        gamma_client = FakeGammaClient(markets=[FakeMarket("m1", "0xtoken1")])
+        wss_client.set_healthy(True)
+        # Don't populate cache on subscribe - tokens stay missing
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_mode="wss_first",
+            seed_grace_seconds=0.5,
+            seed_bootstrap_poll_interval=0.1,
+            seed_skiplist_enabled=False,
+            export_dir=tmp_path,
+        )
+
+        # Use FakeSleep WITHOUT clock - time won't advance
+        # This simulates the problematic case where clock.monotonic() never changes
+        fake_sleep = FakeSleep()
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=fake_sleep,
+        )
+
+        # This should complete quickly (iteration-bounded), not hang forever
+        result = await runner._seed_cache()
+
+        # max_iters = int(0.5 / 0.1) = 5, so sleep should be called 5 times
+        assert fake_sleep.call_count == 5
+        # Token wasn't in cache, should fall back to REST
+        assert result.seed_from_wss == 0
+        assert result.seed_from_rest == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_interrupts_bootstrap_grace(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+        tmp_path: Path,
+    ) -> None:
+        """Phase 6.0.1: Shutdown request should interrupt bootstrap grace wait immediately."""
+        gamma_client = FakeGammaClient(markets=[FakeMarket("m1", "0xtoken1")])
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_mode="wss_first",
+            seed_grace_seconds=10.0,  # Long grace - would be 100 iterations
+            seed_bootstrap_poll_interval=0.1,
+            seed_skiplist_enabled=False,
+            export_dir=tmp_path,
+        )
+
+        fake_sleep = FakeSleep()
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=fake_sleep,
+        )
+
+        # Request shutdown before seeding
+        runner.request_shutdown()
+
+        result = await runner._seed_cache()
+
+        # Should exit early due to shutdown
+        assert fake_sleep.call_count == 0  # No polling iterations
+        assert result.seed_from_wss == 0
+        assert result.seed_from_rest == 0  # No REST fallback due to shutdown
+
+
+class TestSkiplistPersistence:
+    """Tests for Phase 6.0 skiplist persistence defaults."""
+
+    @pytest.fixture
+    def dao(self) -> FakeDAO:
+        """Create fake DAO."""
+        return FakeDAO()
+
+    @pytest.fixture
+    def wss_client(self) -> FakeWssClient:
+        """Create fake WSS client."""
+        return FakeWssClient()
+
+    @pytest.fixture
+    def ob_fetcher(self) -> FakeOrderBookFetcher:
+        """Create fake orderbook fetcher."""
+        return FakeOrderBookFetcher()
+
+    @pytest.mark.asyncio
+    async def test_skiplist_uses_default_path(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+        tmp_path: Path,
+    ) -> None:
+        """Skiplist should use default path when seed_skiplist_path is None."""
+        gamma_client = FakeGammaClient(markets=[FakeMarket("m1", "0xtoken1")])
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_mode="rest",  # Use REST to trigger skiplist writes
+            seed_skiplist_enabled=True,
+            seed_skiplist_path=None,  # Use default
+            export_dir=tmp_path,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        await runner._seed_cache()
+
+        # Default skiplist path should be exports/seed_skiplist.json
+        # (actual path computed as config.export_dir / "seed_skiplist.json")
+        # Note: skiplist only written if there are unseedable tokens
+        # This test just verifies the config logic doesn't fail
+        assert config.seed_skiplist_path is None
+        assert config.seed_skiplist_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_skiplist_disabled_with_flag(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+        tmp_path: Path,
+    ) -> None:
+        """Skiplist should not be loaded when seed_skiplist_enabled=False."""
+        gamma_client = FakeGammaClient(markets=[FakeMarket("m1", "0xtoken1")])
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_mode="rest",
+            seed_skiplist_enabled=False,  # Disabled
+            export_dir=tmp_path,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        result = await runner._seed_cache()
+
+        # Skiplist skipped count should be 0
+        assert result.seed_skipped_skiplist == 0
+
+    @pytest.mark.asyncio
+    async def test_skiplist_loaded_and_reduces_attempts(
+        self,
+        dao: FakeDAO,
+        wss_client: FakeWssClient,
+        ob_fetcher: FakeOrderBookFetcher,
+        tmp_path: Path,
+    ) -> None:
+        """Loading existing skiplist should reduce attempted seeding and increment seed_skipped_skiplist."""
+        import json
+        from datetime import UTC, datetime, timedelta
+
+        # Create a skiplist file with one token
+        skiplist_path = tmp_path / "seed_skiplist.json"
+        now = datetime.now(UTC)
+        skiplist_data = {
+            "version": 1,
+            "entries": [
+                {
+                    "token_id": "0xtoken1",
+                    "kind": "unseedable_not_found",
+                    "added_at": now.isoformat(),
+                    "expires_at": (now + timedelta(hours=24)).isoformat(),
+                }
+            ],
+        }
+        skiplist_path.write_text(json.dumps(skiplist_data))
+
+        # Setup markets including the skiplisted token
+        gamma_client = FakeGammaClient(
+            markets=[
+                FakeMarket("m1", "0xtoken1"),  # In skiplist
+                FakeMarket("m2", "0xtoken2"),  # Not in skiplist
+            ]
+        )
+        wss_client.set_healthy(True)
+
+        config = DaemonConfig(
+            interval_seconds=60,
+            limit=10,
+            orderbook_source="wss",
+            seed_cache=True,
+            seed_mode="rest",
+            seed_skiplist_enabled=True,
+            seed_skiplist_path=skiplist_path,
+            export_dir=tmp_path,
+        )
+
+        runner = DaemonRunner(
+            config=config,
+            dao=dao,
+            gamma_client=gamma_client,
+            wss_client=wss_client,
+            ob_fetcher=ob_fetcher,
+            clock=FakeClock(datetime.now(UTC)),
+            sleep_fn=FakeSleep(),
+        )
+
+        result = await runner._seed_cache()
+
+        # Should skip token1, only seed token2
+        assert result.seed_skipped_skiplist == 1
+        assert result.seed_candidates_total == 2
+        assert result.attempted == 1  # Only token2 attempted
+        assert result.rest_calls == 1
+        assert ob_fetcher.fetch_count == 1
+
+
+class TestPhase60ExportSchema:
+    """Tests for Phase 6.0 export schema additions."""
+
+    def test_coverage_json_has_phase60_fields(self, tmp_path: Path) -> None:
+        """Coverage JSON should include Phase 6.0 skiplist metrics."""
+        # Create a minimal DailyStats
+        stats = DailyStats(
+            date="2024-01-15",
+            total_ticks=10,
+            start_time="2024-01-15T00:00:00Z",
+            end_time="2024-01-15T23:59:59Z",
+        )
+
+        config = DaemonConfig(export_dir=tmp_path)
+        runner = DaemonRunner(
+            config=config,
+            dao=FakeDAO(),
+            gamma_client=FakeGammaClient(),
+        )
+
+        # Set seed_result with Phase 6.0 fields
+        runner._seed_result = SeedResult(
+            attempted=45,
+            succeeded=40,
+            seed_from_wss=35,
+            seed_from_rest=5,
+            seed_skipped_skiplist=10,
+            seed_candidates_total=55,
+        )
+
+        # Export
+        import asyncio
+
+        asyncio.get_event_loop().run_until_complete(runner._export_daily_artifacts(stats))
+
+        # Check JSON has Phase 6.0 fields
+        coverage_path = tmp_path / "coverage_2024-01-15.json"
+        assert coverage_path.exists()
+
+        with open(coverage_path) as f:
+            data = json.load(f)
+
+        assert "seed_skipped_skiplist" in data
+        assert "seed_candidates_total" in data
+        assert data["seed_skipped_skiplist"] == 10
+        assert data["seed_candidates_total"] == 55

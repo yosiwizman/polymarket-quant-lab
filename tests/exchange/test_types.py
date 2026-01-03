@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import pytest
-
 from pmq.exchange.types import (
     AccountBalance,
     Exchange,
     MarketRef,
-    Orderbook,
     OrderAction,
+    Orderbook,
     OrderRequest,
     OrderResponse,
     OrderSide,

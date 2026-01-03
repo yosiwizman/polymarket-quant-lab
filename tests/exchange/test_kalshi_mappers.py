@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
-
 from pmq.exchange.kalshi.mappers import (
     map_kalshi_balance,
     map_kalshi_market,
-    map_kalshi_orderbook,
     map_kalshi_order_response,
+    map_kalshi_orderbook,
     map_kalshi_position,
     to_kalshi_order_params,
 )

@@ -1,12 +1,17 @@
 """Tests for paper execution module.
 
 Phase 6.1: Unit tests for PaperExecutor with mocked dependencies.
+Phase 6.2: Unit tests for explain mode, rejection taxonomy, and exports.
+
 Tests cover:
 - Paper execution disabled → no trades executed
 - Paper execution enabled → signals detected and trades executed
 - Risk gate blocks trades when not approved / limits exceeded
 - max_trades_per_tick enforced
 - Minimum edge filtering
+- Explain mode with rejection reasons
+- ExplainCandidate serialization
+- ExplainSummary aggregation
 """
 
 from __future__ import annotations
@@ -16,7 +21,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from pmq.models import ArbitrageSignal
-from pmq.ops.paper_exec import PaperExecConfig, PaperExecResult, PaperExecutor
+from pmq.ops.paper_exec import (
+    ExplainCandidate,
+    ExplainSummary,
+    PaperExecConfig,
+    PaperExecResult,
+    PaperExecutor,
+    RejectionReason,
+)
 
 # =============================================================================
 # Mock Implementations
@@ -702,3 +714,224 @@ class TestPaperExecutorHelpers:
         stats = executor.get_stats()
         assert "total_trades" in stats
         assert "total_notional" in stats
+
+
+# =============================================================================
+# Tests: Phase 6.2 - Explain Mode
+# =============================================================================
+
+
+class TestRejectionReason:
+    """Tests for RejectionReason enum."""
+
+    def test_enum_values_exist(self) -> None:
+        """All rejection reason variants should exist."""
+        assert RejectionReason.EXECUTED is not None
+        assert RejectionReason.NO_SIGNAL is not None
+        assert RejectionReason.EDGE_BELOW_MIN is not None
+        assert RejectionReason.LIQUIDITY_BELOW_MIN is not None
+        assert RejectionReason.SPREAD_ABOVE_MAX is not None
+        assert RejectionReason.MARKET_INACTIVE is not None
+        assert RejectionReason.MARKET_CLOSED is not None
+        assert RejectionReason.RISK_NOT_APPROVED is not None
+        assert RejectionReason.RISK_POSITION_LIMIT is not None
+        assert RejectionReason.RISK_NOTIONAL_LIMIT is not None
+        assert RejectionReason.RISK_BLOCKED is not None
+        assert RejectionReason.SAFETY_ERROR is not None
+        assert RejectionReason.MAX_TRADES_PER_TICK is not None
+
+    def test_enum_string_values(self) -> None:
+        """Enum values should be descriptive strings."""
+        assert RejectionReason.EDGE_BELOW_MIN.value == "edge_below_min"
+        assert RejectionReason.LIQUIDITY_BELOW_MIN.value == "liquidity_below_min"
+        assert RejectionReason.EXECUTED.value == "executed"
+
+
+class TestExplainCandidate:
+    """Tests for ExplainCandidate dataclass."""
+
+    def test_to_dict_basic(self) -> None:
+        """to_dict should return serializable dictionary."""
+        candidate = ExplainCandidate(
+            market_id="test-market-123",
+            token_id="token-yes-456",
+            side="YES",
+            edge_bps=75.5,
+            spread_bps=20.0,
+            liquidity=5000.0,
+            mid_price=0.45,
+            rejection_reason=RejectionReason.EDGE_BELOW_MIN,
+        )
+
+        result = candidate.to_dict()
+
+        assert result["market_id"] == "test-market-123"
+        assert result["token_id"] == "token-yes-456"
+        assert result["side"] == "YES"
+        assert result["edge_bps"] == 75.5
+        assert result["spread_bps"] == 20.0
+        assert result["liquidity"] == 5000.0
+        assert result["mid_price"] == 0.45
+        assert result["rejection_reason"] == "edge_below_min"
+
+    def test_to_dict_executed_candidate(self) -> None:
+        """Executed candidates should have rejection_reason = executed."""
+        candidate = ExplainCandidate(
+            market_id="m1",
+            token_id="t1",
+            side="NO",
+            edge_bps=150.0,
+            spread_bps=10.0,
+            liquidity=10000.0,
+            mid_price=0.55,
+            rejection_reason=RejectionReason.EXECUTED,
+        )
+
+        result = candidate.to_dict()
+        assert result["rejection_reason"] == "executed"
+
+    def test_to_dict_with_market_question(self) -> None:
+        """to_dict should include optional market_question."""
+        candidate = ExplainCandidate(
+            market_id="m1",
+            token_id="t1",
+            side="YES",
+            edge_bps=100.0,
+            spread_bps=15.0,
+            liquidity=8000.0,
+            mid_price=0.50,
+            rejection_reason=RejectionReason.LIQUIDITY_BELOW_MIN,
+            market_question="Will X happen?",
+        )
+
+        result = candidate.to_dict()
+        assert result["market_question"] == "Will X happen?"
+
+
+class TestExplainSummary:
+    """Tests for ExplainSummary dataclass."""
+
+    def test_from_results_empty(self) -> None:
+        """from_results should handle empty results list."""
+        summary = ExplainSummary.from_results([])
+
+        assert summary.total_ticks == 0
+        assert summary.total_candidates == 0
+        assert summary.total_executed == 0
+        assert summary.rejection_counts == {}
+        assert summary.avg_top_edge_bps == 0.0
+        assert summary.ticks_with_candidates_above_min_edge == 0
+
+    def test_from_results_with_data(self) -> None:
+        """from_results should aggregate rejection counts correctly."""
+        # Create mock results with explain data
+        result1 = PaperExecResult(
+            signals_found=3,
+            trades_executed=1,
+            explain_candidates=[
+                ExplainCandidate(
+                    market_id="m1",
+                    token_id="t1",
+                    side="YES",
+                    edge_bps=120.0,
+                    spread_bps=10.0,
+                    liquidity=5000.0,
+                    mid_price=0.5,
+                    rejection_reason=RejectionReason.EXECUTED,
+                ),
+                ExplainCandidate(
+                    market_id="m2",
+                    token_id="t2",
+                    side="YES",
+                    edge_bps=30.0,
+                    spread_bps=10.0,
+                    liquidity=5000.0,
+                    mid_price=0.5,
+                    rejection_reason=RejectionReason.EDGE_BELOW_MIN,
+                ),
+            ],
+            rejection_counts={"executed": 1, "edge_below_min": 1},
+        )
+
+        result2 = PaperExecResult(
+            signals_found=2,
+            trades_executed=0,
+            explain_candidates=[
+                ExplainCandidate(
+                    market_id="m3",
+                    token_id="t3",
+                    side="NO",
+                    edge_bps=45.0,
+                    spread_bps=10.0,
+                    liquidity=500.0,
+                    mid_price=0.5,
+                    rejection_reason=RejectionReason.LIQUIDITY_BELOW_MIN,
+                ),
+            ],
+            rejection_counts={"liquidity_below_min": 1},
+        )
+
+        summary = ExplainSummary.from_results([result1, result2])
+
+        assert summary.total_ticks == 2
+        assert summary.total_candidates == 3
+        assert summary.total_executed == 1
+        assert summary.rejection_counts["executed"] == 1
+        assert summary.rejection_counts["edge_below_min"] == 1
+        assert summary.rejection_counts["liquidity_below_min"] == 1
+
+
+class TestPaperExecConfigExplain:
+    """Tests for PaperExecConfig explain mode fields."""
+
+    def test_explain_defaults(self) -> None:
+        """Explain mode should be disabled by default."""
+        config = PaperExecConfig()
+        assert config.explain_enabled is False
+        assert config.explain_top_n == 10
+        assert config.explain_export_path is None
+
+    def test_explain_custom_values(self) -> None:
+        """Explain mode should accept custom values."""
+        config = PaperExecConfig(
+            explain_enabled=True,
+            explain_top_n=25,
+            explain_export_path="exports/test.jsonl",
+        )
+        assert config.explain_enabled is True
+        assert config.explain_top_n == 25
+        assert config.explain_export_path == "exports/test.jsonl"
+
+
+class TestPaperExecResultExplain:
+    """Tests for PaperExecResult explain mode fields."""
+
+    def test_result_explain_defaults(self) -> None:
+        """Result should have empty explain fields by default."""
+        result = PaperExecResult()
+        assert result.explain_candidates == []
+        assert result.rejection_counts == {}
+
+    def test_result_with_explain_data(self) -> None:
+        """Result should store explain candidates and counts."""
+        candidates = [
+            ExplainCandidate(
+                market_id="m1",
+                token_id="t1",
+                side="YES",
+                edge_bps=100.0,
+                spread_bps=10.0,
+                liquidity=5000.0,
+                mid_price=0.5,
+                rejection_reason=RejectionReason.EXECUTED,
+            ),
+        ]
+        counts = {"executed": 1}
+
+        result = PaperExecResult(
+            explain_candidates=candidates,
+            rejection_counts=counts,
+        )
+
+        assert len(result.explain_candidates) == 1
+        assert result.rejection_counts["executed"] == 1

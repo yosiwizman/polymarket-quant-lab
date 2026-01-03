@@ -332,7 +332,9 @@ class DaemonConfig:
     paper_exec_require_approval: bool = True  # Require governance approval
     paper_exec_strategy_name: str = "paper_exec"  # Strategy name for governance
     # Phase 6.2: Paper exec explain mode settings
-    paper_exec_explain: bool = False  # Enable explain mode (capture all candidates, disabled by default)
+    paper_exec_explain: bool = (
+        False  # Enable explain mode (capture all candidates, disabled by default)
+    )
     paper_exec_explain_top_n: int = 10  # Number of top candidates to track per tick
     paper_exec_explain_export_path: Path | None = None  # JSONL export path (None = auto)
 
@@ -1239,9 +1241,8 @@ class DaemonRunner:
                 tick_stats.paper_explain_top_edge_bps = result.explain_candidates[0].edge_bps
 
                 # Export tick to JSONL
-                export_path = (
-                    self.config.paper_exec_explain_export_path
-                    or get_default_export_path(self.config.export_dir)
+                export_path = self.config.paper_exec_explain_export_path or get_default_export_path(
+                    self.config.export_dir
                 )
                 write_explain_tick(
                     export_path=export_path,
@@ -1732,8 +1733,7 @@ class DaemonRunner:
                     reverse=True,
                 )
                 rejection_lines = "\n".join(
-                    f"  - {reason}: {count:,}"
-                    for reason, count in sorted_rejections[:10]
+                    f"  - {reason}: {count:,}" for reason, count in sorted_rejections[:10]
                 )
                 rejection_lines = f"\n{rejection_lines}"
 

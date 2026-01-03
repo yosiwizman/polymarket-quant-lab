@@ -351,7 +351,11 @@ class PaperExecutor:
         for signal in arb_signals:
             market_data = markets_lookup.get(signal.market_id, {})
             edge_bps = signal.profit_potential * 10000
-            mid_price = (signal.yes_price + signal.no_price) / 2 if signal.yes_price + signal.no_price > 0 else 0
+            mid_price = (
+                (signal.yes_price + signal.no_price) / 2
+                if signal.yes_price + signal.no_price > 0
+                else 0
+            )
 
             candidate = ExplainCandidate(
                 market_id=signal.market_id,
@@ -380,11 +384,15 @@ class PaperExecutor:
                 _count_rejection(RejectionReason.MARKET_CLOSED)
             elif signal.liquidity < min_liquidity:
                 candidate.rejection_reason = RejectionReason.LIQUIDITY_BELOW_MIN
-                candidate.rejection_detail = f"liquidity={signal.liquidity:.0f} < min={min_liquidity:.0f}"
+                candidate.rejection_detail = (
+                    f"liquidity={signal.liquidity:.0f} < min={min_liquidity:.0f}"
+                )
                 _count_rejection(RejectionReason.LIQUIDITY_BELOW_MIN)
             elif signal.profit_potential < min_edge:
                 candidate.rejection_reason = RejectionReason.EDGE_BELOW_MIN
-                candidate.rejection_detail = f"edge={edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                candidate.rejection_detail = (
+                    f"edge={edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                )
                 _count_rejection(RejectionReason.EDGE_BELOW_MIN)
             # Passed basic filters - will be evaluated for execution
 
@@ -392,7 +400,8 @@ class PaperExecutor:
 
         # Filter signals that pass basic checks for execution
         filtered_signals = [
-            sig for sig in arb_signals
+            sig
+            for sig in arb_signals
             if sig.profit_potential >= min_edge and sig.liquidity >= min_liquidity
         ]
         result.signals_evaluated = len(filtered_signals)
@@ -406,7 +415,10 @@ class PaperExecutor:
                 if trades_this_tick >= self.config.max_trades_per_tick:
                     # Mark remaining candidates as blocked by max trades
                     for cand in all_candidates:
-                        if cand.market_id == signal.market_id and cand.rejection_reason == RejectionReason.NONE:
+                        if (
+                            cand.market_id == signal.market_id
+                            and cand.rejection_reason == RejectionReason.NONE
+                        ):
                             cand.rejection_reason = RejectionReason.MAX_TRADES_PER_TICK
                             cand.rejection_detail = f"trades_this_tick={trades_this_tick} >= max={self.config.max_trades_per_tick}"
                             _count_rejection(RejectionReason.MAX_TRADES_PER_TICK)
@@ -419,7 +431,9 @@ class PaperExecutor:
                         (p.yes_quantity * p.avg_price_yes + p.no_quantity * p.avg_price_no)
                         for p in positions
                     )
-                    trade_notional = self.config.trade_quantity * (signal.yes_price + signal.no_price)
+                    trade_notional = self.config.trade_quantity * (
+                        signal.yes_price + signal.no_price
+                    )
 
                     allowed, reason = self._risk_gate.check_trade_limit(
                         market_id=signal.market_id,
@@ -434,7 +448,10 @@ class PaperExecutor:
                         result.blocked_by_risk += 1
                         # Update candidate with risk rejection
                         for cand in all_candidates:
-                            if cand.market_id == signal.market_id and cand.rejection_reason == RejectionReason.NONE:
+                            if (
+                                cand.market_id == signal.market_id
+                                and cand.rejection_reason == RejectionReason.NONE
+                            ):
                                 if "position" in reason.lower():
                                     cand.rejection_reason = RejectionReason.RISK_POSITION_LIMIT
                                 elif "notional" in reason.lower():
@@ -466,9 +483,15 @@ class PaperExecutor:
 
                     # Mark candidate as executed
                     for cand in all_candidates:
-                        if cand.market_id == signal.market_id and cand.rejection_reason == RejectionReason.NONE:
+                        if (
+                            cand.market_id == signal.market_id
+                            and cand.rejection_reason == RejectionReason.NONE
+                        ):
                             cand.executed = True
-                            cand.trade_ids = [getattr(yes_trade, "id", 0), getattr(no_trade, "id", 0)]
+                            cand.trade_ids = [
+                                getattr(yes_trade, "id", 0),
+                                getattr(no_trade, "id", 0),
+                            ]
                             _count_rejection(RejectionReason.NONE)  # Count successful executions
 
                     # Record trade in risk gate if available
@@ -487,7 +510,10 @@ class PaperExecutor:
                     result.blocked_by_safety += 1
                     # Update candidate with safety rejection
                     for cand in all_candidates:
-                        if cand.market_id == signal.market_id and cand.rejection_reason == RejectionReason.NONE:
+                        if (
+                            cand.market_id == signal.market_id
+                            and cand.rejection_reason == RejectionReason.NONE
+                        ):
                             cand.rejection_reason = RejectionReason.SAFETY_ERROR
                             cand.rejection_detail = str(e)
                             _count_rejection(RejectionReason.SAFETY_ERROR)

@@ -2997,7 +2997,7 @@ poetry run pmq ops daemon --interval 60 --live-exec --live-exec-confirm
 
 ### Credential Storage
 
-- Location: `~/.pmq/creds.json`
+- Location: `~/.pmq/creds.json` (Polymarket) or `~/.pmq/kalshi_creds.json` (Kalshi)
 - Permissions: 0600 (owner read/write only)
 - Contains: API key, secret, passphrase, funder address
 - **NEVER** committed to git
@@ -3011,6 +3011,87 @@ poetry run pmq ops daemon --interval 60 --live-exec --live-exec-confirm
 | "PRIVATE_KEY not set" | Set `$env:PRIVATE_KEY` before running |
 | "L2 auth failed" | Check: private key matches funder, credentials valid |
 | "INVALID_SIGNATURE" | Private key may be incorrect or malformed |
+
+## Exchange Abstraction Layer (Phase 13)
+
+Phase 13 adds support for multiple prediction market exchanges through a clean adapter architecture.
+
+### Supported Exchanges
+
+| Exchange | Status | Market Data | Trading | Auth Method |
+|----------|--------|-------------|---------|-------------|
+| Polymarket | ✓ Active | ✓ | ✓ | Wallet + CLOB API |
+| Kalshi | ✓ Active | ✓ | ✓ | API Key + RSA Secret |
+
+### Exchange Selection
+
+Use `--exchange` to specify which exchange to use:
+
+```powershell
+# Polymarket (default)
+poetry run pmq auth init
+poetry run pmq ops preflight
+
+# Kalshi
+poetry run pmq auth init --exchange kalshi
+poetry run pmq ops preflight --exchange kalshi
+```
+
+### Kalshi Setup
+
+#### Step 1: Get API Credentials
+
+1. Go to https://kalshi.com/account/settings
+2. Generate an API key (you'll get an API key and RSA private key)
+3. Save the RSA private key securely
+
+#### Step 2: Set Environment Variables
+
+```powershell
+$env:KALSHI_EMAIL = "your@email.com"
+$env:KALSHI_API_KEY = "your-api-key"
+$env:KALSHI_API_SECRET = "-----BEGIN RSA PRIVATE KEY-----
+...
+-----END RSA PRIVATE KEY-----"
+```
+
+#### Step 3: Initialize Credentials
+
+```powershell
+poetry run pmq auth init --exchange kalshi --yes
+```
+
+#### Step 4: Verify
+
+```powershell
+# Check credentials
+poetry run pmq auth status --exchange kalshi
+
+# Run preflight
+poetry run pmq ops preflight --exchange kalshi
+
+# Run smoke test (does NOT place orders)
+poetry run pmq ops kalshi-smoke --verbose
+```
+
+### Kalshi CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `pmq auth init --exchange kalshi` | Save Kalshi credentials from environment |
+| `pmq auth status --exchange kalshi` | Show Kalshi credential status |
+| `pmq auth wipe --exchange kalshi` | Delete Kalshi credentials |
+| `pmq ops preflight --exchange kalshi` | Test Kalshi API connectivity |
+| `pmq ops kalshi-smoke` | Comprehensive Kalshi smoke test |
+
+### Safety Warnings
+
+⚠️ **IMPORTANT**: Kalshi integration is for **connectivity testing only**.
+
+- `pmq ops kalshi-smoke` does NOT place orders
+- `pmq ops preflight --exchange kalshi` tests public endpoints only (unless `--require-auth`)
+- Live trading on Kalshi is NOT yet implemented
+- Always test with small amounts first when trading is enabled
 
 ## Project Structure
 

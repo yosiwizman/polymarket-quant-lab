@@ -2740,6 +2740,67 @@ The daemon checks for this file before every order.
 
 > 💡 **Safety First**: Start with `max_order_usd=5.0` and `max_orders_per_hour=2`. Increase only after successful live trades.
 
+### Live Probe Order (Phase 13)
+
+Phase 13 adds a **safe probe order** capability to verify end-to-end order placement works before committing to real trading.
+
+#### What is a Probe Order?
+
+A probe order is a NON-MARKETABLE limit order that:
+- Is placed at a price that **will NOT fill** (off-market)
+- Proves order placement and cancellation works
+- Writes all actions to the live ledger for audit
+- Automatically triggers kill switch if unexpected fill occurs
+
+#### Probe Order Workflow
+
+```powershell
+# Step 1: Ensure credentials are set up (from Phase 11/12)
+$env:PRIVATE_KEY = "0x...your-private-key..."
+poetry run pmq auth status
+
+# Step 2: Grant short approval for live execution
+poetry run pmq risk approve live_exec --ttl-minutes 30 --reason "probe test"
+
+# Step 3: Run probe in DRY-RUN mode first
+poetry run pmq ops live-probe
+
+# Step 4: Execute real probe order (place + cancel)
+poetry run pmq ops live-probe --live-exec --live-exec-confirm
+```
+
+#### Probe Order Safety Features
+
+| Feature | Description |
+|---------|-------------|
+| Non-marketable price | BUY price is set below best bid; SELL above best ask |
+| Tick/size quantization | Prices aligned to exchange tick_size, sizes to min_order_size |
+| Kill switch trigger | Creates `~/.pmq/KILL` if unexpected fill detected |
+| Full ledgering | All actions (intent, placed, cancelled) recorded |
+| TTL approval required | Must have active `live_exec` approval |
+
+#### Probe CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--market-id` | auto | Specific market to probe (auto-selects liquid market) |
+| `--token-id` | auto | Specific token ID to probe |
+| `--side` | BUY | Order side: BUY or SELL |
+| `--size` | 1.0 | Order size in shares |
+| `--wait-seconds` | 3.0 | Seconds to wait before cancelling |
+| `--live-exec` | False | Enable live execution |
+| `--live-exec-confirm` | False | Confirm live order placement |
+
+#### Troubleshooting Probe Orders
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| "No TTL approval" | Missing live_exec approval | Run `pmq risk approve live_exec --ttl-minutes 30` |
+| "KILL SWITCH ACTIVE" | Kill file exists | Delete `~/.pmq/KILL` if safe |
+| "Cannot determine top-of-book" | Illiquid market | Specify `--token-id` for liquid market |
+| "Probe order invalid" | Price/size constraints | Check tick_size and min_order_size |
+| Order placement failed | Auth issue | Run `pmq ops live-preflight --require-auth` |
+
 ## First Paper Trade Checklist
 
 Getting your first paper trade requires several steps to work together. This checklist helps you verify everything is configured correctly.

@@ -5533,5 +5533,407 @@ def ops_live_preflight(
         raise typer.Exit(1)
 
 
+@ops_app.command("live-probe")
+def ops_live_probe(
+    market_id: Annotated[
+        str | None,
+        typer.Option(
+            "--market-id",
+            help="Specific market ID to probe (optional, uses liquid market if not set)",
+        ),
+    ] = None,
+    token_id: Annotated[
+        str | None,
+        typer.Option(
+            "--token-id",
+            help="Specific token ID to probe (optional)",
+        ),
+    ] = None,
+    side: Annotated[
+        str,
+        typer.Option(
+            "--side",
+            help="Order side: BUY or SELL",
+        ),
+    ] = "BUY",
+    size: Annotated[
+        float,
+        typer.Option(
+            "--size",
+            help="Order size in shares (will be quantized to min_order_size)",
+        ),
+    ] = 1.0,
+    live_exec: Annotated[
+        bool,
+        typer.Option(
+            "--live-exec/--no-live-exec",
+            help="Enable live execution (required for real orders)",
+        ),
+    ] = False,
+    live_exec_confirm: Annotated[
+        bool,
+        typer.Option(
+            "--live-exec-confirm/--no-live-exec-confirm",
+            help="Confirm live execution (required for real orders)",
+        ),
+    ] = False,
+    wait_seconds: Annotated[
+        float,
+        typer.Option(
+            "--wait-seconds",
+            help="Seconds to wait before cancelling probe order",
+        ),
+    ] = 3.0,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-V", help="Show detailed output"),
+    ] = False,
+) -> None:
+    """Place a safe probe order to test live order placement (Phase 13).
+
+    This command places a NON-MARKETABLE limit order that should NOT fill,
+    waits briefly to confirm it's on the book, then cancels it.
+
+    Purpose: Prove end-to-end order placement and cancellation works
+    without risking any fills.
+
+    SAFETY FEATURES:
+    1. Order price is set OFF-MARKET (won't fill)
+    2. Requires --live-exec AND --live-exec-confirm flags
+    3. Requires active TTL approval for live_exec scope
+    4. Respects kill switch (~/.pmq/KILL)
+    5. Writes all actions to live ledger
+    6. Triggers kill switch if unexpected fill occurs
+
+    Example (dry-run):
+        pmq ops live-probe
+
+    Example (real probe):
+        pmq risk approve live_exec --ttl-minutes 30 --reason "probe test"
+        pmq ops live-probe --live-exec --live-exec-confirm
+    """
+    import os
+    from decimal import Decimal
+    from pathlib import Path
+
+    console.print("[bold]Phase 13 Live Probe Order[/bold]\n")
+
+    # =========================================================================
+    # Step 1: Run preflight checks
+    # =========================================================================
+    console.print("[cyan]1. Running preflight checks...[/cyan]")
+
+    # Kill switch check
+    kill_switch_path = Path.home() / ".pmq" / "KILL"
+    if kill_switch_path.exists():
+        console.print(f"   [red]✗ KILL SWITCH ACTIVE[/red] at {kill_switch_path}")
+        raise typer.Exit(1)
+    console.print("   [green]✓[/green] Kill switch not active")
+
+    # TTL approval check
+    try:
+        from pmq.risk import is_approved
+
+        if not is_approved("live_exec"):
+            console.print("   [red]✗ No TTL approval for live_exec[/red]")
+            console.print(
+                "   [dim]Run: pmq risk approve live_exec --ttl-minutes 30 --reason 'probe'[/dim]"
+            )
+            raise typer.Exit(1)
+        console.print("   [green]✓[/green] TTL approval active")
+    except ImportError as e:
+        console.print(f"   [red]✗ Risk module not available: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Auth check
+    private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("PMQ_PRIVATE_KEY")
+    if not private_key:
+        console.print("   [red]✗ PRIVATE_KEY not set[/red]")
+        raise typer.Exit(1)
+    console.print("   [green]✓[/green] Private key available")
+
+    from pmq.auth import load_creds
+
+    creds = load_creds()
+    if not creds:
+        console.print("   [red]✗ No credentials found[/red]")
+        console.print("   [dim]Run: pmq auth init[/dim]")
+        raise typer.Exit(1)
+    console.print("   [green]✓[/green] Credentials loaded")
+
+    # =========================================================================
+    # Step 2: Find a market/token to probe
+    # =========================================================================
+    console.print("\n[cyan]2. Selecting market for probe...[/cyan]")
+
+    target_token_id = token_id
+    target_market_id = market_id
+
+    if not target_token_id:
+        # Find a liquid market from the database
+        from pmq.storage import DAO
+
+        dao = DAO()
+        markets = dao.list_markets_by_volume(limit=20)
+
+        if not markets:
+            console.print("   [red]✗ No markets found in database[/red]")
+            console.print("   [dim]Run: pmq sync first[/dim]")
+            raise typer.Exit(1)
+
+        # Pick first market with valid YES token ID
+        for mkt in markets:
+            if mkt.yes_token_id:
+                target_token_id = mkt.yes_token_id
+                target_market_id = mkt.market_id or mkt.condition_id
+                console.print(f"   [green]✓[/green] Selected: {mkt.question[:60]}...")
+                break
+
+        if not target_token_id:
+            console.print("   [red]✗ No market with valid token ID found[/red]")
+            raise typer.Exit(1)
+
+    from pmq.auth.redact import mask_string
+
+    masked_token = mask_string(target_token_id, 8) if len(target_token_id) > 16 else target_token_id
+    console.print(f"   Token ID: {masked_token}")
+
+    # =========================================================================
+    # Step 3: Fetch market constraints and compute non-marketable price
+    # =========================================================================
+    console.print("\n[cyan]3. Fetching market constraints...[/cyan]")
+
+    from pmq.ops.market_constraints import (
+        MarketConstraints,
+        compute_non_marketable_buy_price,
+        compute_non_marketable_sell_price,
+        quantize_size,
+        validate_probe_order,
+    )
+
+    constraints = MarketConstraints.fetch_for_token(target_token_id)
+
+    if constraints.error:
+        console.print(f"   [yellow]⚠ Could not fetch constraints: {constraints.error}[/yellow]")
+        console.print("   [dim]Using defaults: tick_size=0.01, min_order_size=1.0[/dim]")
+
+    console.print(f"   Tick size: {constraints.tick_size}")
+    console.print(f"   Min order size: {constraints.min_order_size}")
+    console.print(f"   Best bid: {constraints.best_bid or 'N/A'}")
+    console.print(f"   Best ask: {constraints.best_ask or 'N/A'}")
+
+    if not constraints.has_valid_book:
+        console.print("   [red]✗ Cannot determine top-of-book prices[/red]")
+        console.print("   [dim]Market may be illiquid or unavailable[/dim]")
+        raise typer.Exit(1)
+
+    # Compute non-marketable price
+    side_upper = side.upper()
+    if side_upper == "BUY":
+        probe_price = compute_non_marketable_buy_price(
+            constraints.best_bid, constraints.tick_size  # type: ignore
+        )
+    else:
+        probe_price = compute_non_marketable_sell_price(
+            constraints.best_ask, constraints.tick_size  # type: ignore
+        )
+
+    # Quantize size
+    probe_size = quantize_size(Decimal(str(size)), constraints.min_order_size)
+
+    console.print(f"\n   [bold]Probe order:[/bold]")
+    console.print(f"   Side: {side_upper}")
+    console.print(f"   Price: {probe_price} (off-market, should NOT fill)")
+    console.print(f"   Size: {probe_size}")
+
+    # Validate the probe order
+    is_valid, validation_error = validate_probe_order(
+        probe_price, probe_size, side_upper, constraints
+    )
+    if not is_valid:
+        console.print(f"   [red]✗ Probe order invalid: {validation_error}[/red]")
+        raise typer.Exit(1)
+    console.print("   [green]✓[/green] Probe order validated (non-marketable)")
+
+    # =========================================================================
+    # Step 4: Execute or dry-run
+    # =========================================================================
+    console.print("\n[cyan]4. Execution...[/cyan]")
+
+    if not live_exec or not live_exec_confirm:
+        console.print("   [yellow]DRY-RUN MODE[/yellow]")
+        console.print("   Would place probe order but --live-exec and --live-exec-confirm not set")
+        console.print("")
+        console.print("   [bold]To execute for real:[/bold]")
+        console.print("   pmq ops live-probe --live-exec --live-exec-confirm")
+        return
+
+    # LIVE EXECUTION
+    console.print("   [bold red]⚠️  LIVE EXECUTION MODE ⚠️[/bold red]")
+    console.print(f"   Placing real order on Polymarket CLOB...")
+
+    # Initialize ledger
+    from pmq.ops.live_ledger import LiveLedger, LiveOrderRecord
+
+    ledger = LiveLedger()
+
+    # Create CLOB client
+    from pmq.auth.client_factory import create_clob_client
+
+    clob_client = create_clob_client(
+        private_key=private_key,
+        creds=creds,
+        chain_id=137,
+    )
+
+    # Initialize lifecycle manager
+    from pmq.ops.order_lifecycle import OrderLifecycle, OrderState
+
+    lifecycle = OrderLifecycle(clob_client, timeout_s=wait_seconds + 5)
+
+    # Record intent in ledger
+    intent_record = LiveOrderRecord(
+        order_id=None,
+        timestamp=datetime.now(UTC).isoformat(),
+        market_id=target_market_id or "unknown",
+        token_id=target_token_id,
+        outcome="YES" if "yes" in target_token_id.lower() else "PROBE",
+        side=side_upper,
+        price=float(probe_price),
+        size=float(probe_size),
+        notional_usd=float(probe_price * probe_size),
+        status="INTENT",
+        arb_side="PROBE",
+        dry_run=False,
+    )
+    ledger.record_order(intent_record)
+
+    # Place the order
+    console.print("   Placing order...")
+    placement = lifecycle.place_limit_order(
+        token_id=target_token_id,
+        side=side_upper,
+        price=probe_price,
+        size=probe_size,
+    )
+
+    if not placement.success or not placement.order_id:
+        console.print(f"   [red]✗ Order placement failed: {placement.error}[/red]")
+        # Record failure
+        fail_record = LiveOrderRecord(
+            order_id=None,
+            timestamp=datetime.now(UTC).isoformat(),
+            market_id=target_market_id or "unknown",
+            token_id=target_token_id,
+            outcome="YES" if "yes" in target_token_id.lower() else "PROBE",
+            side=side_upper,
+            price=float(probe_price),
+            size=float(probe_size),
+            notional_usd=float(probe_price * probe_size),
+            status="ERROR",
+            error_message=placement.error,
+            arb_side="PROBE",
+            dry_run=False,
+        )
+        ledger.record_order(fail_record)
+        raise typer.Exit(1)
+
+    order_id = placement.order_id
+    masked_order_id = mask_string(order_id, 6) if len(order_id) > 12 else order_id
+    console.print(f"   [green]✓[/green] Order placed: {masked_order_id}")
+
+    # Record placement in ledger
+    placed_record = LiveOrderRecord(
+        order_id=order_id,
+        timestamp=datetime.now(UTC).isoformat(),
+        market_id=target_market_id or "unknown",
+        token_id=target_token_id,
+        outcome="YES" if "yes" in target_token_id.lower() else "PROBE",
+        side=side_upper,
+        price=float(probe_price),
+        size=float(probe_size),
+        notional_usd=float(probe_price * probe_size),
+        status="POSTED",
+        arb_side="PROBE",
+        dry_run=False,
+    )
+    ledger.record_order(placed_record)
+
+    # Wait and check state
+    console.print(f"   Waiting {wait_seconds}s for order state...")
+    time.sleep(wait_seconds)
+
+    state_result = lifecycle.get_order_state(order_id)
+    console.print(f"   Order state: {state_result.state.value}")
+
+    # Check for unexpected fill - this is a safety trigger
+    if state_result.state == OrderState.MATCHED or state_result.filled_size > Decimal("0"):
+        console.print("   [bold red]⚠️  UNEXPECTED FILL DETECTED! ⚠️[/bold red]")
+        console.print(f"   Filled size: {state_result.filled_size}")
+        console.print("   [bold red]TRIGGERING KILL SWITCH[/bold red]")
+
+        # Create kill switch file
+        kill_switch_path.parent.mkdir(parents=True, exist_ok=True)
+        kill_switch_path.write_text(f"Triggered by unexpected fill at {datetime.now(UTC).isoformat()}")
+
+        # Record in ledger
+        fill_record = LiveOrderRecord(
+            order_id=order_id,
+            timestamp=datetime.now(UTC).isoformat(),
+            market_id=target_market_id or "unknown",
+            token_id=target_token_id,
+            outcome="YES" if "yes" in target_token_id.lower() else "PROBE",
+            side=side_upper,
+            price=float(probe_price),
+            size=float(state_result.filled_size),
+            notional_usd=float(probe_price * state_result.filled_size),
+            status="UNEXPECTED_FILL",
+            error_message="Kill switch triggered due to unexpected fill",
+            arb_side="PROBE",
+            dry_run=False,
+        )
+        ledger.record_order(fill_record)
+        raise typer.Exit(1)
+
+    # Cancel the order
+    console.print("   Cancelling order...")
+    cancel_result = lifecycle.safe_cancel_if_open(order_id)
+
+    if cancel_result.success:
+        console.print(f"   [green]✓[/green] Order cancelled successfully")
+        # Record cancellation
+        cancel_record = LiveOrderRecord(
+            order_id=order_id,
+            timestamp=datetime.now(UTC).isoformat(),
+            market_id=target_market_id or "unknown",
+            token_id=target_token_id,
+            outcome="YES" if "yes" in target_token_id.lower() else "PROBE",
+            side=side_upper,
+            price=float(probe_price),
+            size=float(probe_size),
+            notional_usd=float(probe_price * probe_size),
+            status="CANCELLED",
+            arb_side="PROBE",
+            dry_run=False,
+        )
+        ledger.record_order(cancel_record)
+    else:
+        console.print(f"   [yellow]⚠ Cancel may have failed: {cancel_result.error}[/yellow]")
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    console.print("\n" + "─" * 50)
+    console.print("[bold green]✓ LIVE PROBE COMPLETE[/bold green]")
+    console.print("\n[bold]Summary:[/bold]")
+    console.print(f"   Order ID: {masked_order_id}")
+    console.print(f"   Price: {probe_price}")
+    console.print(f"   Size: {probe_size}")
+    console.print(f"   State: {state_result.state.value}")
+    console.print(f"   Filled: {state_result.filled_size}")
+    console.print(f"   Cancel success: {cancel_result.success}")
+    console.print("\n[dim]All actions recorded in exports/live_ledger/[/dim]")
+
+
 if __name__ == "__main__":
     app()

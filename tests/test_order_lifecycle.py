@@ -10,11 +10,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pmq.ops.order_lifecycle import (
-    CancellationResult,
     OrderLifecycle,
     OrderPlacementResult,
     OrderState,
-    OrderStateResult,
     OrderTimeoutError,
     _mask_order_id,
     _parse_order_state,
@@ -30,7 +28,7 @@ class MockClobClient:
         self.create_order_response: dict[str, Any] = {}
         self.cancel_response: dict[str, Any] = {}
 
-    def get_order(self, order_id: str) -> dict[str, Any]:
+    def get_order(self, order_id: str) -> dict[str, Any]:  # noqa: ARG002
         """Mock get_order - returns from response list."""
         if self.get_order_responses:
             response = self.get_order_responses[
@@ -41,11 +39,11 @@ class MockClobClient:
         self.get_order_call_count += 1
         return response
 
-    def create_and_post_order(self, order: Any) -> dict[str, Any]:
+    def create_and_post_order(self, order: Any) -> dict[str, Any]:  # noqa: ARG002
         """Mock create_and_post_order."""
         return self.create_order_response
 
-    def cancel(self, order_id: str) -> dict[str, Any]:
+    def cancel(self, order_id: str) -> dict[str, Any]:  # noqa: ARG002
         """Mock cancel."""
         return self.cancel_response
 

@@ -201,10 +201,7 @@ def quantize_price(
     price_dec = Decimal(str(price))
 
     # Determine rounding mode
-    if round_down:
-        rounding = ROUND_DOWN
-    else:
-        rounding = ROUND_UP
+    rounding = ROUND_DOWN if round_down else ROUND_UP
 
     # Quantize to tick size: divide, round, multiply
     ticks = (price_dec / tick_size).to_integral_value(rounding=rounding)
@@ -283,11 +280,7 @@ def quantize_size(
         return min_order_size
 
     # Round to whole units of min_order_size
-    if round_down:
-        rounding = ROUND_DOWN
-    else:
-        rounding = ROUND_UP
-
+    rounding = ROUND_DOWN if round_down else ROUND_UP
     units = (size_dec / min_order_size).to_integral_value(rounding=rounding)
     quantized = units * min_order_size
 
@@ -392,14 +385,9 @@ def is_price_marketable(
     side_upper = side.upper()
 
     if side_upper == "BUY":
-        # BUY is marketable if price >= best ask
-        if best_ask is not None and price >= best_ask:
-            return True
-    elif side_upper == "SELL":
-        # SELL is marketable if price <= best bid
-        if best_bid is not None and price <= best_bid:
-            return True
-
+        return best_ask is not None and price >= best_ask
+    if side_upper == "SELL":
+        return best_bid is not None and price <= best_bid
     return False
 
 

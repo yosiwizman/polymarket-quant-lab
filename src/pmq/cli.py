@@ -5471,7 +5471,7 @@ def ops_live_preflight(
                             f"   [dim]Open orders: {result.open_orders_count}[/dim]"
                         )
                 else:
-                    console.print(f"   [red]✗ Auth sanity check failed[/red]")
+                    console.print("   [red]✗ Auth sanity check failed[/red]")
                     console.print(f"   [dim]{result.message}[/dim]")
                     checks.append(("Auth", False, result.message))
                     all_passed = False
@@ -5584,7 +5584,7 @@ def ops_live_probe(
             help="Seconds to wait before cancelling probe order",
         ),
     ] = 3.0,
-    verbose: Annotated[
+    _verbose: Annotated[
         bool,
         typer.Option("--verbose", "-V", help="Show detailed output"),
     ] = False,
@@ -5643,7 +5643,7 @@ def ops_live_probe(
         console.print("   [green]✓[/green] TTL approval active")
     except ImportError as e:
         console.print(f"   [red]✗ Risk module not available: {e}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
     # Auth check
     private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("PMQ_PRIVATE_KEY")
@@ -5741,7 +5741,7 @@ def ops_live_probe(
     # Quantize size
     probe_size = quantize_size(Decimal(str(size)), constraints.min_order_size)
 
-    console.print(f"\n   [bold]Probe order:[/bold]")
+    console.print("\n   [bold]Probe order:[/bold]")
     console.print(f"   Side: {side_upper}")
     console.print(f"   Price: {probe_price} (off-market, should NOT fill)")
     console.print(f"   Size: {probe_size}")
@@ -5770,7 +5770,7 @@ def ops_live_probe(
 
     # LIVE EXECUTION
     console.print("   [bold red]⚠️  LIVE EXECUTION MODE ⚠️[/bold red]")
-    console.print(f"   Placing real order on Polymarket CLOB...")
+    console.print("   Placing real order on Polymarket CLOB...")
 
     # Initialize ledger
     from pmq.ops.live_ledger import LiveLedger, LiveOrderRecord
@@ -5900,7 +5900,7 @@ def ops_live_probe(
     cancel_result = lifecycle.safe_cancel_if_open(order_id)
 
     if cancel_result.success:
-        console.print(f"   [green]✓[/green] Order cancelled successfully")
+        console.print("   [green]✓[/green] Order cancelled successfully")
         # Record cancellation
         cancel_record = LiveOrderRecord(
             order_id=order_id,

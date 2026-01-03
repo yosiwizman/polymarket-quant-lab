@@ -204,6 +204,9 @@ class TickStats:
     paper_explain_top_edge_bps: float = 0.0  # Top candidate edge this tick
     # Phase 7: Raw edge tracking (before risk gating)
     paper_explain_top_raw_edge_bps: float = 0.0  # Top candidate raw edge this tick
+    # Phase 9: Net edge tracking (after fees/slippage)
+    paper_explain_top_gross_edge_bps: float = 0.0  # Top candidate gross edge this tick
+    paper_explain_top_net_edge_bps: float = 0.0  # Top candidate net edge this tick
 
 
 @dataclass
@@ -258,6 +261,12 @@ class DailyStats:
     # Phase 7: Raw edge tracking (before risk gating)
     paper_explain_ticks_with_raw_edge_above_threshold: int = 0  # Ticks with raw_edge >= min
     paper_explain_max_raw_edge_bps: float = 0.0  # Max raw edge across ticks
+    # Phase 9: Net edge tracking (after fees/slippage)
+    paper_explain_ticks_with_net_edge_above_threshold: int = 0  # Ticks with net_edge >= min
+    paper_explain_max_gross_edge_bps: float = 0.0  # Max gross edge across ticks
+    paper_explain_max_net_edge_bps: float = 0.0  # Max net edge across ticks
+    paper_explain_sum_net_edge_bps: float = 0.0  # Sum for computing average
+    paper_explain_count_net_edge: int = 0  # Count for average computation
 
 
 def compute_adaptive_staleness(interval_seconds: int) -> float:
@@ -336,6 +345,9 @@ class DaemonConfig:
     paper_exec_trade_quantity: float = 10.0  # Quantity per paper trade
     paper_exec_require_approval: bool = True  # Require governance approval
     paper_exec_strategy_name: str = "paper_exec"  # Strategy name for governance
+    # Phase 9: Fee/slippage for net edge computation
+    paper_exec_fee_bps: float = 0.0  # Trading fee in basis points
+    paper_exec_slippage_bps: float = 0.0  # Expected slippage in basis points
     # Phase 6.2: Paper exec explain mode settings
     paper_exec_explain: bool = (
         False  # Enable explain mode (capture all candidates, disabled by default)
@@ -1193,6 +1205,9 @@ class DaemonRunner:
                 min_signal_edge_bps=self.config.paper_exec_min_edge_bps,
                 trade_quantity=self.config.paper_exec_trade_quantity,
                 require_approval=self.config.paper_exec_require_approval,
+                # Phase 9: Fee/slippage settings
+                fee_bps=self.config.paper_exec_fee_bps,
+                slippage_bps=self.config.paper_exec_slippage_bps,
                 # Phase 6.2: Explain mode settings
                 explain_enabled=self.config.paper_exec_explain,
                 explain_top_n=self.config.paper_exec_explain_top_n,
@@ -1269,6 +1284,13 @@ class DaemonRunner:
                     tick_stats.paper_explain_top_raw_edge_bps = result.explain_candidates[
                         0
                     ].raw_edge_bps
+                    # Phase 9: Track gross/net edge (fee-aware)
+                    tick_stats.paper_explain_top_gross_edge_bps = result.explain_candidates[
+                        0
+                    ].gross_edge_bps
+                    tick_stats.paper_explain_top_net_edge_bps = result.explain_candidates[
+                        0
+                    ].net_edge_bps
 
                 # Always export tick to JSONL (Phase 6.2.1)
                 export_path = self.config.paper_exec_explain_export_path or get_default_export_path(
@@ -1364,6 +1386,18 @@ class DaemonRunner:
                     self._daily_stats.paper_explain_ticks_with_raw_edge_above_threshold += 1
                 if top_raw_edge > self._daily_stats.paper_explain_max_raw_edge_bps:
                     self._daily_stats.paper_explain_max_raw_edge_bps = top_raw_edge
+                # Phase 9: Track net edge aggregates (fee-aware)
+                top_gross_edge = tick_stats.paper_explain_top_gross_edge_bps
+                top_net_edge = tick_stats.paper_explain_top_net_edge_bps
+                if top_net_edge >= self.config.paper_exec_min_edge_bps:
+                    self._daily_stats.paper_explain_ticks_with_net_edge_above_threshold += 1
+                if top_gross_edge > self._daily_stats.paper_explain_max_gross_edge_bps:
+                    self._daily_stats.paper_explain_max_gross_edge_bps = top_gross_edge
+                if top_net_edge > self._daily_stats.paper_explain_max_net_edge_bps:
+                    self._daily_stats.paper_explain_max_net_edge_bps = top_net_edge
+                # Track sum/count for average computation
+                self._daily_stats.paper_explain_sum_net_edge_bps += top_net_edge
+                self._daily_stats.paper_explain_count_net_edge += 1
             if tick_stats.error:
                 self._daily_stats.total_errors += 1
             self._daily_stats.end_time = tick_stats.timestamp
@@ -1782,7 +1816,13 @@ class DaemonRunner:
                 rejection_lines = f"\n{rejection_lines}"
 
             min_edge = self.config.paper_exec_min_edge_bps
-            explain_section = f"""## Paper Exec Diagnostics (Phase 7)
+            # Phase 9: Compute net edge average
+            avg_net_edge = (
+                stats.paper_explain_sum_net_edge_bps / stats.paper_explain_count_net_edge
+                if stats.paper_explain_count_net_edge > 0
+                else 0
+            )
+            explain_section = f"""## Paper Exec Diagnostics (Phase 9)
 - **Ticks with Candidates:** {stats.paper_explain_ticks_with_candidates:,} / {stats.total_ticks}
 - **Ticks with Edge >= {min_edge:.0f}bps:** {stats.paper_explain_ticks_above_min_edge:,}
 - **Ticks with Raw Edge >= {min_edge:.0f}bps:** {stats.paper_explain_ticks_with_raw_edge_above_threshold:,}
@@ -1793,8 +1833,16 @@ class DaemonRunner:
 - **Max Raw Edge:** {stats.paper_explain_max_raw_edge_bps:.1f} bps (before risk gating)
 - **Top Rejection Reasons:**{rejection_lines}
 
-> **Calibration Tip:** If Ticks with Raw Edge above min is high but trades are 0, check approval.
-> If raw_edge values look good but edge_bps is 0, the issue is risk gating, not market pricing.
+## Net Edge Diagnostics (Phase 9)
+- **Ticks with Net Edge >= {min_edge:.0f}bps:** {stats.paper_explain_ticks_with_net_edge_above_threshold:,}
+- **Avg Top Net Edge:** {avg_net_edge:.1f} bps (after fees/slippage)
+- **Max Gross Edge:** {stats.paper_explain_max_gross_edge_bps:.1f} bps (before fees)
+- **Max Net Edge:** {stats.paper_explain_max_net_edge_bps:.1f} bps (after fees)
+- **Fee BPS:** {self.config.paper_exec_fee_bps:.1f}
+- **Slippage BPS:** {self.config.paper_exec_slippage_bps:.1f}
+
+> **Calibration Tip:** If Gross Edge is high but Net Edge is below threshold, consider reducing fee/slippage estimates.
+> If Net Edge looks good but trades are 0, check approval status with `pmq risk status`.
 
 """
 

@@ -100,6 +100,7 @@ class TestApprovalDataclass:
         assert approval.scope == "daemon"
         assert approval.approved_by == "user"
 
+
 # =============================================================================
 # Test: ApprovalStore
 # =============================================================================
@@ -306,7 +307,9 @@ class TestHelperFunctions:
             assert get_approval("test", approvals_dir=approvals_dir) is None
 
             # Create approval
-            approve(scope="test", ttl_seconds=3600, reason="Test reason", approvals_dir=approvals_dir)
+            approve(
+                scope="test", ttl_seconds=3600, reason="Test reason", approvals_dir=approvals_dir
+            )
 
             # Get it back
             approval = get_approval("test", approvals_dir=approvals_dir)

@@ -80,16 +80,20 @@ class RejectionReason(Enum):
 class ExplainCandidate:
     """Candidate opportunity with explain data for calibration.
 
-    Phase 6.2: Captures all relevant data for a potential trade,
-    including why it was rejected (if applicable).
+        Phase 6.2: Captures all relevant data for a potential trade,
+        including why it was rejected (if applicable).
 
-    Phase 7: Added raw_edge_bps which is computed BEFORE risk gating.
-    This allows calibration even when risk rejects the trade.
+        Phase 7: Added raw_edge_bps which is computed BEFORE risk gating.
+        This allows calibration even when risk rejects the trade.
 
     Phase 8: Added orderbook-based arb edge fields:
-    - yes_token_id, no_token_id: CLOB token identifiers
-    - arb_side: BUY_BOTH, SELL_BOTH, or NONE
-    - ask_yes, ask_no, bid_yes, bid_no: Best prices from orderbooks
+        - yes_token_id, no_token_id: CLOB token identifiers
+        - arb_side: BUY_BOTH, SELL_BOTH, or NONE
+        - ask_yes, ask_no, bid_yes, bid_no: Best prices from orderbooks
+
+        Phase 9: Added net_edge_bps for fee-aware calibration:
+        - gross_edge_bps: Edge before fees/slippage (was raw_edge_bps)
+        - net_edge_bps: Edge after fees/slippage (used for threshold comparisons)
     """
 
     # Market identification
@@ -110,6 +114,9 @@ class ExplainCandidate:
     spread_bps: float = 0.0  # Bid-ask spread in basis points (if available)
     edge_bps: float = 0.0  # Computed edge/profit potential in basis points
     raw_edge_bps: float = 0.0  # Edge computed BEFORE risk gating (Phase 7)
+    # Phase 9: Explicit gross/net edge for fee-aware calibration
+    gross_edge_bps: float = 0.0  # Edge BEFORE fees/slippage
+    net_edge_bps: float = 0.0  # Edge AFTER fees/slippage (used for thresholds)
     liquidity: float = 0.0  # Market liquidity estimate
     size_estimate: float = 0.0  # Estimated executable size
 
@@ -143,6 +150,8 @@ class ExplainCandidate:
             "spread_bps": round(self.spread_bps, 2),
             "edge_bps": round(self.edge_bps, 2),
             "raw_edge_bps": round(self.raw_edge_bps, 2),
+            "gross_edge_bps": round(self.gross_edge_bps, 2),
+            "net_edge_bps": round(self.net_edge_bps, 2),
             "ask_yes": round(self.ask_yes, 6) if self.ask_yes is not None else None,
             "ask_no": round(self.ask_no, 6) if self.ask_no is not None else None,
             "bid_yes": round(self.bid_yes, 6) if self.bid_yes is not None else None,
@@ -180,6 +189,9 @@ class PaperExecConfig:
     # Scanner config overrides (None = use defaults)
     arb_threshold: float | None = None  # ArbitrageScanner threshold
     min_liquidity: float | None = None  # Minimum liquidity requirement
+    # Phase 9: Fee/slippage for net edge computation
+    fee_bps: float = 0.0  # Trading fee in basis points (default: 0)
+    slippage_bps: float = 0.0  # Expected slippage in basis points (default: 0)
     # Phase 6.2: Explain mode settings
     explain_enabled: bool = False  # Enable explain mode (capture all candidates)
     explain_top_n: int = 10  # Number of top candidates to track per tick
@@ -409,7 +421,7 @@ class PaperExecutor:
                 bid_no = max(0.001, 1.0 - ask_yes)  # Derive from YES ask
                 ask_no = min(0.999, 1.0 - bid_yes)  # Derive from YES bid
 
-                # Compute edge using edge_calc
+                # Phase 9: Compute edge using edge_calc with fee/slippage
                 edge_result = compute_edge_from_prices(
                     ask_yes=ask_yes,
                     ask_no=ask_no,
@@ -417,24 +429,32 @@ class PaperExecutor:
                     bid_no=bid_no,
                     yes_token_id=yes_token_id,
                     no_token_id=no_token_id,
+                    fee_bps=self.config.fee_bps,
+                    slippage_bps=self.config.slippage_bps,
                 )
 
-                raw_edge_bps = edge_result.raw_edge_bps
-                edge_bps = raw_edge_bps
+                gross_edge_bps = edge_result.gross_edge_bps
+                net_edge_bps = edge_result.net_edge_bps
+                raw_edge_bps = gross_edge_bps  # Keep raw_edge as gross for backward compat
+                edge_bps = net_edge_bps  # Use net for threshold comparisons
                 arb_side = edge_result.arb_side.value
                 mid_price = edge_result.mid_price or 0.0
                 spread_bps = edge_result.spread_bps or 0.0
             else:
                 # Fallback: Use signal's profit_potential from Gamma prices
-                edge_bps = signal.profit_potential * 10000
-                raw_edge_bps = edge_bps
+                gross_edge_bps = signal.profit_potential * 10000
+                # Apply fees to get net edge
+                total_cost = (self.config.fee_bps + self.config.slippage_bps) * 2
+                net_edge_bps = gross_edge_bps - total_cost
+                edge_bps = net_edge_bps
+                raw_edge_bps = gross_edge_bps
                 mid_price = (
                     (signal.yes_price + signal.no_price) / 2
                     if signal.yes_price + signal.no_price > 0
                     else 0
                 )
 
-            # Phase 8: Build candidate with all fields
+            # Phase 9: Build candidate with all fields including gross/net edge
             candidate = ExplainCandidate(
                 market_id=signal.market_id,
                 market_question=signal.market_question,
@@ -447,7 +467,9 @@ class PaperExecutor:
                 mid_price=mid_price,
                 spread_bps=spread_bps,
                 edge_bps=edge_bps,
-                raw_edge_bps=raw_edge_bps,  # Preserve true edge before any gating
+                raw_edge_bps=raw_edge_bps,  # Preserve gross edge before any gating
+                gross_edge_bps=gross_edge_bps,
+                net_edge_bps=net_edge_bps,
                 liquidity=signal.liquidity,
                 size_estimate=self.config.trade_quantity,
                 ask_yes=ask_yes,
@@ -475,11 +497,11 @@ class PaperExecutor:
                     f"liquidity={signal.liquidity:.0f} < min={min_liquidity:.0f}"
                 )
                 _count_rejection(RejectionReason.LIQUIDITY_BELOW_MIN)
-            elif raw_edge_bps < self.config.min_signal_edge_bps:
-                # Phase 8: Use raw_edge_bps for threshold check
+            elif net_edge_bps < self.config.min_signal_edge_bps:
+                # Phase 9: Use net_edge_bps for threshold check (after fees)
                 candidate.rejection_reason = RejectionReason.EDGE_BELOW_MIN
                 candidate.rejection_detail = (
-                    f"edge={raw_edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                    f"net_edge={net_edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
                 )
                 _count_rejection(RejectionReason.EDGE_BELOW_MIN)
             # Passed basic filters - will be evaluated for execution

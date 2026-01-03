@@ -1259,12 +1259,12 @@ class TestRawEdgeBps:
         # The critical assertion: raw_edge_bps should be non-zero
         # even though the trade was rejected by risk
         candidate = risk_rejected[0]
-        assert candidate.raw_edge_bps > 0, (
-            f"raw_edge_bps should be non-zero when rejected by risk, got {candidate.raw_edge_bps}"
-        )
-        assert candidate.raw_edge_bps >= 100, (
-            f"Expected raw_edge_bps >= 100 (10% edge), got {candidate.raw_edge_bps}"
-        )
+        assert (
+            candidate.raw_edge_bps > 0
+        ), f"raw_edge_bps should be non-zero when rejected by risk, got {candidate.raw_edge_bps}"
+        assert (
+            candidate.raw_edge_bps >= 100
+        ), f"Expected raw_edge_bps >= 100 (10% edge), got {candidate.raw_edge_bps}"
 
     def test_raw_edge_bps_equals_edge_bps_when_not_rejected(self) -> None:
         """raw_edge_bps should equal edge_bps for executed candidates."""

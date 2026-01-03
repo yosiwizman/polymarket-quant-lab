@@ -13,15 +13,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import pytest
-
 from pmq.ops.edge_calc import (
     ArbSide,
     EdgeResult,
     compute_arb_edge,
     compute_edge_from_prices,
 )
-
 
 # =============================================================================
 # Mock OrderBookData for testing
@@ -549,6 +546,125 @@ class TestComputeEdgeFromPrices:
 # =============================================================================
 # Test: EdgeResult Serialization
 # =============================================================================
+
+
+# =============================================================================
+# Test: Phase 9 Net Edge Computation
+# =============================================================================
+
+
+class TestNetEdgeComputation:
+    """Test Phase 9 gross_edge_bps and net_edge_bps computation.
+
+    Phase 9: Edge is now computed in two stages:
+    - gross_edge_bps: Edge BEFORE fees/slippage
+    - net_edge_bps: Edge AFTER fees/slippage (= gross - 2 * (fee_bps + slippage_bps))
+    """
+
+    def test_gross_and_net_edge_buy_both(self) -> None:
+        """Test gross/net edge computation for BUY_BOTH."""
+        result = compute_edge_from_prices(
+            ask_yes=0.48,
+            ask_no=0.49,
+            bid_yes=0.47,
+            bid_no=0.48,
+            fee_bps=10.0,
+            slippage_bps=5.0,
+        )
+
+        # Gross edge: (1.0 - (0.48 + 0.49)) * 10000 = 300 bps
+        assert result.gross_edge_bps == 300.0
+
+        # Net edge: 300 - 2 * (10 + 5) = 300 - 30 = 270 bps
+        assert result.net_edge_bps == 270.0
+
+        # raw_edge_bps should equal net_edge_bps for backward compat
+        assert result.raw_edge_bps == result.net_edge_bps
+
+    def test_gross_and_net_edge_sell_both(self) -> None:
+        """Test gross/net edge computation for SELL_BOTH."""
+        result = compute_edge_from_prices(
+            ask_yes=0.54,
+            ask_no=0.53,
+            bid_yes=0.53,
+            bid_no=0.52,
+            fee_bps=20.0,
+            slippage_bps=10.0,
+        )
+
+        # Gross edge: ((0.53 + 0.52) - 1.0) * 10000 = 500 bps
+        assert result.gross_edge_bps == 500.0
+
+        # Net edge: 500 - 2 * (20 + 10) = 500 - 60 = 440 bps
+        assert result.net_edge_bps == 440.0
+
+    def test_net_edge_can_be_negative(self) -> None:
+        """Test that net edge can go negative with high fees."""
+        result = compute_edge_from_prices(
+            ask_yes=0.49,
+            ask_no=0.50,
+            bid_yes=0.48,
+            bid_no=0.49,
+            fee_bps=100.0,  # High fees wipe out edge
+            slippage_bps=50.0,
+        )
+
+        # Gross edge: (1.0 - 0.99) * 10000 = 100 bps
+        assert result.gross_edge_bps == 100.0
+
+        # Net edge: 100 - 2 * (100 + 50) = 100 - 300 = -200 bps
+        assert result.net_edge_bps == -200.0
+
+    def test_zero_fees_gross_equals_net(self) -> None:
+        """Test that gross == net when fees are zero."""
+        result = compute_edge_from_prices(
+            ask_yes=0.48,
+            ask_no=0.49,
+            bid_yes=0.47,
+            bid_no=0.48,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+        )
+
+        assert result.gross_edge_bps == 300.0
+        assert result.net_edge_bps == 300.0
+        assert result.gross_edge_bps == result.net_edge_bps
+
+    def test_fee_bps_and_slippage_bps_stored(self) -> None:
+        """Test that fee_bps and slippage_bps are stored in result."""
+        result = compute_edge_from_prices(
+            ask_yes=0.48,
+            ask_no=0.49,
+            bid_yes=0.47,
+            bid_no=0.48,
+            fee_bps=15.0,
+            slippage_bps=8.0,
+        )
+
+        assert result.fee_bps == 15.0
+        assert result.slippage_bps == 8.0
+
+    def test_to_dict_includes_net_edge_fields(self) -> None:
+        """Test that to_dict includes gross/net edge and fee fields."""
+        result = compute_edge_from_prices(
+            ask_yes=0.48,
+            ask_no=0.49,
+            bid_yes=0.47,
+            bid_no=0.48,
+            fee_bps=10.0,
+            slippage_bps=5.0,
+        )
+
+        d = result.to_dict()
+
+        assert "gross_edge_bps" in d
+        assert "net_edge_bps" in d
+        assert "fee_bps" in d
+        assert "slippage_bps" in d
+        assert d["gross_edge_bps"] == 300.0
+        assert d["net_edge_bps"] == 270.0
+        assert d["fee_bps"] == 10.0
+        assert d["slippage_bps"] == 5.0
 
 
 class TestEdgeResultSerialization:

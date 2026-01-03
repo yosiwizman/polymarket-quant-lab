@@ -242,8 +242,11 @@ class OrderLifecycle:
 
         try:
             # Import OrderArgs from py_clob_client
-            from py_clob_client.clob_types import OrderArgs
-            from py_clob_client.order_builder.constants import BUY, SELL
+            from py_clob_client.clob_types import OrderArgs  # type: ignore[import-untyped]
+            from py_clob_client.order_builder.constants import (  # type: ignore[import-untyped]
+                BUY,
+                SELL,
+            )
 
             # Determine side constant
             side_const = BUY if side.upper() == "BUY" else SELL

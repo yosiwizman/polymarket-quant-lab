@@ -584,7 +584,7 @@ class LiveExecutor:
         try:
             # Create order using py_clob_client
             # Note: This requires the py_clob_client.order module
-            from py_clob_client.order import (
+            from py_clob_client.order import (  # type: ignore[import-untyped]
                 BUY,
                 SELL,
                 OrderArgs,

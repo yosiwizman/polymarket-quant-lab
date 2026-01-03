@@ -123,7 +123,7 @@ def create_clob_client(
         ValueError: If credentials or private key not available
     """
     try:
-        from py_clob_client.client import ClobClient
+        from py_clob_client.client import ClobClient  # type: ignore[import-untyped]
     except ImportError as e:
         raise ImportError("py_clob_client not installed. Run: poetry add py-clob-client") from e
 

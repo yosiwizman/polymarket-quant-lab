@@ -5664,7 +5664,7 @@ def ops_live_probe(
         from pmq.storage import DAO
 
         dao = DAO()
-        markets = dao.list_markets_by_volume(limit=20)
+        markets = dao.get_active_markets(limit=20)
 
         if not markets:
             console.print("   [red]✗ No markets found in database[/red]")
@@ -5673,10 +5673,11 @@ def ops_live_probe(
 
         # Pick first market with valid YES token ID
         for mkt in markets:
-            if mkt.yes_token_id:
-                target_token_id = mkt.yes_token_id
-                target_market_id = mkt.market_id or mkt.condition_id
-                console.print(f"   [green]✓[/green] Selected: {mkt.question[:60]}...")
+            if mkt.get("yes_token_id"):
+                target_token_id = mkt["yes_token_id"]
+                target_market_id = mkt.get("id") or mkt.get("condition_id")
+                question = mkt.get("question", "Unknown market")[:60]
+                console.print(f"   [green]✓[/green] Selected: {question}...")
                 break
 
         if not target_token_id:
@@ -5720,14 +5721,20 @@ def ops_live_probe(
     # Compute non-marketable price
     side_upper = side.upper()
     if side_upper == "BUY":
+        if constraints.best_bid is None:
+            console.print("   [red]✗ Cannot compute BUY price: no best_bid[/red]")
+            raise typer.Exit(1)
         probe_price = compute_non_marketable_buy_price(
             constraints.best_bid,
-            constraints.tick_size,  # type: ignore
+            constraints.tick_size,
         )
     else:
+        if constraints.best_ask is None:
+            console.print("   [red]✗ Cannot compute SELL price: no best_ask[/red]")
+            raise typer.Exit(1)
         probe_price = compute_non_marketable_sell_price(
             constraints.best_ask,
-            constraints.tick_size,  # type: ignore
+            constraints.tick_size,
         )
 
     # Quantize size

@@ -78,8 +78,8 @@ class FakeDAO:
 
     def get_paper_trades(
         self,
-        strategy: str | None = None,
-        limit: int = 100,  # noqa: ARG002
+        _strategy: str | None = None,
+        limit: int = 100,
     ) -> list[Any]:
         """Get paper trades."""
         return self.paper_trades[:limit]
@@ -104,8 +104,8 @@ class FakeArbitrageScanner:
 
     def scan_from_db(
         self,
-        markets_data: list[dict[str, Any]],
-        top_n: int | None = None,  # noqa: ARG002
+        _markets_data: list[dict[str, Any]],
+        top_n: int | None = None,
     ) -> list[ArbitrageSignal]:
         """Return preconfigured signals."""
         if top_n is not None:

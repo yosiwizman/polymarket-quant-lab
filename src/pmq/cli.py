@@ -4498,24 +4498,18 @@ def ops_preflight(
             ip = geoblock_data.get("ip", "unknown")
 
             if blocked:
-                console.print(
-                    f"   [red]✗ BLOCKED[/red] - Location: {country}/{region}, IP: {ip}"
-                )
-                console.print(
-                    "   [red]Polymarket is not available in your region.[/red]"
-                )
-                console.print(
-                    "   [dim]Live CLOB trading requires an eligible location.[/dim]"
-                )
+                console.print(f"   [red]✗ BLOCKED[/red] - Location: {country}/{region}, IP: {ip}")
+                console.print("   [red]Polymarket is not available in your region.[/red]")
+                console.print("   [dim]Live CLOB trading requires an eligible location.[/dim]")
                 all_passed = False
             else:
-                console.print(
-                    f"   [green]✓ NOT BLOCKED[/green] - Location: {country}/{region}"
-                )
+                console.print(f"   [green]✓ NOT BLOCKED[/green] - Location: {country}/{region}")
                 if verbose:
                     console.print(f"   [dim]IP: {ip}[/dim]")
     except httpx.HTTPStatusError as e:
-        console.print(f"   [yellow]⚠ HTTP error checking geoblock: {e.response.status_code}[/yellow]")
+        console.print(
+            f"   [yellow]⚠ HTTP error checking geoblock: {e.response.status_code}[/yellow]"
+        )
         all_passed = False
     except Exception as e:
         console.print(f"   [yellow]⚠ Could not check geoblock: {e}[/yellow]")
@@ -4562,12 +4556,8 @@ def ops_preflight(
             f"   [yellow]⚠ {keys_present}/{keys_total} keys configured (partial)[/yellow]"
         )
     else:
-        console.print(
-            "   [yellow]⚠ No builder keys configured[/yellow]"
-        )
-        console.print(
-            "   [dim]Get keys from: https://polymarket.com/profile/builder[/dim]"
-        )
+        console.print("   [yellow]⚠ No builder keys configured[/yellow]")
+        console.print("   [dim]Get keys from: https://polymarket.com/profile/builder[/dim]")
 
     # Step 3: CLOB connectivity check
     console.print("\n[cyan]3. Testing CLOB connectivity...[/cyan]")
@@ -4583,9 +4573,7 @@ def ops_preflight(
                 console.print(f"   [dim]Server time: {server_time}[/dim]")
 
     except httpx.HTTPStatusError as e:
-        console.print(
-            f"   [red]✗ CLOB API error: HTTP {e.response.status_code}[/red]"
-        )
+        console.print(f"   [red]✗ CLOB API error: HTTP {e.response.status_code}[/red]")
         all_passed = False
     except Exception as e:
         console.print(f"   [red]✗ Cannot reach CLOB API: {e}[/red]")
@@ -4596,9 +4584,7 @@ def ops_preflight(
     if all_passed:
         console.print("[bold green]✓ Preflight checks passed[/bold green]")
         if keys_present < keys_total:
-            console.print(
-                "[yellow]Note: Builder keys incomplete - live trading disabled[/yellow]"
-            )
+            console.print("[yellow]Note: Builder keys incomplete - live trading disabled[/yellow]")
     else:
         console.print("[bold red]✗ Preflight checks failed[/bold red]")
         console.print("[dim]Resolve issues above before live trading[/dim]")

@@ -1250,7 +1250,8 @@ class TestRawEdgeBps:
 
         # Find candidate that was rejected by risk
         risk_rejected = [
-            c for c in result.explain_candidates
+            c
+            for c in result.explain_candidates
             if c.rejection_reason == RejectionReason.RISK_NOT_APPROVED
         ]
         assert len(risk_rejected) > 0, "Expected at least one risk_not_approved rejection"

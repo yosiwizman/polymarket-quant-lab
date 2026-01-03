@@ -1248,7 +1248,9 @@ class DaemonRunner:
                 if result.explain_candidates:
                     tick_stats.paper_explain_top_edge_bps = result.explain_candidates[0].edge_bps
                     # Phase 7: Track raw_edge (before risk gating)
-                    tick_stats.paper_explain_top_raw_edge_bps = result.explain_candidates[0].raw_edge_bps
+                    tick_stats.paper_explain_top_raw_edge_bps = result.explain_candidates[
+                        0
+                    ].raw_edge_bps
 
                 # Always export tick to JSONL (Phase 6.2.1)
                 export_path = self.config.paper_exec_explain_export_path or get_default_export_path(

@@ -227,7 +227,7 @@ def derive_or_create_api_creds(
         Exception: If API call fails
     """
     try:
-        from py_clob_client.client import ClobClient  # type: ignore[import-untyped]
+        from py_clob_client.client import ClobClient
     except ImportError as e:
         raise ImportError("py_clob_client not installed. Run: poetry add py-clob-client") from e
 

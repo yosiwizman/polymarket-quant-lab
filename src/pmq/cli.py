@@ -4487,28 +4487,47 @@ def ops_preflight(
             help="Require valid L2 auth credentials (Phase 11)",
         ),
     ] = False,
+    exchange: Annotated[
+        str,
+        typer.Option(
+            "--exchange",
+            "-e",
+            help="Exchange to check: polymarket (default) or kalshi",
+        ),
+    ] = "polymarket",
 ) -> None:
-    """Phase 7 preflight: Check geoblock, builder keys, and CLOB connectivity.
+    """Preflight check: Verify connectivity and credentials.
 
-    Performs checks before live trading:
+    For Polymarket (default):
     1. Geoblock: Calls Polymarket's geoblock endpoint to verify location eligibility
     2. Builder Keys: Verifies CLOB API credentials are configured (env vars)
     3. Connectivity: Tests CLOB public endpoint (does NOT place orders)
     4. (Optional) L2 Auth: If --require-auth, validates credentials with live API
 
-    If geoblock returns blocked=true, exits with error.
-    If builder keys are missing, prints warning but continues.
+    For Kalshi:
+    1. Credentials: Check if credentials are configured
+    2. Connectivity: Test Kalshi public API endpoint
+    3. (Optional) Auth: Test authenticated endpoint
 
     Example:
         pmq ops preflight
-        pmq ops preflight --verbose
-        pmq ops preflight --require-auth  # Phase 11: validate L2 credentials
+        pmq ops preflight --exchange kalshi
+        pmq ops preflight --require-auth  # Polymarket L2 validation
     """
     import os
 
     import httpx
 
-    console.print("[bold]Phase 7 Preflight Check[/bold]\n")
+    # Dispatch to Kalshi preflight if requested
+    if exchange.lower() == "kalshi":
+        _ops_preflight_kalshi(verbose=verbose, require_auth=require_auth)
+        return
+    elif exchange.lower() != "polymarket":
+        console.print(f"[red]Unknown exchange: {exchange}[/red]")
+        console.print("[dim]Supported: polymarket, kalshi[/dim]")
+        raise typer.Exit(1)
+
+    console.print("[bold]Polymarket Preflight Check[/bold]\n")
 
     all_passed = True
 
@@ -4648,6 +4667,222 @@ def ops_preflight(
     else:
         console.print("[bold red]✗ Preflight checks failed[/bold red]")
         console.print("[dim]Resolve issues above before live trading[/dim]")
+        raise typer.Exit(1)
+
+
+def _ops_preflight_kalshi(verbose: bool = False, require_auth: bool = False) -> None:
+    """Internal helper for Kalshi preflight checks."""
+    import httpx
+
+    console.print("[bold]Kalshi Preflight Check[/bold]\n")
+
+    all_passed = True
+
+    # Step 1: Credentials check
+    console.print("[cyan]1. Checking credentials...[/cyan]")
+    from pmq.auth.kalshi_creds import get_kalshi_creds_path, load_kalshi_creds
+    from pmq.auth.redact import mask_string
+
+    creds_path = get_kalshi_creds_path()
+    if not creds_path.exists():
+        console.print("   [yellow]✗ No credentials found[/yellow]")
+        console.print(f"   [dim]Expected: {creds_path}[/dim]")
+        console.print("   [dim]Run 'pmq auth init --exchange kalshi' to configure.[/dim]")
+        all_passed = False
+    else:
+        creds = load_kalshi_creds()
+        if creds is None:
+            console.print("   [red]✗ Credentials file corrupt[/red]")
+            all_passed = False
+        else:
+            console.print("   [green]✓ Credentials found[/green]")
+            if verbose:
+                console.print(f"   [dim]Email: {creds.email}[/dim]")
+                console.print(f"   [dim]API Key: {mask_string(creds.api_key, 4)}[/dim]")
+
+    # Step 2: Connectivity check - public endpoint
+    console.print("\n[cyan]2. Testing Kalshi API connectivity...[/cyan]")
+    from pmq.auth.kalshi_creds import KALSHI_API_BASE_PROD
+
+    api_base = KALSHI_API_BASE_PROD
+    if creds_path.exists():
+        creds = load_kalshi_creds()
+        if creds:
+            api_base = creds.api_base
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            # Get markets (public endpoint)
+            resp = client.get(f"{api_base}/markets", params={"limit": 1})
+            resp.raise_for_status()
+            data = resp.json()
+            market_count = len(data.get("markets", []))
+            console.print("   [green]✓ Kalshi API reachable[/green]")
+            if verbose:
+                console.print(f"   [dim]Markets returned: {market_count}[/dim]")
+    except httpx.HTTPStatusError as e:
+        console.print(f"   [red]✗ Kalshi API error: HTTP {e.response.status_code}[/red]")
+        all_passed = False
+    except Exception as e:
+        console.print(f"   [red]✗ Cannot reach Kalshi API: {e}[/red]")
+        all_passed = False
+
+    # Step 3 (optional): Auth check if --require-auth
+    if require_auth:
+        console.print("\n[cyan]3. Testing authenticated endpoint (--require-auth)...[/cyan]")
+        if not creds_path.exists():
+            console.print("   [red]✗ No credentials to test[/red]")
+            all_passed = False
+        else:
+            creds = load_kalshi_creds()
+            if creds is None:
+                console.print("   [red]✗ Could not load credentials[/red]")
+                all_passed = False
+            else:
+                try:
+                    from pmq.exchange.kalshi.api import KalshiApi
+
+                    api = KalshiApi(creds=creds)
+                    balance_response = api.get_balance()
+                    balance_cents = balance_response.get("balance", 0)
+                    balance_usd = balance_cents / 100
+
+                    console.print("   [green]✓ Authentication successful[/green]")
+                    if verbose:
+                        console.print(f"   [dim]Balance: ${balance_usd:.2f}[/dim]")
+                    api.close()
+                except ImportError as e:
+                    console.print(f"   [red]✗ Missing dependency: {e}[/red]")
+                    all_passed = False
+                except Exception as e:
+                    console.print(f"   [red]✗ Auth failed: {e}[/red]")
+                    all_passed = False
+
+    # Summary
+    console.print("\n" + "─" * 40)
+    if all_passed:
+        console.print("[bold green]✓ Kalshi preflight checks passed[/bold green]")
+        if require_auth:
+            console.print("[green]Authenticated - ready for Kalshi operations[/green]")
+    else:
+        console.print("[bold red]✗ Kalshi preflight checks failed[/bold red]")
+        console.print("[dim]Resolve issues above before proceeding[/dim]")
+        raise typer.Exit(1)
+
+
+@ops_app.command("kalshi-smoke")
+def ops_kalshi_smoke(
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-V", help="Show detailed output"),
+    ] = False,
+) -> None:
+    """Kalshi smoke test - verify connectivity without placing orders (Phase 13).
+
+    Tests Kalshi integration:
+    1. Load credentials from ~/.pmq/kalshi_creds.json
+    2. Fetch market list (public endpoint)
+    3. Fetch orderbook for first market (public endpoint)
+    4. Test authenticated endpoint (get balance) if credentials exist
+
+    This is a NON-TRADING test - no orders are placed.
+
+    Example:
+        pmq ops kalshi-smoke
+        pmq ops kalshi-smoke --verbose
+    """
+    console.print("[bold]Kalshi Smoke Test (Phase 13)[/bold]\n")
+    console.print("[dim]This test does NOT place any orders.[/dim]\n")
+
+    all_passed = True
+
+    # Step 1: Load credentials
+    console.print("[cyan]1. Loading credentials...[/cyan]")
+    from pmq.auth.kalshi_creds import load_kalshi_creds
+    from pmq.auth.redact import mask_string
+
+    creds = load_kalshi_creds()
+    if creds is None:
+        console.print(
+            "   [yellow]⚠ No credentials found (will test public endpoints only)[/yellow]"
+        )
+    else:
+        console.print("   [green]✓ Credentials loaded[/green]")
+        if verbose:
+            console.print(f"   [dim]Email: {creds.email}[/dim]")
+            console.print(f"   [dim]API Key: {mask_string(creds.api_key, 4)}[/dim]")
+
+    # Step 2: Fetch markets using exchange client
+    console.print("\n[cyan]2. Fetching markets (public API)...[/cyan]")
+    try:
+        from pmq.exchange.kalshi.client import KalshiMarketDataClient
+
+        market_client = KalshiMarketDataClient()
+        markets = market_client.get_markets(limit=5)
+
+        console.print(f"   [green]✓ Fetched {len(markets)} markets[/green]")
+        if verbose and markets:
+            for m in markets[:3]:
+                console.print(f"   [dim]{m.market_id}: {m.question[:50]}...[/dim]")
+        market_client.close()
+    except Exception as e:
+        console.print(f"   [red]✗ Failed to fetch markets: {e}[/red]")
+        all_passed = False
+        markets = []
+
+    # Step 3: Fetch orderbook for first market
+    if markets:
+        console.print("\n[cyan]3. Fetching orderbook (public API)...[/cyan]")
+        try:
+            market_client = KalshiMarketDataClient()
+            orderbook = market_client.get_orderbook(markets[0].market_id)
+
+            console.print(f"   [green]✓ Orderbook fetched for {markets[0].market_id}[/green]")
+            if verbose:
+                console.print(f"   [dim]Best bid: {orderbook.best_yes_bid or 'N/A'}[/dim]")
+                console.print(f"   [dim]Best ask: {orderbook.best_yes_ask or 'N/A'}[/dim]")
+                spread = orderbook.spread_yes_bps / 100 if orderbook.spread_yes_bps else None
+                console.print(f"   [dim]Spread: {spread or 'N/A'}%[/dim]")
+            market_client.close()
+        except Exception as e:
+            console.print(f"   [red]✗ Failed to fetch orderbook: {e}[/red]")
+            all_passed = False
+    else:
+        console.print("\n[cyan]3. Skipping orderbook (no markets fetched)[/cyan]")
+
+    # Step 4: Test authenticated endpoint if credentials exist
+    if creds:
+        console.print("\n[cyan]4. Testing authentication (get balance)...[/cyan]")
+        try:
+            from pmq.exchange.kalshi.client import KalshiTradingClient
+
+            trading_client = KalshiTradingClient(creds=creds)
+            balance = trading_client.get_balance()
+
+            console.print("   [green]✓ Authentication successful[/green]")
+            console.print(f"   Balance: [cyan]${balance.available_balance:.2f}[/cyan] available")
+            if verbose:
+                console.print(f"   [dim]Currency: {balance.currency}[/dim]")
+            trading_client.close()
+        except Exception as e:
+            console.print(f"   [red]✗ Authentication failed: {e}[/red]")
+            all_passed = False
+    else:
+        console.print("\n[cyan]4. Skipping auth test (no credentials)[/cyan]")
+
+    # Summary
+    console.print("\n" + "─" * 50)
+    if all_passed:
+        console.print("[bold green]✓ KALSHI SMOKE TEST PASSED[/bold green]")
+        if creds:
+            console.print("[green]Ready for Kalshi operations (authenticated)[/green]")
+        else:
+            console.print(
+                "[yellow]Public endpoints work. Configure credentials for trading.[/yellow]"
+            )
+    else:
+        console.print("[bold red]✗ KALSHI SMOKE TEST FAILED[/bold red]")
+        console.print("[dim]Check errors above and verify credentials.[/dim]")
         raise typer.Exit(1)
 
 
@@ -5011,31 +5246,53 @@ def auth_init(
             help="Signature type: 0=EOA, 1=POLY_PROXY (default), 2=GNOSIS_SAFE",
         ),
     ] = 1,
+    exchange: Annotated[
+        str,
+        typer.Option(
+            "--exchange",
+            "-e",
+            help="Exchange to configure: polymarket (default) or kalshi",
+        ),
+    ] = "polymarket",
 ) -> None:
-    """Initialize CLOB API credentials (Phase 11).
+    """Initialize API credentials (Phase 11 + Phase 13).
 
-    Derives or creates L2 API credentials from your Ethereum private key.
-    Credentials are stored locally at ~/.pmq/creds.json with secure permissions.
+    For Polymarket (default):
+    - Derives or creates L2 API credentials from your Ethereum private key.
+    - Credentials stored at ~/.pmq/creds.json
 
-    ⚠️ WARNING: Creating new credentials may INVALIDATE any existing API key
-    for this wallet. Only run this if you haven't already set up credentials.
+    For Kalshi:
+    - Stores API key/secret from environment variables.
+    - Credentials stored at ~/.pmq/kalshi_creds.json
 
     Required environment variables:
-        PRIVATE_KEY: Your Ethereum private key (hex, with or without 0x prefix)
-        FUNDER_ADDRESS: Your funder/proxy wallet address
+        Polymarket:
+            PRIVATE_KEY: Your Ethereum private key
+            FUNDER_ADDRESS: Your funder/proxy wallet address
+        Kalshi:
+            KALSHI_EMAIL: Your Kalshi account email
+            KALSHI_API_KEY: Your Kalshi API key
+            KALSHI_API_SECRET: Your Kalshi RSA private key (PEM format)
 
     Example:
-        # Set environment variables first:
-        # PowerShell: $env:PRIVATE_KEY = "0x..."
-        # PowerShell: $env:FUNDER_ADDRESS = "0x..."
-
-        pmq auth init
-        pmq auth init --yes  # Skip confirmation
+        pmq auth init                     # Polymarket
+        pmq auth init --exchange kalshi   # Kalshi
     """
     import os
 
-    from pmq.auth import creds_exist, derive_or_create_api_creds, get_creds_path, save_creds
     from pmq.auth.redact import mask_string
+
+    # Dispatch based on exchange
+    if exchange.lower() == "kalshi":
+        _auth_init_kalshi(yes=yes)
+        return
+    elif exchange.lower() != "polymarket":
+        console.print(f"[red]Unknown exchange: {exchange}[/red]")
+        console.print("[dim]Supported: polymarket, kalshi[/dim]")
+        raise typer.Exit(1)
+
+    # Polymarket auth init
+    from pmq.auth import creds_exist, derive_or_create_api_creds, get_creds_path, save_creds
 
     # Check for required environment variables
     private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("PMQ_PRIVATE_KEY")
@@ -5103,22 +5360,117 @@ def auth_init(
         raise typer.Exit(1) from None
 
 
+def _auth_init_kalshi(yes: bool = False) -> None:
+    """Internal helper for Kalshi auth init."""
+    import os
+
+    from pmq.auth.kalshi_creds import (
+        KalshiCredentials,
+        get_kalshi_creds_path,
+        kalshi_creds_exist,
+        save_kalshi_creds,
+    )
+    from pmq.auth.redact import mask_string
+
+    # Check for required environment variables
+    email = os.environ.get("KALSHI_EMAIL")
+    api_key = os.environ.get("KALSHI_API_KEY")
+    api_secret = os.environ.get("KALSHI_API_SECRET")
+    api_base = os.environ.get("KALSHI_API_BASE")  # Optional, for demo
+
+    missing = []
+    if not email:
+        missing.append("KALSHI_EMAIL")
+    if not api_key:
+        missing.append("KALSHI_API_KEY")
+    if not api_secret:
+        missing.append("KALSHI_API_SECRET")
+
+    if missing:
+        console.print("[red]Error: Missing required environment variables:[/red]")
+        for var in missing:
+            console.print(f"  [yellow]- {var}[/yellow]")
+        console.print("\n[dim]Set them with:[/dim]")
+        console.print('  $env:KALSHI_EMAIL = "your@email.com"')
+        console.print('  $env:KALSHI_API_KEY = "your-api-key"')
+        console.print('  $env:KALSHI_API_SECRET = "-----BEGIN RSA PRIVATE KEY-----..."')
+        console.print("\n[dim]Get API keys from: https://kalshi.com/account/settings[/dim]")
+        raise typer.Exit(1)
+
+    # At this point we know all required vars exist (we checked missing list above)
+    # Type assertions for mypy
+    assert email is not None
+    assert api_key is not None
+    assert api_secret is not None
+
+    # Show what will be saved
+    creds_path = get_kalshi_creds_path()
+    console.print("[bold]Kalshi Credentials Setup[/bold]")
+    console.print(f"\nCredentials will be saved to: [cyan]{creds_path}[/cyan]")
+    console.print(f"Email: [cyan]{email}[/cyan]")
+    console.print(f"API Key: [dim]{mask_string(api_key, 4)}[/dim]")
+    secret_preview = api_secret[:30] + "..." if len(api_secret) > 30 else api_secret
+    console.print(f"API Secret: [dim]{mask_string(secret_preview, 4)}[/dim]")
+    if api_base:
+        console.print(f"API Base: [cyan]{api_base}[/cyan]")
+
+    if kalshi_creds_exist():
+        console.print("\n[yellow]Existing credentials found. They will be overwritten.[/yellow]")
+
+    if not yes:
+        confirmed = typer.confirm("\nSave these credentials?")
+        if not confirmed:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit(0)
+
+    # Create and save credentials
+    creds = KalshiCredentials(
+        email=email,
+        api_key=api_key,
+        api_secret=api_secret,
+        api_base=api_base or "https://api.elections.kalshi.com/trade-api/v2",
+    )
+
+    saved_path = save_kalshi_creds(creds)
+    console.print("\n[bold green]✓ Kalshi credentials saved successfully[/bold green]")
+    console.print(f"  Saved to: [dim]{saved_path}[/dim]")
+    console.print("\n[dim]Run 'pmq ops preflight --exchange kalshi' to verify connectivity.[/dim]")
+
+
 @auth_app.command("status")
-def auth_status() -> None:
-    """Show credential status (Phase 11).
+def auth_status(
+    exchange: Annotated[
+        str,
+        typer.Option(
+            "--exchange",
+            "-e",
+            help="Exchange to check: polymarket (default) or kalshi",
+        ),
+    ] = "polymarket",
+) -> None:
+    """Show credential status (Phase 11 + Phase 13).
 
     Displays whether credentials exist and shows masked API key.
     Does not expose secrets.
 
     Example:
         pmq auth status
+        pmq auth status --exchange kalshi
     """
+    if exchange.lower() == "kalshi":
+        _auth_status_kalshi()
+        return
+    elif exchange.lower() != "polymarket":
+        console.print(f"[red]Unknown exchange: {exchange}[/red]")
+        console.print("[dim]Supported: polymarket, kalshi[/dim]")
+        raise typer.Exit(1)
+
     from pmq.auth import get_creds_path, load_creds
 
     creds_path = get_creds_path()
 
     if not creds_path.exists():
-        console.print("[yellow]No credentials found[/yellow]")
+        console.print("[yellow]No Polymarket credentials found[/yellow]")
         console.print(f"[dim]Expected location: {creds_path}[/dim]")
         console.print("[dim]Run 'pmq auth init' to create credentials.[/dim]")
         return
@@ -5130,10 +5482,11 @@ def auth_status() -> None:
         console.print("[dim]File may be corrupted. Run 'pmq auth wipe' then 'pmq auth init'.[/dim]")
         return
 
-    table = Table(title="CLOB Credentials")
+    table = Table(title="Polymarket CLOB Credentials")
     table.add_column("Field", style="cyan")
     table.add_column("Value")
 
+    table.add_row("Exchange", "[blue]Polymarket[/blue]")
     table.add_row("Status", "[green]CONFIGURED[/green]")
     table.add_row("API Key", creds.masked_api_key())
     table.add_row("Funder Address", creds.funder_address)
@@ -5142,6 +5495,43 @@ def auth_status() -> None:
 
     console.print(table)
     console.print("\n[dim]Run 'pmq ops preflight --require-auth' to verify credentials work.[/dim]")
+
+
+def _auth_status_kalshi() -> None:
+    """Internal helper for Kalshi auth status."""
+    from pmq.auth.kalshi_creds import get_kalshi_creds_path, load_kalshi_creds
+    from pmq.auth.redact import mask_string
+
+    creds_path = get_kalshi_creds_path()
+
+    if not creds_path.exists():
+        console.print("[yellow]No Kalshi credentials found[/yellow]")
+        console.print(f"[dim]Expected location: {creds_path}[/dim]")
+        console.print("[dim]Run 'pmq auth init --exchange kalshi' to configure.[/dim]")
+        return
+
+    creds = load_kalshi_creds()
+    if creds is None:
+        console.print("[red]Credentials file exists but could not be loaded[/red]")
+        console.print(f"[dim]File: {creds_path}[/dim]")
+        console.print(
+            "[dim]File may be corrupted. Run 'pmq auth wipe --exchange kalshi' then re-init.[/dim]"
+        )
+        return
+
+    table = Table(title="Kalshi Credentials")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+
+    table.add_row("Exchange", "[blue]Kalshi[/blue]")
+    table.add_row("Status", "[green]CONFIGURED[/green]")
+    table.add_row("Email", creds.email)
+    table.add_row("API Key", mask_string(creds.api_key, 4))
+    table.add_row("API Base", creds.api_base)
+    table.add_row("File", str(creds_path))
+
+    console.print(table)
+    console.print("\n[dim]Run 'pmq ops preflight --exchange kalshi' to verify connectivity.[/dim]")
 
 
 @auth_app.command("wipe")
@@ -5154,22 +5544,39 @@ def auth_wipe(
             help="Skip confirmation prompt",
         ),
     ] = False,
+    exchange: Annotated[
+        str,
+        typer.Option(
+            "--exchange",
+            "-e",
+            help="Exchange to wipe: polymarket (default) or kalshi",
+        ),
+    ] = "polymarket",
 ) -> None:
-    """Delete stored credentials (Phase 11).
+    """Delete stored credentials (Phase 11 + Phase 13).
 
     Removes the local credentials file. Does NOT revoke the API key on
-    Polymarket's side - you may need to re-derive it later.
+    the exchange side - you may need to re-derive it later.
 
     Example:
         pmq auth wipe
+        pmq auth wipe --exchange kalshi
         pmq auth wipe --yes  # Skip confirmation
     """
+    if exchange.lower() == "kalshi":
+        _auth_wipe_kalshi(yes=yes)
+        return
+    elif exchange.lower() != "polymarket":
+        console.print(f"[red]Unknown exchange: {exchange}[/red]")
+        console.print("[dim]Supported: polymarket, kalshi[/dim]")
+        raise typer.Exit(1)
+
     from pmq.auth import delete_creds, get_creds_path, load_creds
 
     creds_path = get_creds_path()
 
     if not creds_path.exists():
-        console.print("[yellow]No credentials to delete[/yellow]")
+        console.print("[yellow]No Polymarket credentials to delete[/yellow]")
         return
 
     # Show what will be deleted
@@ -5186,7 +5593,37 @@ def auth_wipe(
 
     deleted = delete_creds()
     if deleted:
-        console.print("[green]✓ Credentials deleted[/green]")
+        console.print("[green]✓ Polymarket credentials deleted[/green]")
+    else:
+        console.print("[yellow]Could not delete credentials[/yellow]")
+
+
+def _auth_wipe_kalshi(yes: bool = False) -> None:
+    """Internal helper for Kalshi auth wipe."""
+    from pmq.auth.kalshi_creds import delete_kalshi_creds, get_kalshi_creds_path, load_kalshi_creds
+    from pmq.auth.redact import mask_string
+
+    creds_path = get_kalshi_creds_path()
+
+    if not creds_path.exists():
+        console.print("[yellow]No Kalshi credentials to delete[/yellow]")
+        return
+
+    # Show what will be deleted
+    creds = load_kalshi_creds()
+    if creds:
+        console.print(f"API Key to delete: [cyan]{mask_string(creds.api_key, 4)}[/cyan]")
+    console.print(f"File: [dim]{creds_path}[/dim]")
+
+    if not yes:
+        confirmed = typer.confirm("\nDelete local Kalshi credentials?")
+        if not confirmed:
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    deleted = delete_kalshi_creds()
+    if deleted:
+        console.print("[green]✓ Kalshi credentials deleted[/green]")
     else:
         console.print("[yellow]Could not delete credentials[/yellow]")
 

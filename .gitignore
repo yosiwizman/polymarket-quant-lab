@@ -139,3 +139,4 @@ cython_debug/
 data/cache/
 *.db
 !tests/fixtures/*.db
+exports/

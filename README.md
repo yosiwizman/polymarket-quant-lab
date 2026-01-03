@@ -2187,6 +2187,129 @@ With Phase 6.1, when paper execution is enabled:
 
 > 💡 **Why Paper Execution in Daemon?** The ops daemon already has stable real-time market data. Paper execution leverages this to generate signals and track simulated performance continuously, preparing for eventual live execution while maintaining strict safety controls.
 
+### Paper-Exec Explain Mode + Calibration (Phase 6.2)
+
+Phase 6.2 adds transparency to paper execution to understand WHY trades aren't firing:
+- **Explain Mode**: Captures ALL candidate opportunities (even rejected ones)
+- **Rejection Taxonomy**: Classifies rejections with explicit reasons
+- **JSONL Export**: Per-tick candidates exported for offline analysis
+- **Diagnostics**: daemon_summary includes calibration metrics
+
+#### The Problem
+
+Phase 6.1 might show 0 trades with no visibility into why. Common causes:
+- `min_signal_edge_bps` threshold too high for current market conditions
+- Liquidity too low on available markets
+- No arbitrage opportunities (YES+NO prices close to 1.0)
+
+#### Enabling Explain Mode
+
+```powershell
+# Run daemon with paper execution + explain mode
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain
+
+# Customize explain output
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain \
+  --paper-exec-top-n 25 \
+  --paper-exec-export-path ./exports/custom_explain.jsonl
+
+# Lower edge threshold for testing (capture more candidates)
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain \
+  --paper-exec-min-edge 10
+```
+
+#### Phase 6.2 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--paper-exec-explain/--no-paper-exec-explain` | bool | False | Enable explain mode |
+| `--paper-exec-top-n` | int | 10 | Number of top candidates to track per tick |
+| `--paper-exec-export-path` | Path | Auto | JSONL export path (default: exports/paper_exec_<date>.jsonl) |
+
+#### Rejection Taxonomy
+
+Explain mode classifies each candidate into one of these rejection reasons:
+
+| Reason | Description |
+|--------|-------------|
+| `executed` | Trade was executed successfully |
+| `edge_below_min` | Edge < `--paper-exec-min-edge` threshold |
+| `liquidity_below_min` | Market liquidity too low |
+| `spread_above_max` | Bid-ask spread too wide |
+| `market_inactive` | Market is not active |
+| `market_closed` | Market has closed |
+| `risk_not_approved` | Strategy not approved by governance |
+| `risk_position_limit` | Would exceed position limit |
+| `risk_notional_limit` | Would exceed notional limit |
+| `risk_blocked` | Generic risk gate block |
+| `safety_error` | SafetyGuard blocked the trade |
+| `max_trades_per_tick` | Hit per-tick trade limit |
+
+#### JSONL Export Format
+
+Each line in the JSONL file contains one tick's candidates:
+
+```json
+{
+  "timestamp": "2026-01-03T10:30:00Z",
+  "signals_found": 15,
+  "trades_executed": 0,
+  "rejection_counts": {"edge_below_min": 12, "liquidity_below_min": 3},
+  "candidates": [
+    {
+      "market_id": "0x1234...",
+      "side": "YES",
+      "edge_bps": 42.5,
+      "spread_bps": 15.0,
+      "liquidity": 5000.0,
+      "mid_price": 0.45,
+      "rejection_reason": "edge_below_min"
+    }
+  ]
+}
+```
+
+#### Daemon Summary Diagnostics
+
+When explain mode is enabled, daemon_summary.md includes a "Paper Exec Diagnostics" section:
+
+```markdown
+## Paper Exec Diagnostics (Phase 6.2)
+- **Ticks with Candidates:** 150 / 180
+- **Ticks with Edge >= 50bps:** 23
+- **Avg Top Edge:** 35.2 bps
+- **Median Top Edge:** 28.5 bps
+- **Max Top Edge:** 125.0 bps
+- **Top Rejection Reasons:**
+  - edge_below_min: 1,250
+  - liquidity_below_min: 340
+  - market_inactive: 85
+
+> **Calibration Tip:** If Ticks with Edge above min is low but Ticks with Candidates is high,
+> consider lowering `--paper-exec-min-edge` (e.g., from 50 to 25 bps) for testing.
+```
+
+#### Safe Calibration Workflow
+
+1. **Run with explain mode** to collect baseline data:
+   ```powershell
+   poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain --max-hours 2
+   ```
+
+2. **Review diagnostics** in daemon_summary.md:
+   - If `Avg Top Edge < min_edge`, consider lowering threshold
+   - If most rejections are `edge_below_min`, market conditions may not support current threshold
+
+3. **Analyze JSONL export** for detailed candidate data:
+   ```powershell
+   # Count rejection reasons
+   cat exports/paper_exec_*.jsonl | jq '.rejection_counts'
+   ```
+
+4. **Iterate safely**: Lower `--paper-exec-min-edge` in small increments (e.g., 50 → 40 → 30) and re-run
+
+> ⚠️ **SAFETY REMINDER**: This is still PAPER TRADING. Lowering thresholds increases simulated trade volume but no real orders are placed.
+
 ## Project Structure
 
 ```

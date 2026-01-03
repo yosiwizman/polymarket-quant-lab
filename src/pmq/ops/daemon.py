@@ -199,6 +199,9 @@ class TickStats:
     paper_trades_executed: int = 0  # Paper trades executed this tick
     paper_blocked_by_risk: int = 0  # Trades blocked by risk gate
     paper_pnl_total: float = 0.0  # Total PnL (realized + unrealized)
+    # Phase 6.2: Explain mode tracking
+    paper_explain_candidates: int = 0  # Number of explain candidates this tick
+    paper_explain_top_edge_bps: float = 0.0  # Top candidate edge this tick
 
 
 @dataclass
@@ -244,6 +247,12 @@ class DailyStats:
     paper_pnl_realized: float = 0.0  # Realized PnL (end of day)
     paper_pnl_unrealized: float = 0.0  # Unrealized PnL (end of day)
     paper_pnl_total: float = 0.0  # Total PnL (end of day)
+    # Phase 6.2: Explain mode daily aggregates
+    paper_explain_rejection_counts: dict[str, int] = field(default_factory=dict)  # reason -> count
+    paper_explain_ticks_with_candidates: int = 0  # Ticks with at least 1 candidate
+    paper_explain_ticks_above_min_edge: int = 0  # Ticks with top edge >= min_edge
+    paper_explain_avg_top_edge_bps: float = 0.0  # Average top edge across ticks
+    paper_explain_max_top_edge_bps: float = 0.0  # Max top edge across ticks
 
 
 def compute_adaptive_staleness(interval_seconds: int) -> float:
@@ -322,6 +331,12 @@ class DaemonConfig:
     paper_exec_trade_quantity: float = 10.0  # Quantity per paper trade
     paper_exec_require_approval: bool = True  # Require governance approval
     paper_exec_strategy_name: str = "paper_exec"  # Strategy name for governance
+    # Phase 6.2: Paper exec explain mode settings
+    paper_exec_explain: bool = (
+        False  # Enable explain mode (capture all candidates, disabled by default)
+    )
+    paper_exec_explain_top_n: int = 10  # Number of top candidates to track per tick
+    paper_exec_explain_export_path: Path | None = None  # JSONL export path (None = auto)
 
     def get_effective_staleness(self) -> float:
         """Get effective staleness threshold (adaptive if not explicitly set).
@@ -1139,13 +1154,21 @@ class DaemonRunner:
         Phase 6.1: Generates signals from market snapshots and executes
         paper trades through PaperLedger only.
 
+        Phase 6.2: With explain mode, captures ALL candidates with rejection
+        reasons and exports to JSONL for calibration.
+
         HARD RULE: No real order placement. All trades go to PaperLedger.
 
         Args:
             markets: List of market objects from this tick
             tick_stats: Tick stats to update with paper execution metrics
         """
-        from pmq.ops.paper_exec import PaperExecConfig, PaperExecutor
+        from pmq.ops.paper_exec import (
+            PaperExecConfig,
+            PaperExecutor,
+            get_default_export_path,
+            write_explain_tick,
+        )
 
         # Lazy init paper executor
         if self._paper_executor is None:
@@ -1156,6 +1179,10 @@ class DaemonRunner:
                 min_signal_edge_bps=self.config.paper_exec_min_edge_bps,
                 trade_quantity=self.config.paper_exec_trade_quantity,
                 require_approval=self.config.paper_exec_require_approval,
+                # Phase 6.2: Explain mode settings
+                explain_enabled=self.config.paper_exec_explain,
+                explain_top_n=self.config.paper_exec_explain_top_n,
+                explain_export_path=self.config.paper_exec_explain_export_path,
             )
 
             # Try to get risk gate (optional)
@@ -1175,7 +1202,8 @@ class DaemonRunner:
             )
             logger.info(
                 f"Paper executor initialized: enabled={paper_config.enabled}, "
-                f"max_trades={paper_config.max_trades_per_tick}"
+                f"max_trades={paper_config.max_trades_per_tick}, "
+                f"explain={paper_config.explain_enabled}"
             )
 
         # Convert markets to dict format for scanner
@@ -1206,6 +1234,21 @@ class DaemonRunner:
             tick_stats.paper_trades_executed = result.trades_executed
             tick_stats.paper_blocked_by_risk = result.blocked_by_risk + result.blocked_by_safety
             tick_stats.paper_pnl_total = result.total_pnl
+
+            # Phase 6.2: Update explain mode tick stats
+            if self.config.paper_exec_explain and result.explain_candidates:
+                tick_stats.paper_explain_candidates = len(result.explain_candidates)
+                tick_stats.paper_explain_top_edge_bps = result.explain_candidates[0].edge_bps
+
+                # Export tick to JSONL
+                export_path = self.config.paper_exec_explain_export_path or get_default_export_path(
+                    self.config.export_dir
+                )
+                write_explain_tick(
+                    export_path=export_path,
+                    tick_timestamp=tick_stats.timestamp,
+                    result=result,
+                )
 
             # Log paper execution if any activity
             if result.trades_executed > 0:
@@ -1277,6 +1320,14 @@ class DaemonRunner:
             self._daily_stats.paper_blocked_by_risk += tick_stats.paper_blocked_by_risk
             # Update PnL (latest snapshot, not cumulative)
             self._daily_stats.paper_pnl_total = tick_stats.paper_pnl_total
+            # Phase 6.2: Explain mode aggregates
+            if tick_stats.paper_explain_candidates > 0:
+                self._daily_stats.paper_explain_ticks_with_candidates += 1
+                top_edge = tick_stats.paper_explain_top_edge_bps
+                if top_edge >= self.config.paper_exec_min_edge_bps:
+                    self._daily_stats.paper_explain_ticks_above_min_edge += 1
+                if top_edge > self._daily_stats.paper_explain_max_top_edge_bps:
+                    self._daily_stats.paper_explain_max_top_edge_bps = top_edge
             if tick_stats.error:
                 self._daily_stats.total_errors += 1
             self._daily_stats.end_time = tick_stats.timestamp
@@ -1652,6 +1703,54 @@ class DaemonRunner:
 
 """
 
+        # Phase 6.2: Paper Exec Diagnostics section (explain mode)
+        explain_section = ""
+        if self.config.paper_exec_explain and stats.paper_explain_ticks_with_candidates > 0:
+            # Compute average top edge from tick history
+            top_edges = [
+                t.paper_explain_top_edge_bps
+                for t in stats.tick_history
+                if t.paper_explain_top_edge_bps > 0
+            ]
+            avg_top_edge = sum(top_edges) / len(top_edges) if top_edges else 0
+            # Compute median
+            if top_edges:
+                sorted_edges = sorted(top_edges)
+                mid_idx = len(sorted_edges) // 2
+                if len(sorted_edges) % 2 == 0:
+                    median_top_edge = (sorted_edges[mid_idx - 1] + sorted_edges[mid_idx]) / 2
+                else:
+                    median_top_edge = sorted_edges[mid_idx]
+            else:
+                median_top_edge = 0
+
+            # Build rejection breakdown from accumulated counts
+            rejection_lines = ""
+            if stats.paper_explain_rejection_counts:
+                sorted_rejections = sorted(
+                    stats.paper_explain_rejection_counts.items(),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                rejection_lines = "\n".join(
+                    f"  - {reason}: {count:,}" for reason, count in sorted_rejections[:10]
+                )
+                rejection_lines = f"\n{rejection_lines}"
+
+            min_edge = self.config.paper_exec_min_edge_bps
+            explain_section = f"""## Paper Exec Diagnostics (Phase 6.2)
+- **Ticks with Candidates:** {stats.paper_explain_ticks_with_candidates:,} / {stats.total_ticks}
+- **Ticks with Edge >= {min_edge:.0f}bps:** {stats.paper_explain_ticks_above_min_edge:,}
+- **Avg Top Edge:** {avg_top_edge:.1f} bps
+- **Median Top Edge:** {median_top_edge:.1f} bps
+- **Max Top Edge:** {stats.paper_explain_max_top_edge_bps:.1f} bps
+- **Top Rejection Reasons:**{rejection_lines}
+
+> **Calibration Tip:** If Ticks with Edge above min is low but Ticks with Candidates is high,
+> consider lowering `--paper-exec-min-edge` (e.g., from 50 to 25 bps) for testing.
+
+"""
+
         md_content = f"""# Daemon Summary - {date_str}
 
 ## Overview
@@ -1702,11 +1801,11 @@ class DaemonRunner:
 - **Blocked by Risk:** {stats.paper_blocked_by_risk:,}
 - **Total PnL:** ${stats.paper_pnl_total:.2f}
 
-## Errors
+{explain_section}## Errors
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon (Phase 6.1)*
+*Generated by pmq ops daemon (Phase 6.2)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)

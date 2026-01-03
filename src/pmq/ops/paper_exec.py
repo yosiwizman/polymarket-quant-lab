@@ -6,12 +6,22 @@ Phase 6.1: Live paper execution loop that:
 - Executes in PaperLedger only (no real orders)
 - Tracks per-tick and daily paper trading metrics
 
+Phase 6.2: Paper-Exec Explain Mode + Rejection Taxonomy + Calibration Exports:
+- Compute ALL candidate opportunities (even rejected ones)
+- Classify rejections with explicit taxonomy
+- Export top N candidates per tick to JSONL for calibration
+- Add diagnostics to daemon_summary for tuning min-edge
+
 HARD RULE: No real order placement or private key logic. PaperLedger only.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pmq.logging import get_logger
@@ -26,6 +36,97 @@ logger = get_logger("ops.paper_exec")
 
 
 # =============================================================================
+# Phase 6.2: Rejection Taxonomy
+# =============================================================================
+
+
+class RejectionReason(Enum):
+    """Rejection reason taxonomy for paper execution candidates.
+
+    Phase 6.2: Explicit rejection reasons for calibration and debugging.
+    Each reason maps to a specific threshold or condition that blocked execution.
+    """
+
+    # Passed all checks - executed or would execute
+    NONE = "none"
+    EXECUTED = "executed"  # Successfully executed
+
+    # Signal quality rejections
+    NO_SIGNAL = "no_signal"  # No arbitrage signal detected for market
+    EDGE_BELOW_MIN = "edge_below_min"  # Profit potential < min_signal_edge_bps
+    LIQUIDITY_BELOW_MIN = "liquidity_below_min"  # Market liquidity too low
+    SPREAD_ABOVE_MAX = "spread_above_max"  # Bid-ask spread too wide
+
+    # Market state rejections
+    MARKET_INACTIVE = "market_inactive"  # Market not active
+    MARKET_CLOSED = "market_closed"  # Market is closed
+
+    # Risk/governance rejections
+    RISK_NOT_APPROVED = "risk_not_approved"  # Strategy not approved by governance
+    RISK_POSITION_LIMIT = "risk_position_limit"  # Would exceed position limit
+    RISK_NOTIONAL_LIMIT = "risk_notional_limit"  # Would exceed notional limit
+    RISK_TRADE_RATE_LIMIT = "risk_trade_rate_limit"  # Too many trades in window
+    RISK_BLOCKED = "risk_blocked"  # Generic risk gate block
+
+    # Safety rejections
+    SAFETY_ERROR = "safety_error"  # SafetyGuard blocked the trade
+
+    # Execution limit
+    MAX_TRADES_PER_TICK = "max_trades_per_tick"  # Hit per-tick trade limit
+
+
+@dataclass
+class ExplainCandidate:
+    """Candidate opportunity with explain data for calibration.
+
+    Phase 6.2: Captures all relevant data for a potential trade,
+    including why it was rejected (if applicable).
+    """
+
+    # Market identification
+    market_id: str
+    token_id: str | None = None
+    market_question: str = ""
+
+    # Signal data
+    side: str = "arb"  # "arb" for arbitrage, "long", "short" for directional
+    yes_price: float = 0.0
+    no_price: float = 0.0
+    mid_price: float = 0.0
+    spread_bps: float = 0.0  # Bid-ask spread in basis points (if available)
+    edge_bps: float = 0.0  # Computed edge/profit potential in basis points
+    liquidity: float = 0.0  # Market liquidity estimate
+    size_estimate: float = 0.0  # Estimated executable size
+
+    # Rejection tracking
+    rejection_reason: RejectionReason = RejectionReason.NONE
+    rejection_detail: str = ""  # Additional context (e.g., "edge=42bps < min=50bps")
+
+    # Execution result (if executed)
+    executed: bool = False
+    trade_ids: list[int] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON export."""
+        return {
+            "market_id": self.market_id,
+            "token_id": self.token_id,
+            "market_question": self.market_question[:100] if self.market_question else "",
+            "side": self.side,
+            "yes_price": round(self.yes_price, 6),
+            "no_price": round(self.no_price, 6),
+            "mid_price": round(self.mid_price, 6),
+            "spread_bps": round(self.spread_bps, 2),
+            "edge_bps": round(self.edge_bps, 2),
+            "liquidity": round(self.liquidity, 2),
+            "size_estimate": round(self.size_estimate, 2),
+            "rejection_reason": self.rejection_reason.value,
+            "rejection_detail": self.rejection_detail,
+            "executed": self.executed,
+        }
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -36,6 +137,9 @@ class PaperExecConfig:
 
     SAFETY: Paper execution is disabled by default and requires explicit
     opt-in. All trades go through PaperLedger only - no real orders.
+
+    Phase 6.2: Explain mode captures ALL candidates (even rejected) for
+    calibration and debugging. Export path defaults to exports/paper_exec_<date>.jsonl.
     """
 
     enabled: bool = False  # Must be explicitly enabled
@@ -47,6 +151,10 @@ class PaperExecConfig:
     # Scanner config overrides (None = use defaults)
     arb_threshold: float | None = None  # ArbitrageScanner threshold
     min_liquidity: float | None = None  # Minimum liquidity requirement
+    # Phase 6.2: Explain mode settings
+    explain_enabled: bool = False  # Enable explain mode (capture all candidates)
+    explain_top_n: int = 10  # Number of top candidates to track per tick
+    explain_export_path: Path | None = None  # JSONL export path (None = auto)
 
 
 # =============================================================================
@@ -60,6 +168,8 @@ class PaperExecResult:
 
     Contains counts of signals found, executed, blocked, and errors.
     Also includes PnL snapshot from PaperLedger.
+
+    Phase 6.2: Added explain_candidates and rejection_counts for calibration.
     """
 
     # Signal/trade counts
@@ -80,6 +190,10 @@ class PaperExecResult:
     executed_signals: list[dict[str, Any]] = field(default_factory=list)
     blocked_reasons: list[str] = field(default_factory=list)
     error_messages: list[str] = field(default_factory=list)
+
+    # Phase 6.2: Explain mode data
+    explain_candidates: list[ExplainCandidate] = field(default_factory=list)
+    rejection_counts: dict[str, int] = field(default_factory=dict)  # reason -> count
 
 
 # =============================================================================
@@ -159,8 +273,18 @@ class PaperExecutor:
 
         Returns:
             PaperExecResult with execution metrics
+
+        Phase 6.2: When explain_enabled, also computes ALL candidates with
+        rejection reasons and tracks top N by edge for calibration.
         """
         result = PaperExecResult()
+        all_candidates: list[ExplainCandidate] = []  # Phase 6.2: Track all candidates
+        rejection_counts: dict[str, int] = {}  # Phase 6.2: Count by reason
+
+        def _count_rejection(reason: RejectionReason) -> None:
+            """Increment rejection counter."""
+            key = reason.value
+            rejection_counts[key] = rejection_counts.get(key, 0) + 1
 
         if not self.config.enabled:
             # Paper execution disabled - just return PnL snapshot
@@ -172,10 +296,14 @@ class PaperExecutor:
             return result
 
         # Check governance approval if required
+        strategy_approved = True
+        approval_rejection_reason = ""
         if self.config.require_approval and self._risk_gate:
             try:
                 approval = self._risk_gate.check_approval(strategy_name)
                 if not approval.approved:
+                    strategy_approved = False
+                    approval_rejection_reason = approval.reason
                     logger.debug(f"Paper execution blocked: {approval.reason}")
                     result.blocked_reasons.append(f"Not approved: {approval.reason}")
                     result.blocked_by_risk += 1
@@ -185,7 +313,9 @@ class PaperExecutor:
                     result.unrealized_pnl = pnl["total_unrealized_pnl"]
                     result.total_pnl = pnl["total_pnl"]
                     result.position_count = pnl["position_count"]
-                    return result
+                    # Phase 6.2: Even if not approved, build candidates in explain mode
+                    if not self.config.explain_enabled:
+                        return result
             except Exception as e:
                 logger.warning(f"Risk gate check failed: {e}")
                 result.error_messages.append(f"Risk gate error: {e}")
@@ -194,11 +324,14 @@ class PaperExecutor:
         # Limit markets scanned
         markets_to_scan = markets_data[: self.config.max_markets_scanned]
 
+        # Phase 6.2: In explain mode, get ALL signals (not limited)
+        scan_top_n = None if self.config.explain_enabled else self.config.max_trades_per_tick * 2
+
         # Run arbitrage scanner
         try:
             arb_signals = self._arb_scanner.scan_from_db(
                 markets_to_scan,
-                top_n=self.config.max_trades_per_tick * 2,  # Get more than we need
+                top_n=scan_top_n,
             )
             result.signals_found = len(arb_signals)
         except Exception as e:
@@ -207,76 +340,188 @@ class PaperExecutor:
             result.errors += 1
             arb_signals = []
 
-        # Filter by minimum edge
+        # Build lookup for market data
+        markets_lookup = {m.get("id", ""): m for m in markets_to_scan}
+
+        # Phase 6.2: Process ALL signals and track candidates with rejection reasons
         min_edge = self.config.min_signal_edge_bps / 10000  # Convert bps to decimal
-        filtered_signals = [sig for sig in arb_signals if sig.profit_potential >= min_edge]
+        min_liquidity = self._arb_scanner._config.min_liquidity
+
+        # Build candidates from signals
+        for signal in arb_signals:
+            market_data = markets_lookup.get(signal.market_id, {})
+            edge_bps = signal.profit_potential * 10000
+            mid_price = (
+                (signal.yes_price + signal.no_price) / 2
+                if signal.yes_price + signal.no_price > 0
+                else 0
+            )
+
+            candidate = ExplainCandidate(
+                market_id=signal.market_id,
+                market_question=signal.market_question,
+                side="arb",
+                yes_price=signal.yes_price,
+                no_price=signal.no_price,
+                mid_price=mid_price,
+                edge_bps=edge_bps,
+                liquidity=signal.liquidity,
+                size_estimate=self.config.trade_quantity,
+            )
+
+            # Determine rejection reason (if any)
+            if not strategy_approved:
+                candidate.rejection_reason = RejectionReason.RISK_NOT_APPROVED
+                candidate.rejection_detail = approval_rejection_reason
+                _count_rejection(RejectionReason.RISK_NOT_APPROVED)
+            elif not market_data.get("active", True):
+                candidate.rejection_reason = RejectionReason.MARKET_INACTIVE
+                candidate.rejection_detail = "Market is not active"
+                _count_rejection(RejectionReason.MARKET_INACTIVE)
+            elif market_data.get("closed", False):
+                candidate.rejection_reason = RejectionReason.MARKET_CLOSED
+                candidate.rejection_detail = "Market is closed"
+                _count_rejection(RejectionReason.MARKET_CLOSED)
+            elif signal.liquidity < min_liquidity:
+                candidate.rejection_reason = RejectionReason.LIQUIDITY_BELOW_MIN
+                candidate.rejection_detail = (
+                    f"liquidity={signal.liquidity:.0f} < min={min_liquidity:.0f}"
+                )
+                _count_rejection(RejectionReason.LIQUIDITY_BELOW_MIN)
+            elif signal.profit_potential < min_edge:
+                candidate.rejection_reason = RejectionReason.EDGE_BELOW_MIN
+                candidate.rejection_detail = (
+                    f"edge={edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                )
+                _count_rejection(RejectionReason.EDGE_BELOW_MIN)
+            # Passed basic filters - will be evaluated for execution
+
+            all_candidates.append(candidate)
+
+        # Filter signals that pass basic checks for execution
+        filtered_signals = [
+            sig
+            for sig in arb_signals
+            if sig.profit_potential >= min_edge and sig.liquidity >= min_liquidity
+        ]
         result.signals_evaluated = len(filtered_signals)
 
-        # Execute trades up to limit
+        # Execute trades up to limit (only if approved)
         trades_this_tick = 0
-        for signal in filtered_signals:
-            if trades_this_tick >= self.config.max_trades_per_tick:
-                break
+        executed_market_ids: set[str] = set()
 
-            # Check risk gate trade limit if available
-            if self._risk_gate:
-                positions = self._paper_ledger.get_all_positions()
-                total_notional = sum(
-                    (p.yes_quantity * p.avg_price_yes + p.no_quantity * p.avg_price_no)
-                    for p in positions
-                )
-                trade_notional = self.config.trade_quantity * (signal.yes_price + signal.no_price)
-
-                allowed, reason = self._risk_gate.check_trade_limit(
-                    market_id=signal.market_id,
-                    notional=trade_notional,
-                    current_positions=len(positions),
-                    current_total_notional=total_notional,
-                )
-
-                if not allowed:
-                    logger.debug(f"Trade blocked by risk gate: {reason}")
-                    result.blocked_reasons.append(reason)
-                    result.blocked_by_risk += 1
+        if strategy_approved:
+            for signal in filtered_signals:
+                if trades_this_tick >= self.config.max_trades_per_tick:
+                    # Mark remaining candidates as blocked by max trades
+                    for cand in all_candidates:
+                        if (
+                            cand.market_id == signal.market_id
+                            and cand.rejection_reason == RejectionReason.NONE
+                        ):
+                            cand.rejection_reason = RejectionReason.MAX_TRADES_PER_TICK
+                            cand.rejection_detail = f"trades_this_tick={trades_this_tick} >= max={self.config.max_trades_per_tick}"
+                            _count_rejection(RejectionReason.MAX_TRADES_PER_TICK)
                     continue
 
-            # Execute paper trade
-            try:
-                yes_trade, no_trade = self._paper_ledger.execute_arb_trade(
-                    signal, quantity=self.config.trade_quantity
-                )
-
-                trades_this_tick += 1
-                result.trades_executed += 2  # Both YES and NO trades
-                result.executed_signals.append(
-                    {
-                        "market_id": signal.market_id,
-                        "yes_price": signal.yes_price,
-                        "no_price": signal.no_price,
-                        "profit_potential_bps": signal.profit_potential * 10000,
-                        "quantity": self.config.trade_quantity,
-                    }
-                )
-
-                # Record trade in risk gate if available
+                # Check risk gate trade limit if available
                 if self._risk_gate:
-                    self._risk_gate.record_trade()
-                    self._risk_gate.record_trade()  # Two trades (YES + NO)
+                    positions = self._paper_ledger.get_all_positions()
+                    total_notional = sum(
+                        (p.yes_quantity * p.avg_price_yes + p.no_quantity * p.avg_price_no)
+                        for p in positions
+                    )
+                    trade_notional = self.config.trade_quantity * (
+                        signal.yes_price + signal.no_price
+                    )
 
-                logger.info(
-                    f"Paper trade executed: {signal.market_id[:16]}... "
-                    f"edge={signal.profit_potential * 10000:.1f}bps"
-                )
+                    allowed, reason = self._risk_gate.check_trade_limit(
+                        market_id=signal.market_id,
+                        notional=trade_notional,
+                        current_positions=len(positions),
+                        current_total_notional=total_notional,
+                    )
 
-            except SafetyError as e:
-                logger.debug(f"Trade blocked by safety: {e}")
-                result.blocked_reasons.append(f"Safety: {e}")
-                result.blocked_by_safety += 1
+                    if not allowed:
+                        logger.debug(f"Trade blocked by risk gate: {reason}")
+                        result.blocked_reasons.append(reason)
+                        result.blocked_by_risk += 1
+                        # Update candidate with risk rejection
+                        for cand in all_candidates:
+                            if (
+                                cand.market_id == signal.market_id
+                                and cand.rejection_reason == RejectionReason.NONE
+                            ):
+                                if "position" in reason.lower():
+                                    cand.rejection_reason = RejectionReason.RISK_POSITION_LIMIT
+                                elif "notional" in reason.lower():
+                                    cand.rejection_reason = RejectionReason.RISK_NOTIONAL_LIMIT
+                                else:
+                                    cand.rejection_reason = RejectionReason.RISK_BLOCKED
+                                cand.rejection_detail = reason
+                                _count_rejection(cand.rejection_reason)
+                        continue
 
-            except Exception as e:
-                logger.warning(f"Paper trade failed: {e}")
-                result.error_messages.append(f"Trade error: {e}")
-                result.errors += 1
+                # Execute paper trade
+                try:
+                    yes_trade, no_trade = self._paper_ledger.execute_arb_trade(
+                        signal, quantity=self.config.trade_quantity
+                    )
+
+                    trades_this_tick += 1
+                    result.trades_executed += 2  # Both YES and NO trades
+                    executed_market_ids.add(signal.market_id)
+                    result.executed_signals.append(
+                        {
+                            "market_id": signal.market_id,
+                            "yes_price": signal.yes_price,
+                            "no_price": signal.no_price,
+                            "profit_potential_bps": signal.profit_potential * 10000,
+                            "quantity": self.config.trade_quantity,
+                        }
+                    )
+
+                    # Mark candidate as executed
+                    for cand in all_candidates:
+                        if (
+                            cand.market_id == signal.market_id
+                            and cand.rejection_reason == RejectionReason.NONE
+                        ):
+                            cand.executed = True
+                            cand.trade_ids = [
+                                getattr(yes_trade, "id", 0),
+                                getattr(no_trade, "id", 0),
+                            ]
+                            _count_rejection(RejectionReason.NONE)  # Count successful executions
+
+                    # Record trade in risk gate if available
+                    if self._risk_gate:
+                        self._risk_gate.record_trade()
+                        self._risk_gate.record_trade()  # Two trades (YES + NO)
+
+                    logger.info(
+                        f"Paper trade executed: {signal.market_id[:16]}... "
+                        f"edge={signal.profit_potential * 10000:.1f}bps"
+                    )
+
+                except SafetyError as e:
+                    logger.debug(f"Trade blocked by safety: {e}")
+                    result.blocked_reasons.append(f"Safety: {e}")
+                    result.blocked_by_safety += 1
+                    # Update candidate with safety rejection
+                    for cand in all_candidates:
+                        if (
+                            cand.market_id == signal.market_id
+                            and cand.rejection_reason == RejectionReason.NONE
+                        ):
+                            cand.rejection_reason = RejectionReason.SAFETY_ERROR
+                            cand.rejection_detail = str(e)
+                            _count_rejection(RejectionReason.SAFETY_ERROR)
+
+                except Exception as e:
+                    logger.warning(f"Paper trade failed: {e}")
+                    result.error_messages.append(f"Trade error: {e}")
+                    result.errors += 1
 
         # Get final PnL snapshot
         pnl = self._paper_ledger.calculate_pnl(markets_data=current_prices)
@@ -285,11 +530,29 @@ class PaperExecutor:
         result.total_pnl = pnl["total_pnl"]
         result.position_count = pnl["position_count"]
 
+        # Phase 6.2: Store explain data
+        result.rejection_counts = rejection_counts
+
+        # Sort candidates by edge (descending) and take top N
+        sorted_candidates = sorted(all_candidates, key=lambda c: c.edge_bps, reverse=True)
+        result.explain_candidates = sorted_candidates[: self.config.explain_top_n]
+
         if result.trades_executed > 0:
             logger.info(
                 f"Paper tick: {result.signals_found} signals, "
                 f"{result.trades_executed} trades, "
                 f"PnL=${result.total_pnl:.2f}"
+            )
+
+        # Phase 6.2: Log explain summary
+        if self.config.explain_enabled and all_candidates:
+            total_rejected = sum(v for k, v in rejection_counts.items() if k != "none")
+            total_executed = rejection_counts.get("none", 0)
+            top_edge = sorted_candidates[0].edge_bps if sorted_candidates else 0
+            logger.debug(
+                f"Explain: {len(all_candidates)} candidates, "
+                f"{total_executed} executed, {total_rejected} rejected, "
+                f"top_edge={top_edge:.1f}bps"
             )
 
         return result
@@ -326,3 +589,144 @@ class PaperExecutor:
     def get_stats(self) -> dict[str, Any]:
         """Get paper trading statistics."""
         return self._paper_ledger.get_stats()
+
+
+# =============================================================================
+# Phase 6.2: JSONL Export for Explain Mode
+# =============================================================================
+
+
+def write_explain_tick(
+    export_path: Path,
+    tick_timestamp: str,
+    result: PaperExecResult,
+) -> None:
+    """Write explain data for a single tick to JSONL file.
+
+    Phase 6.2: Appends one JSON line per tick with candidates and rejection counts.
+    Safe to call multiple times per day - appends to existing file.
+
+    Args:
+        export_path: Path to JSONL file (will be created if doesn't exist)
+        tick_timestamp: ISO timestamp for this tick
+        result: PaperExecResult with explain_candidates and rejection_counts
+    """
+    tick_record = {
+        "timestamp": tick_timestamp,
+        "signals_found": result.signals_found,
+        "signals_evaluated": result.signals_evaluated,
+        "trades_executed": result.trades_executed,
+        "blocked_by_risk": result.blocked_by_risk,
+        "blocked_by_safety": result.blocked_by_safety,
+        "total_pnl": round(result.total_pnl, 2),
+        "rejection_counts": result.rejection_counts,
+        "candidates": [c.to_dict() for c in result.explain_candidates],
+    }
+
+    # Ensure directory exists
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Append to JSONL file
+    with open(export_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(tick_record) + "\n")
+
+
+def get_default_export_path(export_dir: Path, date_str: str | None = None) -> Path:
+    """Get default export path for explain JSONL.
+
+    Args:
+        export_dir: Directory for exports
+        date_str: Date string (YYYY-MM-DD), defaults to today
+
+    Returns:
+        Path like exports/paper_exec_2026-01-03.jsonl
+    """
+    if date_str is None:
+        date_str = datetime.now(UTC).strftime("%Y-%m-%d")
+    return export_dir / f"paper_exec_{date_str}.jsonl"
+
+
+@dataclass
+class ExplainSummary:
+    """Summary statistics from explain mode data.
+
+    Phase 6.2: Computed from accumulated explain tick data for daemon_summary.
+    """
+
+    total_ticks: int = 0
+    total_candidates: int = 0
+    total_executed: int = 0
+    total_rejected: int = 0
+
+    # Rejection breakdown
+    rejection_counts: dict[str, int] = field(default_factory=dict)
+
+    # Edge statistics (from top candidates)
+    avg_top_edge_bps: float = 0.0
+    median_top_edge_bps: float = 0.0
+    max_top_edge_bps: float = 0.0
+
+    # Ticks with opportunities
+    ticks_with_candidates: int = 0  # Ticks with at least 1 candidate
+    ticks_with_candidates_above_min_edge: int = 0  # Ticks with top candidate >= min_edge
+
+    @classmethod
+    def from_results(
+        cls,
+        results: list[PaperExecResult],
+        min_edge_bps: float = 50.0,
+    ) -> ExplainSummary:
+        """Build summary from list of tick results.
+
+        Args:
+            results: List of PaperExecResult from each tick
+            min_edge_bps: Minimum edge threshold for counting "above min" ticks
+
+        Returns:
+            ExplainSummary with aggregated statistics
+        """
+        summary = cls()
+        summary.total_ticks = len(results)
+
+        top_edges: list[float] = []
+        combined_rejection_counts: dict[str, int] = {}
+
+        for result in results:
+            candidates = result.explain_candidates
+            rejection_counts = result.rejection_counts
+
+            if candidates:
+                summary.ticks_with_candidates += 1
+                top_edge = candidates[0].edge_bps if candidates else 0
+                top_edges.append(top_edge)
+
+                if top_edge >= min_edge_bps:
+                    summary.ticks_with_candidates_above_min_edge += 1
+
+            summary.total_candidates += len(candidates)
+
+            # Aggregate rejection counts
+            for reason, count in rejection_counts.items():
+                combined_rejection_counts[reason] = combined_rejection_counts.get(reason, 0) + count
+
+        # Compute totals
+        summary.total_executed = combined_rejection_counts.get("executed", 0)
+        summary.total_rejected = sum(
+            v for k, v in combined_rejection_counts.items() if k != "executed"
+        )
+        summary.rejection_counts = combined_rejection_counts
+
+        # Compute edge statistics
+        if top_edges:
+            summary.avg_top_edge_bps = sum(top_edges) / len(top_edges)
+            sorted_edges = sorted(top_edges)
+            mid_idx = len(sorted_edges) // 2
+            if len(sorted_edges) % 2 == 0:
+                summary.median_top_edge_bps = (
+                    sorted_edges[mid_idx - 1] + sorted_edges[mid_idx]
+                ) / 2
+            else:
+                summary.median_top_edge_bps = sorted_edges[mid_idx]
+            summary.max_top_edge_bps = max(top_edges)
+
+        return summary

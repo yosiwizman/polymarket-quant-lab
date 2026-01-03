@@ -4127,6 +4127,28 @@ def ops_daemon(
             help="Quantity per paper trade (default: 10)",
         ),
     ] = 10.0,
+    # Phase 6.2: Paper exec explain mode flags
+    paper_exec_explain: Annotated[
+        bool,
+        typer.Option(
+            "--paper-exec-explain/--no-paper-exec-explain",
+            help="Enable explain mode: capture ALL candidates with rejection reasons for calibration (default: off)",
+        ),
+    ] = False,
+    paper_exec_explain_top_n: Annotated[
+        int,
+        typer.Option(
+            "--paper-exec-top-n",
+            help="Number of top candidates to track per tick in explain mode (default: 10)",
+        ),
+    ] = 10,
+    paper_exec_explain_export_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--paper-exec-export-path",
+            help="JSONL export path for explain data (default: exports/paper_exec_<date>.jsonl)",
+        ),
+    ] = None,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -4244,6 +4266,10 @@ def ops_daemon(
         paper_exec_max_trades_per_tick=paper_exec_max_trades,
         paper_exec_min_edge_bps=paper_exec_min_edge_bps,
         paper_exec_trade_quantity=paper_exec_quantity,
+        # Phase 6.2: Paper exec explain mode
+        paper_exec_explain=paper_exec_explain,
+        paper_exec_explain_top_n=paper_exec_explain_top_n,
+        paper_exec_explain_export_path=paper_exec_explain_export_path,
     )
 
     # Initialize dependencies
@@ -4287,8 +4313,9 @@ def ops_daemon(
     seed_max_str = str(seed_max) if seed_max else str(limit)
     skiplist_str = str(seed_skiplist_path) if seed_skiplist_path else "disabled"
     paper_str = "on" if paper_exec else "off"
+    explain_str = "on" if paper_exec_explain else "off"
     console.print(
-        f"[bold green]Starting ops daemon (Phase 6.1)[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 6.2)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
@@ -4302,6 +4329,7 @@ def ops_daemon(
         f"Seed Skiplist: {skiplist_str}\n"
         f"REST Resilience: {rest_rps:.1f} rps, burst {rest_burst}, {rest_retries} retries\n"
         f"Paper Execution: [cyan]{paper_str}[/cyan] (max={paper_exec_max_trades}/tick, min_edge={paper_exec_min_edge_bps}bps)\n"
+        f"Paper Explain: [cyan]{explain_str}[/cyan] (top_n={paper_exec_explain_top_n})\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"

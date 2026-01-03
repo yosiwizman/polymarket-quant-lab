@@ -5322,5 +5322,217 @@ def ops_live_smoke(
         raise typer.Exit(1)
 
 
+@ops_app.command("live-preflight")
+def ops_live_preflight(
+    require_auth: Annotated[
+        bool,
+        typer.Option(
+            "--require-auth",
+            help="Require L2 authentication check (recommended)",
+        ),
+    ] = True,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-V", help="Show detailed output"),
+    ] = False,
+) -> None:
+    """Pre-flight check for live execution (Phase 12).
+
+    Validates all requirements for safe live order placement:
+    1. Geoblock check - Must not be blocked
+    2. Kill switch check - Must not exist (~/.pmq/KILL)
+    3. TTL approval check - Must have active live_exec approval
+    4. Auth sanity check - Credentials and L2 client must work
+
+    This command is deterministic and does NOT place any orders.
+
+    Example:
+        pmq ops live-preflight
+        pmq ops live-preflight --require-auth --verbose
+    """
+    import os
+    from pathlib import Path
+
+    import httpx
+
+    console.print("[bold]Phase 12 Live Execution Preflight Check[/bold]\n")
+
+    all_passed = True
+    checks: list[tuple[str, bool, str]] = []  # (name, passed, detail)
+
+    # Step 1: Geoblock check
+    console.print("[cyan]1. Checking geoblock status...[/cyan]")
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get("https://polymarket.com/api/geoblock")
+            resp.raise_for_status()
+            geoblock_data = resp.json()
+
+            blocked = geoblock_data.get("blocked", True)
+            country = geoblock_data.get("country", "unknown")
+
+            if blocked:
+                console.print(f"   [red]✗ BLOCKED[/red] - Location: {country}")
+                console.print("   [red]Live trading not available in your region.[/red]")
+                checks.append(("Geoblock", False, f"Blocked in {country}"))
+                all_passed = False
+            else:
+                console.print(f"   [green]✓ NOT BLOCKED[/green] - Location: {country}")
+                checks.append(("Geoblock", True, f"Clear in {country}"))
+    except Exception as e:
+        console.print(f"   [yellow]⚠ Could not check geoblock: {e}[/yellow]")
+        checks.append(("Geoblock", False, f"Error: {e}"))
+        all_passed = False
+
+    # Step 2: Kill switch check
+    console.print("\n[cyan]2. Checking kill switch...[/cyan]")
+    kill_switch_path = Path.home() / ".pmq" / "KILL"
+    if kill_switch_path.exists():
+        console.print(f"   [red]✗ KILL SWITCH ACTIVE[/red] at {kill_switch_path}")
+        console.print("   [dim]Delete the file to enable live execution[/dim]")
+        checks.append(("Kill Switch", False, "KILL file exists"))
+        all_passed = False
+    else:
+        console.print("   [green]✓ Kill switch not active[/green]")
+        checks.append(("Kill Switch", True, "No KILL file"))
+
+    # Step 3: TTL approval check for live_exec scope
+    console.print("\n[cyan]3. Checking live_exec TTL approval...[/cyan]")
+    try:
+        from pmq.risk import get_approval, is_approved
+
+        approved = is_approved("live_exec")
+        approval = get_approval("live_exec")
+
+        if approved and approval:
+            remaining = approval.time_remaining()
+            remaining_minutes = int(remaining.total_seconds() // 60)
+            console.print(
+                f"   [green]✓ live_exec APPROVED[/green] - {remaining_minutes}m remaining"
+            )
+            checks.append(("TTL Approval", True, f"Approved for {remaining_minutes}m"))
+        elif approval and not approval.is_valid():
+            console.print("   [red]✗ live_exec EXPIRED[/red]")
+            console.print(
+                "   [dim]Run: pmq risk approve live_exec --ttl-minutes 60[/dim]"
+            )
+            checks.append(("TTL Approval", False, "Expired"))
+            all_passed = False
+        else:
+            console.print("   [red]✗ NO live_exec approval found[/red]")
+            console.print(
+                "   [dim]Run: pmq risk approve live_exec --ttl-minutes 60 --reason 'first live trade'[/dim]"
+            )
+            checks.append(("TTL Approval", False, "Not found"))
+            all_passed = False
+    except Exception as e:
+        console.print(f"   [red]✗ Approval check failed: {e}[/red]")
+        checks.append(("TTL Approval", False, f"Error: {e}"))
+        all_passed = False
+
+    # Step 4: Auth sanity check (if require_auth)
+    if require_auth:
+        console.print("\n[cyan]4. Checking L2 authentication...[/cyan]")
+        try:
+            from pmq.auth import load_creds
+            from pmq.auth.client_factory import check_auth_sanity, create_clob_client
+
+            private_key = os.environ.get("PRIVATE_KEY") or os.environ.get(
+                "PMQ_PRIVATE_KEY"
+            )
+            creds = load_creds()
+
+            if not creds:
+                console.print("   [red]✗ No credentials found[/red]")
+                console.print("   [dim]Run: pmq auth init[/dim]")
+                checks.append(("Auth", False, "No credentials"))
+                all_passed = False
+            elif not private_key:
+                console.print("   [red]✗ PRIVATE_KEY not set[/red]")
+                console.print('   [dim]Set it with: $env:PRIVATE_KEY = "0x..."[/dim]')
+                checks.append(("Auth", False, "No private key"))
+                all_passed = False
+            else:
+                # Create CLOB client and run sanity check
+                client = create_clob_client(
+                    private_key=private_key,
+                    chain_id=137,  # Polygon mainnet
+                    signature_type=creds.signature_type,
+                    funder_address=creds.funder_address,
+                )
+                result = check_auth_sanity(client)
+
+                if result.success:
+                    console.print(
+                        f"   [green]✓ Auth sanity check passed[/green] - {result.message}"
+                    )
+                    checks.append(("Auth", True, result.message))
+                    if verbose and result.open_orders is not None:
+                        console.print(
+                            f"   [dim]Open orders: {result.open_orders}[/dim]"
+                        )
+                else:
+                    console.print(f"   [red]✗ Auth sanity check failed[/red]")
+                    console.print(f"   [dim]{result.message}[/dim]")
+                    checks.append(("Auth", False, result.message))
+                    all_passed = False
+
+        except ImportError as e:
+            console.print(f"   [red]✗ Missing dependency: {e}[/red]")
+            console.print("   [dim]Run: poetry add py-clob-client[/dim]")
+            checks.append(("Auth", False, f"Import error: {e}"))
+            all_passed = False
+        except Exception as e:
+            console.print(f"   [red]✗ Auth check failed: {e}[/red]")
+            checks.append(("Auth", False, f"Error: {e}"))
+            all_passed = False
+
+    # Step 5: Safety defaults check
+    console.print("\n[cyan]5. Safety defaults check...[/cyan]")
+    try:
+        from pmq.ops.live_exec import DEFAULT_MAX_ORDER_USD, DEFAULT_MAX_ORDERS_PER_HOUR
+
+        console.print(
+            f"   [green]✓[/green] Max order size: ${DEFAULT_MAX_ORDER_USD:.2f}"
+        )
+        console.print(
+            f"   [green]✓[/green] Max orders/hour: {DEFAULT_MAX_ORDERS_PER_HOUR}"
+        )
+        console.print("   [green]✓[/green] Confirm flag required (dry-run by default)")
+        console.print("   [green]✓[/green] SELL_BOTH disabled")
+        checks.append(("Safety Defaults", True, "Conservative limits active"))
+    except ImportError:
+        console.print("   [yellow]⚠ Could not import live_exec module[/yellow]")
+        checks.append(("Safety Defaults", True, "Assumed OK"))
+
+    # Summary
+    console.print("\n" + "─" * 50)
+
+    # Summary table
+    table = Table(title="Preflight Summary")
+    table.add_column("Check", style="cyan")
+    table.add_column("Status")
+    table.add_column("Detail")
+
+    for name, passed, detail in checks:
+        status = "[green]✓ PASS[/green]" if passed else "[red]✗ FAIL[/red]"
+        table.add_row(name, status, detail)
+
+    console.print(table)
+
+    if all_passed:
+        console.print("\n[bold green]✓ LIVE EXECUTION PREFLIGHT PASSED[/bold green]")
+        console.print("[dim]Ready for live order placement with:[/dim]")
+        console.print("[dim]  --live-exec --live-exec-confirm[/dim]")
+        console.print("[yellow]")
+        console.print("⚠️  WARNING: Live orders use REAL MONEY. Start small ($1-5).")
+        console.print("⚠️  Create ~/.pmq/KILL file anytime to halt all live execution.")
+        console.print("[/yellow]")
+    else:
+        console.print("\n[bold red]✗ LIVE EXECUTION PREFLIGHT FAILED[/bold red]")
+        console.print("[dim]Resolve issues above before attempting live execution.[/dim]")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

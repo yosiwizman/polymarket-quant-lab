@@ -1,8 +1,8 @@
 # Polymarket Quant Lab
 
-A quantitative trading platform for Polymarket prediction markets. Phase 1 focuses on market data ingestion, paper trading, and signal detection with safety guardrails.
+A quantitative trading platform for Polymarket prediction markets. Features market data ingestion, paper trading, signal detection, backtesting, governance, and live execution with comprehensive safety guardrails.
 
-> ⚠️ **IMPORTANT**: This is Phase 1 - no live trading is implemented. All trades are simulated paper trades. No API keys or wallets are required.
+> ⚠️ **IMPORTANT**: Live trading (Phase 12) is **DISABLED BY DEFAULT**. Paper trading requires no API keys. Live execution requires explicit `--live-exec` flag, TTL approval, and `--live-exec-confirm` confirmation.
 
 ## Features
 
@@ -2616,6 +2616,129 @@ Daemon summary now includes "Net Edge Diagnostics" section with net edge statist
 
 > ⚠️ **SAFETY**: Approvals expire automatically. If you need long-running approval, either increase TTL or re-approve periodically. This prevents forgotten approvals from allowing unintended trades.
 
+### Live Execution (Phase 12)
+
+Phase 12 adds REAL order placement capability via the `py-clob-client` library. This is **DISABLED BY DEFAULT** and requires multiple explicit safety gates.
+
+> ⚠️ **WARNING**: Live execution places REAL orders with REAL money. Only enable after thorough testing with paper execution.
+
+#### Safety Architecture
+
+Live execution requires ALL of these conditions:
+
+1. **`--live-exec` CLI flag**: Explicitly passed to daemon command
+2. **TTL Approval**: Active approval for `live_exec` scope (separate from `paper_exec`)
+3. **`--live-exec-confirm` flag**: Explicit confirmation to post real orders (otherwise dry-run)
+4. **No Kill Switch**: `~/.pmq/KILL` file must NOT exist
+5. **Auth Sanity**: Valid CLOB credentials with working L2 auth
+6. **Geoblock Clear**: Must pass geoblock check
+
+#### Live Execution Defaults
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `False` | Must explicitly enable with `--live-exec` |
+| `confirm` | `False` | Dry-run by default (no real orders) |
+| `max_order_usd` | `$5.00` | Maximum per-order size |
+| `max_orders_per_hour` | `2` | Rate limit on real orders |
+| `min_net_edge_bps` | `10.0` | Minimum edge after fees |
+
+#### Live Preflight Command
+
+Before running live execution, verify all safety checks:
+
+```powershell
+# Run live preflight checks
+poetry run pmq ops live-preflight
+
+# With auth validation
+poetry run pmq ops live-preflight --require-auth
+```
+
+Output shows:
+- Geoblock status
+- Kill switch status (`~/.pmq/KILL`)
+- TTL approval status for `live_exec` scope
+- Auth sanity (if `--require-auth`)
+- Current safety defaults
+
+#### Enabling Live Execution
+
+```powershell
+# Step 1: Grant time-limited approval for live execution
+poetry run pmq risk approve live_exec --ttl-minutes 60 --reason "First live trade test"
+
+# Step 2: Run preflight to verify everything is ready
+poetry run pmq ops live-preflight --require-auth
+
+# Step 3: Run daemon with live execution in DRY-RUN mode (no real orders)
+poetry run pmq ops daemon --interval 60 --live-exec
+
+# Step 4: When ready, enable REAL order placement
+poetry run pmq ops daemon --interval 60 --live-exec --live-exec-confirm
+```
+
+#### Live Ledger
+
+All live orders are logged to a persistent JSON ledger:
+
+- Location: `exports/live_ledger.json`
+- Atomic writes (temp file → rename) for crash safety
+- Redacts sensitive data (API keys) from logs
+- Tracks: timestamp, market_id, side, price, size, order_id, status
+
+#### Safety Checks (10 Total)
+
+| Check | Description | Rejection Reason |
+|-------|-------------|------------------|
+| 1. Enabled | `--live-exec` flag provided | `LIVE_EXEC_DISABLED` |
+| 2. Kill Switch | `~/.pmq/KILL` file does not exist | `KILL_SWITCH_ACTIVE` |
+| 3. TTL Approval | Active approval for `live_exec` scope | `TTL_APPROVAL_MISSING` |
+| 4. SELL_BOTH Disabled | Only BUY_BOTH arb strategy allowed | `SELL_BOTH_NOT_ALLOWED` |
+| 5. Valid Arb Side | Must be `BUY_BOTH` | `INVALID_ARB_SIDE` |
+| 6. Min Edge | Edge >= `min_net_edge_bps` | `EDGE_BELOW_MINIMUM` |
+| 7. Token IDs | Both YES and NO token IDs present | `MISSING_TOKEN_IDS` |
+| 8. Size Limit | Order size <= `max_order_usd` | `SIZE_EXCEEDS_LIMIT` |
+| 9. Rate Limit | Orders/hour <= `max_orders_per_hour` | `RATE_LIMIT_EXCEEDED` |
+| 10. Confirm | `--live-exec-confirm` flag provided | `CONFIRM_FLAG_MISSING` |
+
+#### Phase 12 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--live-exec/--no-live-exec` | bool | False | Enable live execution mode |
+| `--live-exec-confirm/--no-live-exec-confirm` | bool | False | Confirm real order placement |
+| `--live-exec-max-usd` | float | 5.0 | Max order size in USD |
+| `--live-exec-max-per-hour` | int | 2 | Max orders per hour |
+| `--live-exec-min-edge` | float | 10.0 | Min edge in basis points |
+
+#### Emergency Kill Switch
+
+Create `~/.pmq/KILL` file to immediately block all live orders:
+
+```powershell
+# Create kill switch
+New-Item -Path "$HOME\.pmq\KILL" -ItemType File
+
+# Remove kill switch
+Remove-Item -Path "$HOME\.pmq\KILL"
+```
+
+The daemon checks for this file before every order.
+
+#### First Live Trade Workflow
+
+1. **Complete Paper Trading First**: Verify paper execution works with positive PnL
+2. **Run Live Preflight**: `pmq ops live-preflight --require-auth`
+3. **Grant Short Approval**: `pmq risk approve live_exec --ttl-minutes 30`
+4. **Start in Dry-Run**: `pmq ops daemon --live-exec` (no `--live-exec-confirm`)
+5. **Monitor Dry-Run**: Check logs for "would place order" messages
+6. **Enable Live**: `pmq ops daemon --live-exec --live-exec-confirm`
+7. **Monitor Live Ledger**: Watch `exports/live_ledger.json`
+8. **Kill If Needed**: Create `~/.pmq/KILL` to stop orders
+
+> 💡 **Safety First**: Start with `max_order_usd=5.0` and `max_orders_per_hour=2`. Increase only after successful live trades.
+
 ## First Paper Trade Checklist
 
 Getting your first paper trade requires several steps to work together. This checklist helps you verify everything is configured correctly.
@@ -2694,9 +2817,9 @@ Your first paper trade will occur when:
 
 > 💡 **Tip**: If markets are efficient (no arb), you've proven the system works correctly! The absence of trades when no opportunity exists is the right behavior.
 
-## First Live Trade Checklist (Phase 11)
+## First Live Trade Checklist (Phase 11 + 12)
 
-**⚠️ IMPORTANT**: Live trading is NOT yet implemented. Phase 11 provides the authentication bootstrap and smoke test infrastructure needed BEFORE live trading can be enabled.
+**⚠️ IMPORTANT**: Live trading is now available in Phase 12. See the "Live Execution (Phase 12)" section above for full details on safety architecture.
 
 ### Prerequisites
 
@@ -2776,14 +2899,29 @@ poetry run pmq risk approve paper_exec --ttl-minutes 120 --reason "Tested with l
 poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-min-edge 10
 ```
 
-### Future: Live Execution
+### Step 7: Live Execution (Phase 12)
 
-**Live trading is NOT YET IMPLEMENTED.** When it is:
+**Live trading is now available!** Requirements:
 
-- Will require `--live-exec` flag (disabled by default)
-- Will require valid TTL approval for `live_exec` scope
-- Will require passing `pmq ops live-smoke` test
-- Will place REAL orders with REAL money
+- Requires `--live-exec` flag (disabled by default)
+- Requires valid TTL approval for `live_exec` scope
+- Requires passing `pmq ops live-preflight` test
+- Requires `--live-exec-confirm` for real orders (otherwise dry-run)
+- Places REAL orders with REAL money
+
+```powershell
+# Grant live execution approval
+poetry run pmq risk approve live_exec --ttl-minutes 60 --reason "First live trade"
+
+# Run preflight
+poetry run pmq ops live-preflight --require-auth
+
+# Run in dry-run mode first
+poetry run pmq ops daemon --interval 60 --live-exec
+
+# When ready, enable real orders
+poetry run pmq ops daemon --interval 60 --live-exec --live-exec-confirm
+```
 
 ### Phase 11 CLI Commands (Auth)
 
@@ -2844,9 +2982,13 @@ polymarket-quant-lab/
 │   ├── evaluation/         # Evaluation pipeline (Phase 4)
 │   │   ├── pipeline.py     # End-to-end orchestration
 │   │   └── reporter.py     # Report generation
-│   ├── auth/               # Authentication (Phase 11)
+│   ├── auth/               # Authentication (Phase 11-12)
 │   │   ├── creds.py        # Credential storage
-│   │   └── redact.py       # Secret redaction
+│   │   ├── redact.py       # Secret redaction
+│   │   └── client_factory.py # CLOB client factory (Phase 12)
+│   ├── ops/                # Operations (Phase 12)
+│   │   ├── live_exec.py    # Live executor with safety checks
+│   │   └── live_ledger.py  # Persistent order ledger
 │   └── web/
 │       ├── app.py          # FastAPI application
 │       ├── routes.py       # API endpoints
@@ -2861,6 +3003,7 @@ polymarket-quant-lab/
 │   ├── test_governance.py  # Approval/risk gate tests
 │   ├── test_evaluation.py  # Evaluation pipeline tests
 │   ├── test_statarb.py     # StatArb pairs config tests
+│   ├── test_live_exec.py   # Live execution tests (Phase 12)
 │   └── test_web_and_export.py
 ├── config/
 │   └── pairs.yml           # Stat-arb pairs config
@@ -2872,10 +3015,12 @@ polymarket-quant-lab/
 
 ## Safety Notes
 
-- **NO LIVE TRADING**: Phase 1 is paper trading only. No real money is at risk.
-- **No API Keys Required**: All data comes from public endpoints.
-- **Kill Switch**: Set `PMQ_SAFETY_KILL_SWITCH=true` to halt all operations.
-- **Audit Trail**: All operations are logged for review.
+- **LIVE TRADING AVAILABLE**: Phase 12 adds live trading. Disabled by default, requires explicit flags.
+- **10-Layer Safety Checks**: Live execution requires TTL approval, confirm flag, kill switch clear, etc.
+- **Emergency Kill Switch**: Create `~/.pmq/KILL` file to block all live orders immediately.
+- **Rate Limited**: Default 2 orders/hour, $5 max per order.
+- **API Keys**: Live execution requires CLOB credentials. Paper trading uses public endpoints only.
+- **Audit Trail**: All operations logged. Live orders saved to `exports/live_ledger.json`.
 
 ## Development
 
@@ -3129,11 +3274,27 @@ poetry run mypy src
 - [x] Net Edge Diagnostics in daemon summary
 - [x] Tests for approval TTL and net edge math
 
-### Phase 5.x (Future)
-- [ ] Authenticated CLOB integration
-- [ ] Real order placement via py-clob-client
+### Phase 11 ✓
+- [x] Authentication bootstrap: `pmq auth init/status/wipe`
+- [x] Credential storage in `~/.pmq/creds.json`
+- [x] Live smoke test: `pmq ops live-smoke`
+- [x] Preflight with auth validation: `pmq ops preflight --require-auth`
+
+### Phase 12 ✓
+- [x] Live order placement via `py-clob-client`
+- [x] 10-layer safety checks (enabled, kill switch, TTL approval, etc.)
+- [x] Live preflight command: `pmq ops live-preflight`
+- [x] LiveLedger with atomic JSON writes
+- [x] LiveExecutor with dry-run and confirm modes
+- [x] Emergency kill switch (`~/.pmq/KILL`)
+- [x] CLI flags: `--live-exec`, `--live-exec-confirm`, `--live-exec-max-usd`, etc.
+- [x] Comprehensive test coverage with mocked CLOB client
+
+### Future Phases
 - [ ] Wallet integration (Polygon)
 - [ ] Advanced signal strategies
+- [ ] Multi-market order optimization
+- [ ] Real-time PnL tracking
 
 ## License
 

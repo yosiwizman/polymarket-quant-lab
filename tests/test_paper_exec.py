@@ -1190,3 +1190,178 @@ class TestAlwaysOnExplainMode:
         assert len(result.explain_candidates) > 0
         for cand in result.explain_candidates:
             assert cand.rejection_detail != ""  # Should have detail
+
+
+# =============================================================================
+# Tests: Phase 7 - Raw Edge Before Risk Gating
+# =============================================================================
+
+
+class TestRawEdgeBps:
+    """Tests for Phase 7 raw_edge_bps field.
+
+    raw_edge_bps captures edge BEFORE any risk gating, ensuring
+    we can calibrate thresholds even when trades are blocked.
+    """
+
+    def test_raw_edge_bps_preserved_when_risk_not_approved(self) -> None:
+        """raw_edge_bps should be non-zero even when rejection_reason is risk_not_approved."""
+        config = PaperExecConfig(
+            enabled=True,
+            require_approval=True,
+            explain_enabled=True,
+            min_signal_edge_bps=10.0,  # Low threshold to ensure signal passes
+        )
+        dao = FakeDAO()
+        ledger = FakePaperLedger(dao)
+
+        # Risk gate that rejects (not approved)
+        risk_gate = FakeRiskGate(approved=False, block_reason="No approval for paper_exec")
+
+        # Signal with good edge (10% edge = 1000 bps)
+        # yes + no = 0.40 + 0.50 = 0.90 → profit_potential = 0.10 → 1000 bps
+        signal = make_signal("m1", 0.40, 0.50, liquidity=5000.0)
+        scanner = FakeArbitrageScanner(signals=[signal])
+
+        executor = PaperExecutor(
+            config=config,
+            dao=dao,
+            paper_ledger=ledger,
+            risk_gate=risk_gate,
+            arb_scanner=scanner,
+        )
+
+        markets_data = [
+            {
+                "id": "m1",
+                "question": "Test market",
+                "active": True,
+                "closed": False,
+                "last_price_yes": 0.40,
+                "last_price_no": 0.50,
+                "liquidity": 5000.0,
+            },
+        ]
+
+        result = executor.execute_tick(markets_data)
+
+        # Should have explain candidates
+        assert len(result.explain_candidates) > 0
+
+        # Find candidate that was rejected by risk
+        risk_rejected = [
+            c for c in result.explain_candidates
+            if c.rejection_reason == RejectionReason.RISK_NOT_APPROVED
+        ]
+        assert len(risk_rejected) > 0, "Expected at least one risk_not_approved rejection"
+
+        # The critical assertion: raw_edge_bps should be non-zero
+        # even though the trade was rejected by risk
+        candidate = risk_rejected[0]
+        assert candidate.raw_edge_bps > 0, (
+            f"raw_edge_bps should be non-zero when rejected by risk, got {candidate.raw_edge_bps}"
+        )
+        assert candidate.raw_edge_bps >= 100, (
+            f"Expected raw_edge_bps >= 100 (10% edge), got {candidate.raw_edge_bps}"
+        )
+
+    def test_raw_edge_bps_equals_edge_bps_when_not_rejected(self) -> None:
+        """raw_edge_bps should equal edge_bps for executed candidates."""
+        config = PaperExecConfig(
+            enabled=True,
+            require_approval=False,  # No risk gate
+            explain_enabled=True,
+            min_signal_edge_bps=10.0,
+        )
+        dao = FakeDAO()
+        ledger = FakePaperLedger(dao)
+
+        # Good signal that should execute
+        signal = make_signal("m1", 0.40, 0.50, liquidity=5000.0)  # 10% edge
+        scanner = FakeArbitrageScanner(signals=[signal])
+
+        executor = PaperExecutor(
+            config=config,
+            dao=dao,
+            paper_ledger=ledger,
+            arb_scanner=scanner,
+        )
+
+        markets_data = [
+            {
+                "id": "m1",
+                "active": True,
+                "last_price_yes": 0.40,
+                "last_price_no": 0.50,
+                "liquidity": 5000.0,
+            },
+        ]
+
+        result = executor.execute_tick(markets_data)
+
+        # Should have executed
+        assert result.trades_executed > 0
+        assert len(result.explain_candidates) > 0
+
+        # For executed candidates, raw_edge_bps == edge_bps
+        for cand in result.explain_candidates:
+            if cand.executed:
+                assert cand.raw_edge_bps == cand.edge_bps, (
+                    f"raw_edge_bps ({cand.raw_edge_bps}) should equal "
+                    f"edge_bps ({cand.edge_bps}) for executed trades"
+                )
+
+    def test_raw_edge_bps_in_to_dict(self) -> None:
+        """to_dict should include raw_edge_bps field."""
+        candidate = ExplainCandidate(
+            market_id="m1",
+            token_id="t1",
+            side="arb",
+            edge_bps=0.0,  # Zero because rejected
+            raw_edge_bps=150.0,  # Actual edge before gating
+            spread_bps=10.0,
+            liquidity=5000.0,
+            mid_price=0.5,
+            rejection_reason=RejectionReason.RISK_NOT_APPROVED,
+            rejection_detail="No approval for paper_exec",
+        )
+
+        result = candidate.to_dict()
+
+        assert "raw_edge_bps" in result
+        assert result["raw_edge_bps"] == 150.0
+        assert result["edge_bps"] == 0.0
+        assert result["rejection_reason"] == "risk_not_approved"
+
+    def test_explain_summary_tracks_raw_edge_stats(self) -> None:
+        """ExplainSummary should track raw_edge statistics."""
+        # Create results with raw_edge data
+        result1 = PaperExecResult(
+            explain_candidates=[
+                ExplainCandidate(
+                    market_id="m1",
+                    edge_bps=0.0,
+                    raw_edge_bps=100.0,
+                    rejection_reason=RejectionReason.RISK_NOT_APPROVED,
+                ),
+            ],
+            rejection_counts={"risk_not_approved": 1},
+        )
+        result2 = PaperExecResult(
+            explain_candidates=[
+                ExplainCandidate(
+                    market_id="m2",
+                    edge_bps=0.0,
+                    raw_edge_bps=200.0,
+                    rejection_reason=RejectionReason.RISK_NOT_APPROVED,
+                ),
+            ],
+            rejection_counts={"risk_not_approved": 1},
+        )
+
+        summary = ExplainSummary.from_results([result1, result2], min_edge_bps=50.0)
+
+        # Should track raw edge statistics
+        assert summary.max_raw_edge_bps == 200.0
+        assert summary.avg_top_raw_edge_bps == 150.0  # (100 + 200) / 2
+        assert summary.ticks_with_raw_edge_above_threshold == 2  # Both >= 50

@@ -202,6 +202,8 @@ class TickStats:
     # Phase 6.2: Explain mode tracking
     paper_explain_candidates: int = 0  # Number of explain candidates this tick
     paper_explain_top_edge_bps: float = 0.0  # Top candidate edge this tick
+    # Phase 7: Raw edge tracking (before risk gating)
+    paper_explain_top_raw_edge_bps: float = 0.0  # Top candidate raw edge this tick
 
 
 @dataclass
@@ -253,6 +255,9 @@ class DailyStats:
     paper_explain_ticks_above_min_edge: int = 0  # Ticks with top edge >= min_edge
     paper_explain_avg_top_edge_bps: float = 0.0  # Average top edge across ticks
     paper_explain_max_top_edge_bps: float = 0.0  # Max top edge across ticks
+    # Phase 7: Raw edge tracking (before risk gating)
+    paper_explain_ticks_with_raw_edge_above_threshold: int = 0  # Ticks with raw_edge >= min
+    paper_explain_max_raw_edge_bps: float = 0.0  # Max raw edge across ticks
 
 
 def compute_adaptive_staleness(interval_seconds: int) -> float:
@@ -1242,6 +1247,8 @@ class DaemonRunner:
                 tick_stats.paper_explain_candidates = len(result.explain_candidates)
                 if result.explain_candidates:
                     tick_stats.paper_explain_top_edge_bps = result.explain_candidates[0].edge_bps
+                    # Phase 7: Track raw_edge (before risk gating)
+                    tick_stats.paper_explain_top_raw_edge_bps = result.explain_candidates[0].raw_edge_bps
 
                 # Always export tick to JSONL (Phase 6.2.1)
                 export_path = self.config.paper_exec_explain_export_path or get_default_export_path(
@@ -1331,6 +1338,12 @@ class DaemonRunner:
                     self._daily_stats.paper_explain_ticks_above_min_edge += 1
                 if top_edge > self._daily_stats.paper_explain_max_top_edge_bps:
                     self._daily_stats.paper_explain_max_top_edge_bps = top_edge
+                # Phase 7: Track raw_edge aggregates
+                top_raw_edge = tick_stats.paper_explain_top_raw_edge_bps
+                if top_raw_edge >= self.config.paper_exec_min_edge_bps:
+                    self._daily_stats.paper_explain_ticks_with_raw_edge_above_threshold += 1
+                if top_raw_edge > self._daily_stats.paper_explain_max_raw_edge_bps:
+                    self._daily_stats.paper_explain_max_raw_edge_bps = top_raw_edge
             if tick_stats.error:
                 self._daily_stats.total_errors += 1
             self._daily_stats.end_time = tick_stats.timestamp
@@ -1706,7 +1719,7 @@ class DaemonRunner:
 
 """
 
-        # Phase 6.2: Paper Exec Diagnostics section (explain mode)
+        # Phase 6.2/7: Paper Exec Diagnostics section (explain mode with raw_edge)
         explain_section = ""
         if self.config.paper_exec_explain and stats.paper_explain_ticks_with_candidates > 0:
             # Compute average top edge from tick history
@@ -1727,6 +1740,14 @@ class DaemonRunner:
             else:
                 median_top_edge = 0
 
+            # Phase 7: Compute raw_edge statistics (before risk gating)
+            top_raw_edges = [
+                t.paper_explain_top_raw_edge_bps
+                for t in stats.tick_history
+                if t.paper_explain_top_raw_edge_bps > 0
+            ]
+            avg_top_raw_edge = sum(top_raw_edges) / len(top_raw_edges) if top_raw_edges else 0
+
             # Build rejection breakdown from accumulated counts
             rejection_lines = ""
             if stats.paper_explain_rejection_counts:
@@ -1741,16 +1762,19 @@ class DaemonRunner:
                 rejection_lines = f"\n{rejection_lines}"
 
             min_edge = self.config.paper_exec_min_edge_bps
-            explain_section = f"""## Paper Exec Diagnostics (Phase 6.2)
+            explain_section = f"""## Paper Exec Diagnostics (Phase 7)
 - **Ticks with Candidates:** {stats.paper_explain_ticks_with_candidates:,} / {stats.total_ticks}
 - **Ticks with Edge >= {min_edge:.0f}bps:** {stats.paper_explain_ticks_above_min_edge:,}
+- **Ticks with Raw Edge >= {min_edge:.0f}bps:** {stats.paper_explain_ticks_with_raw_edge_above_threshold:,}
 - **Avg Top Edge:** {avg_top_edge:.1f} bps
 - **Median Top Edge:** {median_top_edge:.1f} bps
 - **Max Top Edge:** {stats.paper_explain_max_top_edge_bps:.1f} bps
+- **Avg Top Raw Edge:** {avg_top_raw_edge:.1f} bps (before risk gating)
+- **Max Raw Edge:** {stats.paper_explain_max_raw_edge_bps:.1f} bps (before risk gating)
 - **Top Rejection Reasons:**{rejection_lines}
 
-> **Calibration Tip:** If Ticks with Edge above min is low but Ticks with Candidates is high,
-> consider lowering `--paper-exec-min-edge` (e.g., from 50 to 25 bps) for testing.
+> **Calibration Tip:** If Ticks with Raw Edge above min is high but trades are 0, check approval.
+> If raw_edge values look good but edge_bps is 0, the issue is risk gating, not market pricing.
 
 """
 

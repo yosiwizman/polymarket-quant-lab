@@ -170,6 +170,7 @@ class PaperExecResult:
     Also includes PnL snapshot from PaperLedger.
 
     Phase 6.2: Added explain_candidates and rejection_counts for calibration.
+    Phase 6.2.1: Added markets_scanned for diagnostics.
     """
 
     # Signal/trade counts
@@ -194,6 +195,9 @@ class PaperExecResult:
     # Phase 6.2: Explain mode data
     explain_candidates: list[ExplainCandidate] = field(default_factory=list)
     rejection_counts: dict[str, int] = field(default_factory=dict)  # reason -> count
+
+    # Phase 6.2.1: Diagnostics
+    markets_scanned: int = 0  # Number of markets scanned this tick
 
 
 # =============================================================================
@@ -296,6 +300,8 @@ class PaperExecutor:
             return result
 
         # Check governance approval if required
+        # Phase 6.2.1: Don't increment blocked_by_risk here - only count when
+        # there are actual executable candidates blocked by the gate
         strategy_approved = True
         approval_rejection_reason = ""
         if self.config.require_approval and self._risk_gate:
@@ -306,7 +312,8 @@ class PaperExecutor:
                     approval_rejection_reason = approval.reason
                     logger.debug(f"Paper execution blocked: {approval.reason}")
                     result.blocked_reasons.append(f"Not approved: {approval.reason}")
-                    result.blocked_by_risk += 1
+                    # Phase 6.2.1: DON'T increment blocked_by_risk here
+                    # We only count as "blocked" when there were actual executable signals
                     # Still return PnL snapshot
                     pnl = self._paper_ledger.calculate_pnl(markets_data=current_prices)
                     result.realized_pnl = pnl["total_realized_pnl"]
@@ -323,6 +330,7 @@ class PaperExecutor:
 
         # Limit markets scanned
         markets_to_scan = markets_data[: self.config.max_markets_scanned]
+        result.markets_scanned = len(markets_to_scan)  # Phase 6.2.1: Track for diagnostics
 
         # Phase 6.2: In explain mode, get ALL signals (not limited)
         scan_top_n = None if self.config.explain_enabled else self.config.max_trades_per_tick * 2
@@ -533,9 +541,25 @@ class PaperExecutor:
         # Phase 6.2: Store explain data
         result.rejection_counts = rejection_counts
 
+        # Phase 6.2.1: Generate near-miss candidates from market data when no arb signals
+        # This ensures explain mode always has something to report for calibration
+        if self.config.explain_enabled and len(all_candidates) == 0:
+            all_candidates = self._generate_near_miss_candidates(
+                markets_to_scan, markets_lookup, strategy_approved, approval_rejection_reason
+            )
+            # Update rejection counts from near-miss candidates
+            for cand in all_candidates:
+                _count_rejection(cand.rejection_reason)
+
         # Sort candidates by edge (descending) and take top N
         sorted_candidates = sorted(all_candidates, key=lambda c: c.edge_bps, reverse=True)
         result.explain_candidates = sorted_candidates[: self.config.explain_top_n]
+
+        # Phase 6.2.1: Only count blocked_by_risk if there were actual executable signals blocked
+        # This is computed after all processing to get accurate count
+        if not strategy_approved and result.signals_evaluated > 0:
+            # Strategy not approved but we had signals that would have executed
+            result.blocked_by_risk += result.signals_evaluated
 
         if result.trades_executed > 0:
             logger.info(
@@ -545,17 +569,112 @@ class PaperExecutor:
             )
 
         # Phase 6.2: Log explain summary
-        if self.config.explain_enabled and all_candidates:
+        if self.config.explain_enabled:
             total_rejected = sum(v for k, v in rejection_counts.items() if k != "none")
             total_executed = rejection_counts.get("none", 0)
             top_edge = sorted_candidates[0].edge_bps if sorted_candidates else 0
             logger.debug(
                 f"Explain: {len(all_candidates)} candidates, "
                 f"{total_executed} executed, {total_rejected} rejected, "
-                f"top_edge={top_edge:.1f}bps"
+                f"top_edge={top_edge:.1f}bps, markets_scanned={result.markets_scanned}"
             )
 
         return result
+
+    def _generate_near_miss_candidates(
+        self,
+        markets_to_scan: list[dict[str, Any]],
+        _markets_lookup: dict[str, dict[str, Any]],  # Reserved for future use
+        strategy_approved: bool,
+        approval_rejection_reason: str,
+    ) -> list[ExplainCandidate]:
+        """Generate near-miss candidates from market data when no arb signals found.
+
+        Phase 6.2.1: This ensures explain mode always has something to report,
+        even when the ArbitrageScanner finds no signals. We compute edge from
+        YES+NO prices and classify why each market didn't qualify.
+
+        Args:
+            markets_to_scan: List of market dicts
+            markets_lookup: Dict of market_id -> market dict
+            strategy_approved: Whether strategy is approved
+            approval_rejection_reason: Reason if not approved
+
+        Returns:
+            List of ExplainCandidate sorted by edge_bps (descending), limited to top N
+        """
+        candidates: list[ExplainCandidate] = []
+        min_liquidity = self._arb_scanner._config.min_liquidity
+        arb_threshold = self._arb_scanner._config.threshold
+
+        # Cap at 2x explain_top_n to bound runtime
+        max_to_process = min(len(markets_to_scan), self.config.explain_top_n * 2)
+
+        for market in markets_to_scan[:max_to_process]:
+            market_id = market.get("id", "")
+            yes_price = market.get("last_price_yes", 0.0) or 0.0
+            no_price = market.get("last_price_no", 0.0) or 0.0
+            liquidity = market.get("liquidity", 0.0) or 0.0
+            question = market.get("question", "")
+            active = market.get("active", True)
+            closed = market.get("closed", False)
+
+            # Skip if no price data
+            if yes_price <= 0 and no_price <= 0:
+                continue
+
+            # Compute edge: profit potential = 1 - (YES + NO)
+            combined_price = yes_price + no_price
+            profit_potential = max(0, 1.0 - combined_price)  # Can't be negative
+            edge_bps = profit_potential * 10000
+            mid_price = combined_price / 2 if combined_price > 0 else 0
+
+            candidate = ExplainCandidate(
+                market_id=market_id,
+                market_question=question,
+                side="arb",
+                yes_price=yes_price,
+                no_price=no_price,
+                mid_price=mid_price,
+                edge_bps=edge_bps,
+                liquidity=liquidity,
+                size_estimate=self.config.trade_quantity,
+            )
+
+            # Determine rejection reason
+            if not strategy_approved:
+                candidate.rejection_reason = RejectionReason.RISK_NOT_APPROVED
+                candidate.rejection_detail = approval_rejection_reason
+            elif not active:
+                candidate.rejection_reason = RejectionReason.MARKET_INACTIVE
+                candidate.rejection_detail = "Market is not active"
+            elif closed:
+                candidate.rejection_reason = RejectionReason.MARKET_CLOSED
+                candidate.rejection_detail = "Market is closed"
+            elif liquidity < min_liquidity:
+                candidate.rejection_reason = RejectionReason.LIQUIDITY_BELOW_MIN
+                candidate.rejection_detail = f"liquidity={liquidity:.0f} < min={min_liquidity:.0f}"
+            elif combined_price >= arb_threshold:
+                # No arb opportunity (prices sum to >= threshold)
+                candidate.rejection_reason = RejectionReason.NO_SIGNAL
+                candidate.rejection_detail = (
+                    f"YES+NO={combined_price:.4f} >= threshold={arb_threshold:.4f}"
+                )
+            elif profit_potential < self.config.min_signal_edge_bps / 10000:
+                candidate.rejection_reason = RejectionReason.EDGE_BELOW_MIN
+                candidate.rejection_detail = (
+                    f"edge={edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                )
+            else:
+                # Should have been picked up by scanner - mark as no signal
+                candidate.rejection_reason = RejectionReason.NO_SIGNAL
+                candidate.rejection_detail = "Not detected by ArbitrageScanner"
+
+            candidates.append(candidate)
+
+        # Sort by edge and return top N
+        candidates.sort(key=lambda c: c.edge_bps, reverse=True)
+        return candidates[: self.config.explain_top_n]
 
     def get_pnl_snapshot(
         self,
@@ -604,6 +723,8 @@ def write_explain_tick(
     """Write explain data for a single tick to JSONL file.
 
     Phase 6.2: Appends one JSON line per tick with candidates and rejection counts.
+    Phase 6.2.1: Always writes, even if candidates list is empty. This ensures
+    the file exists and proves the loop executed.
     Safe to call multiple times per day - appends to existing file.
 
     Args:
@@ -613,6 +734,7 @@ def write_explain_tick(
     """
     tick_record = {
         "timestamp": tick_timestamp,
+        "markets_scanned": result.markets_scanned,  # Phase 6.2.1
         "signals_found": result.signals_found,
         "signals_evaluated": result.signals_evaluated,
         "trades_executed": result.trades_executed,

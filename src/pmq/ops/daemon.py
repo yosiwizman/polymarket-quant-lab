@@ -1235,12 +1235,15 @@ class DaemonRunner:
             tick_stats.paper_blocked_by_risk = result.blocked_by_risk + result.blocked_by_safety
             tick_stats.paper_pnl_total = result.total_pnl
 
-            # Phase 6.2: Update explain mode tick stats
-            if self.config.paper_exec_explain and result.explain_candidates:
+            # Phase 6.2.1: Always write JSONL when explain mode enabled (even if no candidates)
+            # This ensures the file exists and proves the loop executed
+            if self.config.paper_exec_explain:
+                # Update explain mode tick stats
                 tick_stats.paper_explain_candidates = len(result.explain_candidates)
-                tick_stats.paper_explain_top_edge_bps = result.explain_candidates[0].edge_bps
+                if result.explain_candidates:
+                    tick_stats.paper_explain_top_edge_bps = result.explain_candidates[0].edge_bps
 
-                # Export tick to JSONL
+                # Always export tick to JSONL (Phase 6.2.1)
                 export_path = self.config.paper_exec_explain_export_path or get_default_export_path(
                     self.config.export_dir
                 )

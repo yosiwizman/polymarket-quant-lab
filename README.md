@@ -2187,13 +2187,18 @@ With Phase 6.1, when paper execution is enabled:
 
 > 💡 **Why Paper Execution in Daemon?** The ops daemon already has stable real-time market data. Paper execution leverages this to generate signals and track simulated performance continuously, preparing for eventual live execution while maintaining strict safety controls.
 
-### Paper-Exec Explain Mode + Calibration (Phase 6.2)
+### Paper-Exec Explain Mode + Calibration (Phase 6.2 / 6.2.1)
 
 Phase 6.2 adds transparency to paper execution to understand WHY trades aren't firing:
 - **Explain Mode**: Captures ALL candidate opportunities (even rejected ones)
 - **Rejection Taxonomy**: Classifies rejections with explicit reasons
 - **JSONL Export**: Per-tick candidates exported for offline analysis
 - **Diagnostics**: daemon_summary includes calibration metrics
+
+Phase 6.2.1 makes explain mode "always-on" and useful even when no arbitrage signals are found:
+- **Always writes JSONL**: Every tick produces a JSONL line (even if candidates list is empty)
+- **Near-miss candidates**: Generates candidates from market data when no arb signals found
+- **Fixed blocked_by_risk**: Only counts as "blocked" when actual executable signals were blocked
 
 #### The Problem
 
@@ -2244,26 +2249,34 @@ Explain mode classifies each candidate into one of these rejection reasons:
 | `risk_blocked` | Generic risk gate block |
 | `safety_error` | SafetyGuard blocked the trade |
 | `max_trades_per_tick` | Hit per-tick trade limit |
+| `no_signal` | No arbitrage signal (YES+NO >= threshold) |
 
-#### JSONL Export Format
+#### JSONL Export Format (Phase 6.2.1)
 
-Each line in the JSONL file contains one tick's candidates:
+Each line in the JSONL file contains one tick's data. **The file is always written when explain mode is enabled**, even if no candidates exist (this proves the loop executed):
 
 ```json
 {
   "timestamp": "2026-01-03T10:30:00Z",
-  "signals_found": 15,
+  "markets_scanned": 200,
+  "signals_found": 0,
+  "signals_evaluated": 0,
   "trades_executed": 0,
-  "rejection_counts": {"edge_below_min": 12, "liquidity_below_min": 3},
+  "blocked_by_risk": 0,
+  "blocked_by_safety": 0,
+  "total_pnl": 0.0,
+  "rejection_counts": {"no_signal": 8, "liquidity_below_min": 2},
   "candidates": [
     {
       "market_id": "0x1234...",
-      "side": "YES",
-      "edge_bps": 42.5,
-      "spread_bps": 15.0,
+      "side": "arb",
+      "yes_price": 0.50,
+      "no_price": 0.51,
+      "edge_bps": 0.0,
       "liquidity": 5000.0,
-      "mid_price": 0.45,
-      "rejection_reason": "edge_below_min"
+      "mid_price": 0.505,
+      "rejection_reason": "no_signal",
+      "rejection_detail": "YES+NO=1.0100 >= threshold=0.9900"
     }
   ]
 }
@@ -2307,6 +2320,23 @@ When explain mode is enabled, daemon_summary.md includes a "Paper Exec Diagnosti
    ```
 
 4. **Iterate safely**: Lower `--paper-exec-min-edge` in small increments (e.g., 50 → 40 → 30) and re-run
+
+#### Interpreting Near-Miss Candidates (Phase 6.2.1)
+
+When the ArbitrageScanner finds no signals, explain mode generates "near-miss" candidates from market data:
+
+- **no_signal**: Market prices sum to >= threshold (e.g., YES=0.50 + NO=0.51 = 1.01). No arb opportunity exists.
+- **edge_below_min**: Market has slight arb potential but edge < min threshold.
+- **liquidity_below_min**: Market has arb potential but liquidity too low to trade.
+- **market_inactive / market_closed**: Market state prevents trading.
+
+This helps you understand WHY there are no trades even when the scanner finds nothing.
+
+#### blocked_by_risk Semantics (Phase 6.2.1)
+
+`blocked_by_risk` only increments when there were **actual executable signals** that would have traded but were blocked by the risk gate. If no signals are found (or all were filtered by edge/liquidity), `blocked_by_risk = 0`.
+
+This prevents the misleading "blocked_by_risk = 40" when running 40 ticks with no arb opportunities.
 
 > ⚠️ **SAFETY REMINDER**: This is still PAPER TRADING. Lowering thresholds increases simulated trade volume but no real orders are placed.
 

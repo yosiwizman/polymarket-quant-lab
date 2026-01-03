@@ -5456,20 +5456,19 @@ def ops_live_preflight(
                 # Create CLOB client and run sanity check
                 client = create_clob_client(
                     private_key=private_key,
+                    creds=creds,
                     chain_id=137,  # Polygon mainnet
-                    signature_type=creds.signature_type,
-                    funder_address=creds.funder_address,
                 )
-                result = check_auth_sanity(client)
+                result = check_auth_sanity(client, creds=creds)
 
                 if result.success:
                     console.print(
                         f"   [green]✓ Auth sanity check passed[/green] - {result.message}"
                     )
                     checks.append(("Auth", True, result.message))
-                    if verbose and result.open_orders is not None:
+                    if verbose and result.open_orders_count is not None:
                         console.print(
-                            f"   [dim]Open orders: {result.open_orders}[/dim]"
+                            f"   [dim]Open orders: {result.open_orders_count}[/dim]"
                         )
                 else:
                     console.print(f"   [red]✗ Auth sanity check failed[/red]")

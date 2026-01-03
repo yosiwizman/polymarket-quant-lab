@@ -2682,7 +2682,8 @@ poetry run pmq ops daemon --interval 60 --live-exec --live-exec-confirm
 
 All live orders are logged to a persistent JSON ledger:
 
-- Location: `exports/live_ledger.json`
+- Location: `exports/live_ledger/` directory
+- File pattern: `live_orders_YYYY-MM-DD.json` (one file per day)
 - Atomic writes (temp file → rename) for crash safety
 - Redacts sensitive data (API keys) from logs
 - Tracks: timestamp, market_id, side, price, size, order_id, status
@@ -2691,16 +2692,16 @@ All live orders are logged to a persistent JSON ledger:
 
 | Check | Description | Rejection Reason |
 |-------|-------------|------------------|
-| 1. Enabled | `--live-exec` flag provided | `LIVE_EXEC_DISABLED` |
-| 2. Kill Switch | `~/.pmq/KILL` file does not exist | `KILL_SWITCH_ACTIVE` |
-| 3. TTL Approval | Active approval for `live_exec` scope | `TTL_APPROVAL_MISSING` |
-| 4. SELL_BOTH Disabled | Only BUY_BOTH arb strategy allowed | `SELL_BOTH_NOT_ALLOWED` |
-| 5. Valid Arb Side | Must be `BUY_BOTH` | `INVALID_ARB_SIDE` |
-| 6. Min Edge | Edge >= `min_net_edge_bps` | `EDGE_BELOW_MINIMUM` |
-| 7. Token IDs | Both YES and NO token IDs present | `MISSING_TOKEN_IDS` |
-| 8. Size Limit | Order size <= `max_order_usd` | `SIZE_EXCEEDS_LIMIT` |
-| 9. Rate Limit | Orders/hour <= `max_orders_per_hour` | `RATE_LIMIT_EXCEEDED` |
-| 10. Confirm | `--live-exec-confirm` flag provided | `CONFIRM_FLAG_MISSING` |
+| 1. Enabled | `--live-exec` flag provided | `not_enabled` |
+| 2. Kill Switch | `~/.pmq/KILL` file does not exist | `kill_switch` |
+| 3. TTL Approval | Active approval for `live_exec` scope | `approval_missing` |
+| 4. SELL_BOTH Disabled | Only BUY_BOTH arb strategy allowed | `sell_both_disabled` |
+| 5. Valid Arb Side | Must be `BUY_BOTH` | `no_valid_arb` |
+| 6. Min Edge | Edge >= `min_net_edge_bps` | `edge_too_low` |
+| 7. Token IDs | Both YES and NO token IDs present | `missing_token_id` |
+| 8. Size Limit | Order size <= `max_order_usd` | `size_limit` |
+| 9. Rate Limit | Orders/hour <= `max_orders_per_hour` | `rate_limit` |
+| 10. Confirm | `--live-exec-confirm` flag provided | `not_confirmed` |
 
 #### Phase 12 CLI Flags
 

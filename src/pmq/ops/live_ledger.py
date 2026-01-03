@@ -177,8 +177,6 @@ class LiveLedger:
             Path(temp_path).replace(file_path)
         except Exception:
             # Clean up temp file on error
-            with open(temp_path) as _:
-                pass
             Path(temp_path).unlink(missing_ok=True)
             raise
 
@@ -241,6 +239,7 @@ class LiveLedger:
                 if order_ts >= one_hour_ago:
                     stats.orders_last_hour += 1
             except (ValueError, AttributeError):
+                # Timestamp parsing failed - skip this record for rate limiting
                 pass
 
         return stats
@@ -265,6 +264,7 @@ class LiveLedger:
                 if order_ts >= one_hour_ago:
                     count += 1
             except (ValueError, AttributeError):
+                # Timestamp parsing failed - skip this record for rate limiting
                 pass
 
         return count

@@ -2129,6 +2129,64 @@ With Phase 6.0, a daemon run should show:
 
 > 💡 **Why Bootstrap Before Grace?** Polymarket's WSS emits "book" messages immediately upon subscription. By subscribing BEFORE the grace wait, the cache gets populated during grace. This is the key insight that makes WSS-first seeding actually work.
 
+### Live Paper Execution Loop (Phase 6.1)
+
+Phase 6.1 adds an optional paper execution mode to the ops daemon:
+- Generates signals from real-time snapshots using existing scanners (ArbitrageScanner)
+- Routes signals through governance/risk gate (if `--paper-exec-require-approval`)
+- Executes qualifying trades in PaperLedger only
+- Exports daily paper trades and positions
+
+> ⚠️ **SAFETY**: This is PAPER TRADING ONLY. No real orders are placed. No wallet or private key logic. All trades are simulated.
+
+#### Enabling Paper Execution
+
+```powershell
+# Run daemon with paper execution enabled
+poetry run pmq ops daemon --interval 60 --paper-exec
+
+# Customize paper execution parameters
+poetry run pmq ops daemon --interval 60 --paper-exec \
+  --paper-exec-max-trades 5 \
+  --paper-exec-min-edge 100 \
+  --paper-exec-quantity 20
+
+# Check status (includes paper metrics if running)
+poetry run pmq ops status
+```
+
+#### Phase 6.1 CLI Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--paper-exec/--no-paper-exec` | bool | False | Enable paper execution in daemon |
+| `--paper-exec-max-trades` | int | 3 | Max paper trades per tick |
+| `--paper-exec-min-edge` | float | 50.0 | Min edge in basis points to execute |
+| `--paper-exec-quantity` | float | 10.0 | Quantity per paper trade |
+
+#### Exports (Phase 6.1)
+
+When paper execution is enabled, daily exports include:
+- `exports/paper_trades_YYYY-MM-DD.csv.gz` - All paper trades (timestamp, market, side, qty, price, etc.)
+- `exports/paper_positions_YYYY-MM-DD.json` - Positions snapshot with PnL summary
+- `exports/coverage_YYYY-MM-DD.json` includes `paper_*` fields (signals found, trades executed, PnL)
+- `exports/daemon_summary_YYYY-MM-DD.md` includes "Paper Execution" section
+
+#### Monitoring Endpoints
+
+- `GET /api/paper/summary` - Paper trading stats, positions, and latest metrics
+- `pmq ops status` - CLI shows paper metrics from latest coverage export
+
+#### Expected Results
+
+With Phase 6.1, when paper execution is enabled:
+- **paper_signals_found > 0** when arbitrage opportunities exist
+- **paper_trades_executed** depends on signal edge and approval status
+- **paper_pnl_total** tracks simulated performance over time
+- **paper_blocked_by_risk > 0** if risk limits hit or strategy not approved
+
+> 💡 **Why Paper Execution in Daemon?** The ops daemon already has stable real-time market data. Paper execution leverages this to generate signals and track simulated performance continuously, preparing for eventual live execution while maintaining strict safety controls.
+
 ## Project Structure
 
 ```
@@ -2415,6 +2473,17 @@ poetry run mypy src
 - [x] New metrics: `seed_skipped_skiplist`, `seed_candidates_total`
 - [x] Updated exports: coverage JSON and markdown include Phase 6.0 fields
 - [x] Unit tests for WSS bootstrap seeding and skiplist persistence defaults
+
+### Phase 6.1 ✓
+- [x] Live paper execution loop integrated into ops daemon
+- [x] PaperExecutor class: signals → governance/risk gate → PaperLedger
+- [x] New CLI flags: `--paper-exec`, `--paper-exec-max-trades`, `--paper-exec-min-edge`, `--paper-exec-quantity`
+- [x] Daily exports: `paper_trades_YYYY-MM-DD.csv.gz`, `paper_positions_YYYY-MM-DD.json`
+- [x] Coverage JSON/markdown include paper execution metrics
+- [x] `pmq ops status` shows paper metrics when available
+- [x] GET `/api/paper/summary` endpoint for monitoring
+- [x] HARD RULE: Paper-only execution, no real orders or wallet logic
+- [x] Unit tests for paper executor with mocked dependencies
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

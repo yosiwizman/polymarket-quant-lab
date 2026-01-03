@@ -194,6 +194,11 @@ class TickStats:
     rest_retry_calls: int = 0  # Total retry attempts this tick
     rest_429_count: int = 0  # 429 responses this tick
     rest_5xx_count: int = 0  # 5xx responses this tick
+    # Phase 6.1: Paper execution metrics
+    paper_signals_found: int = 0  # Arbitrage signals found this tick
+    paper_trades_executed: int = 0  # Paper trades executed this tick
+    paper_blocked_by_risk: int = 0  # Trades blocked by risk gate
+    paper_pnl_total: float = 0.0  # Total PnL (realized + unrealized)
 
 
 @dataclass
@@ -232,6 +237,13 @@ class DailyStats:
     seed_retry_calls: int = 0  # Retry attempts during seeding only
     total_rest_429: int = 0  # Total 429 responses
     total_rest_5xx: int = 0  # Total 5xx responses
+    # Phase 6.1: Paper execution metrics (daily totals)
+    paper_signals_found: int = 0  # Total arbitrage signals found
+    paper_trades_executed: int = 0  # Total paper trades executed
+    paper_blocked_by_risk: int = 0  # Total trades blocked by risk gate
+    paper_pnl_realized: float = 0.0  # Realized PnL (end of day)
+    paper_pnl_unrealized: float = 0.0  # Unrealized PnL (end of day)
+    paper_pnl_total: float = 0.0  # Total PnL (end of day)
 
 
 def compute_adaptive_staleness(interval_seconds: int) -> float:
@@ -302,6 +314,14 @@ class DaemonConfig:
     seed_skiplist_enabled: bool = True  # Phase 6.0: Enable skiplist persistence (default ON)
     # Phase 6.0: Bootstrap wait polling
     seed_bootstrap_poll_interval: float = 0.2  # Interval for polling cache readiness during grace
+    # Phase 6.1: Paper execution settings
+    paper_exec_enabled: bool = False  # Enable paper trading in daemon (default OFF for safety)
+    paper_exec_max_trades_per_tick: int = 3  # Max paper trades per tick
+    paper_exec_max_markets_scanned: int = 200  # Max markets to scan for signals
+    paper_exec_min_edge_bps: float = 50.0  # Minimum edge in basis points
+    paper_exec_trade_quantity: float = 10.0  # Quantity per paper trade
+    paper_exec_require_approval: bool = True  # Require governance approval
+    paper_exec_strategy_name: str = "paper_exec"  # Strategy name for governance
 
     def get_effective_staleness(self) -> float:
         """Get effective staleness threshold (adaptive if not explicitly set).
@@ -390,6 +410,9 @@ class DaemonRunner:
             burst=config.rest_burst,
             clock=self.clock,
         )
+
+        # Phase 6.1: Paper executor (lazy init to avoid import cycles)
+        self._paper_executor: Any = None
 
         # Ensure export directory exists
         self.config.export_dir.mkdir(parents=True, exist_ok=True)
@@ -665,6 +688,10 @@ class DaemonRunner:
             snapshot_time = now.isoformat()
             snapshot_count = self.dao.save_snapshots_bulk(markets, snapshot_time, orderbook_data)
             tick_stats.snapshots_saved = snapshot_count
+
+            # Phase 6.1: Run paper execution if enabled
+            if self.config.paper_exec_enabled:
+                await self._run_paper_execution(markets, tick_stats)
 
             # Update runtime state
             self.dao.set_runtime_state("daemon_last_tick", snapshot_time)
@@ -1106,6 +1133,92 @@ class DaemonRunner:
         )
         return result
 
+    async def _run_paper_execution(self, markets: list[Any], tick_stats: TickStats) -> None:
+        """Run paper execution loop for this tick.
+
+        Phase 6.1: Generates signals from market snapshots and executes
+        paper trades through PaperLedger only.
+
+        HARD RULE: No real order placement. All trades go to PaperLedger.
+
+        Args:
+            markets: List of market objects from this tick
+            tick_stats: Tick stats to update with paper execution metrics
+        """
+        from pmq.ops.paper_exec import PaperExecConfig, PaperExecutor
+
+        # Lazy init paper executor
+        if self._paper_executor is None:
+            paper_config = PaperExecConfig(
+                enabled=self.config.paper_exec_enabled,
+                max_trades_per_tick=self.config.paper_exec_max_trades_per_tick,
+                max_markets_scanned=self.config.paper_exec_max_markets_scanned,
+                min_signal_edge_bps=self.config.paper_exec_min_edge_bps,
+                trade_quantity=self.config.paper_exec_trade_quantity,
+                require_approval=self.config.paper_exec_require_approval,
+            )
+
+            # Try to get risk gate (optional)
+            risk_gate = None
+            if self.config.paper_exec_require_approval:
+                try:
+                    from pmq.governance import RiskGate
+
+                    risk_gate = RiskGate(dao=self.dao)
+                except Exception as e:
+                    logger.warning(f"Could not initialize RiskGate: {e}")
+
+            self._paper_executor = PaperExecutor(
+                config=paper_config,
+                dao=self.dao,
+                risk_gate=risk_gate,
+            )
+            logger.info(
+                f"Paper executor initialized: enabled={paper_config.enabled}, "
+                f"max_trades={paper_config.max_trades_per_tick}"
+            )
+
+        # Convert markets to dict format for scanner
+        markets_data = []
+        for m in markets:
+            # Build market dict compatible with scan_from_db
+            markets_data.append(
+                {
+                    "id": m.id,
+                    "question": getattr(m, "question", ""),
+                    "active": getattr(m, "active", True),
+                    "closed": getattr(m, "closed", False),
+                    "last_price_yes": getattr(m, "yes_price", 0.0),
+                    "last_price_no": getattr(m, "no_price", 0.0),
+                    "liquidity": getattr(m, "liquidity", 0.0),
+                }
+            )
+
+        # Execute paper trading tick
+        try:
+            result = self._paper_executor.execute_tick(
+                markets_data=markets_data,
+                strategy_name=self.config.paper_exec_strategy_name,
+            )
+
+            # Update tick stats with paper execution metrics
+            tick_stats.paper_signals_found = result.signals_found
+            tick_stats.paper_trades_executed = result.trades_executed
+            tick_stats.paper_blocked_by_risk = result.blocked_by_risk + result.blocked_by_safety
+            tick_stats.paper_pnl_total = result.total_pnl
+
+            # Log paper execution if any activity
+            if result.trades_executed > 0:
+                logger.info(
+                    f"Paper exec: {result.signals_found} signals, "
+                    f"{result.trades_executed} trades, "
+                    f"PnL=${result.total_pnl:.2f}"
+                )
+
+        except Exception as e:
+            logger.error(f"Paper execution error: {e}")
+            tick_stats.error = (tick_stats.error or "") + f" Paper exec error: {e}"
+
     def _ensure_daily_stats_initialized(self) -> None:
         """Ensure daily stats are initialized for today (Phase 5.7).
 
@@ -1158,6 +1271,12 @@ class DaemonRunner:
             self._daily_stats.total_rest_retry_calls += tick_stats.rest_retry_calls
             self._daily_stats.total_rest_429 += tick_stats.rest_429_count
             self._daily_stats.total_rest_5xx += tick_stats.rest_5xx_count
+            # Phase 6.1: Paper execution metrics
+            self._daily_stats.paper_signals_found += tick_stats.paper_signals_found
+            self._daily_stats.paper_trades_executed += tick_stats.paper_trades_executed
+            self._daily_stats.paper_blocked_by_risk += tick_stats.paper_blocked_by_risk
+            # Update PnL (latest snapshot, not cumulative)
+            self._daily_stats.paper_pnl_total = tick_stats.paper_pnl_total
             if tick_stats.error:
                 self._daily_stats.total_errors += 1
             self._daily_stats.end_time = tick_stats.timestamp
@@ -1428,6 +1547,11 @@ class DaemonRunner:
             "seed_retry_calls": stats.seed_retry_calls,
             "rest_429_count": stats.total_rest_429,
             "rest_5xx_count": stats.total_rest_5xx,
+            # Phase 6.1: Paper execution metrics
+            "paper_signals_found": stats.paper_signals_found,
+            "paper_trades_executed": stats.paper_trades_executed,
+            "paper_blocked_by_risk": stats.paper_blocked_by_risk,
+            "paper_pnl_total": stats.paper_pnl_total,
             # Metadata
             "errors": stats.total_errors,
             "start_time": stats.start_time,
@@ -1572,15 +1696,159 @@ class DaemonRunner:
 - **429 Responses:** {stats.total_rest_429:,}
 - **5xx Responses:** {stats.total_rest_5xx:,}
 
+## Paper Execution (Phase 6.1)
+- **Signals Found:** {stats.paper_signals_found:,}
+- **Trades Executed:** {stats.paper_trades_executed:,}
+- **Blocked by Risk:** {stats.paper_blocked_by_risk:,}
+- **Total PnL:** ${stats.paper_pnl_total:.2f}
+
 ## Errors
 - **Total Errors:** {stats.total_errors}
 
 ---
-*Generated by pmq ops daemon (Phase 6.0)*
+*Generated by pmq ops daemon (Phase 6.1)*
 """
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
         logger.info(f"Exported summary to {md_path}")
+
+        # Phase 6.1: Export paper trades and positions
+        if self.config.paper_exec_enabled:
+            await self._export_paper_trades(date_str)
+            await self._export_paper_positions(date_str)
+
+    async def _export_paper_trades(self, date_str: str) -> int:
+        """Export paper trades for a given date to gzip CSV.
+
+        Phase 6.1: Exports all paper trades with atomic write.
+
+        Args:
+            date_str: Date string in YYYY-MM-DD format
+
+        Returns:
+            Number of trades exported
+        """
+        export_dir = self.config.export_dir
+        output_path = export_dir / f"paper_trades_{date_str}.csv.gz"
+
+        # Get trades from DAO
+        trades = self.dao.get_trades_for_export(limit=10000)
+        if not trades:
+            logger.info(f"No paper trades to export for {date_str}")
+            return 0
+
+        # Filter trades for this date (approximate - uses created_at)
+        day_start = f"{date_str}T00:00:00"
+        day_end = f"{date_str}T23:59:59"
+        day_trades = [t for t in trades if day_start <= (t.get("created_at") or "9999") <= day_end]
+
+        if not day_trades:
+            logger.info(f"No paper trades to export for {date_str}")
+            return 0
+
+        # Atomic write: temp file in same directory, then rename
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".csv.gz.tmp", dir=str(export_dir))
+        try:
+            os.close(temp_fd)
+            temp_path_obj = Path(temp_path)
+
+            fieldnames = [
+                "id",
+                "strategy",
+                "market_id",
+                "side",
+                "outcome",
+                "price",
+                "quantity",
+                "notional",
+                "created_at",
+            ]
+
+            with gzip.open(temp_path_obj, "wt", encoding="utf-8", newline="") as gz:
+                writer = csv.DictWriter(gz, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for trade in day_trades:
+                    writer.writerow(
+                        {
+                            "id": trade.get("id"),
+                            "strategy": trade.get("strategy"),
+                            "market_id": trade.get("market_id"),
+                            "side": trade.get("side"),
+                            "outcome": trade.get("outcome"),
+                            "price": trade.get("price"),
+                            "quantity": trade.get("quantity"),
+                            "notional": trade.get("notional"),
+                            "created_at": trade.get("created_at"),
+                        }
+                    )
+
+            # Atomic rename
+            if sys.platform == "win32" and output_path.exists():
+                output_path.unlink()
+            temp_path_obj.rename(output_path)
+
+            logger.info(f"Exported {len(day_trades):,} paper trades to {output_path}")
+            return len(day_trades)
+
+        except Exception:
+            with contextlib.suppress(Exception):
+                Path(temp_path).unlink(missing_ok=True)
+            raise
+
+    async def _export_paper_positions(self, date_str: str) -> int:
+        """Export paper positions snapshot for a given date to JSON.
+
+        Phase 6.1: Exports positions snapshot with PnL summary.
+
+        Args:
+            date_str: Date string in YYYY-MM-DD format
+
+        Returns:
+            Number of positions exported
+        """
+        export_dir = self.config.export_dir
+        output_path = export_dir / f"paper_positions_{date_str}.json"
+
+        # Get positions from DAO
+        positions = self.dao.get_positions_for_export()
+
+        # Calculate PnL summary
+        total_realized = sum(p.get("realized_pnl", 0.0) for p in positions)
+        total_yes_qty = sum(p.get("yes_quantity", 0.0) for p in positions)
+        total_no_qty = sum(p.get("no_quantity", 0.0) for p in positions)
+
+        positions_data = {
+            "date": date_str,
+            "snapshot_time": self.clock.now().isoformat(),
+            "position_count": len(positions),
+            "total_realized_pnl": total_realized,
+            "total_yes_quantity": total_yes_qty,
+            "total_no_quantity": total_no_qty,
+            "positions": positions,
+        }
+
+        # Atomic write using temp file
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".json.tmp", dir=str(export_dir))
+        try:
+            os.close(temp_fd)
+            temp_path_obj = Path(temp_path)
+
+            with open(temp_path_obj, "w", encoding="utf-8") as f:
+                json.dump(positions_data, f, indent=2, default=str)
+
+            # Atomic rename
+            if sys.platform == "win32" and output_path.exists():
+                output_path.unlink()
+            temp_path_obj.rename(output_path)
+
+            logger.info(f"Exported {len(positions):,} paper positions to {output_path}")
+            return len(positions)
+
+        except Exception:
+            with contextlib.suppress(Exception):
+                Path(temp_path).unlink(missing_ok=True)
+            raise
 
     async def _finalize(self) -> None:
         """Finalize daemon: export current day stats and close connections.
@@ -1626,6 +1894,28 @@ class DaemonRunner:
                 )
             except Exception as e:
                 logger.warning(f"Snapshot export failed for {current_day}: {e}")
+
+        # Phase 6.1: Export paper trades and positions on shutdown
+        if self.config.paper_exec_enabled and current_day:
+            try:
+                await asyncio.wait_for(
+                    self._export_paper_trades(current_day),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                logger.warning(f"Paper trades export for {current_day} timed out")
+            except Exception as e:
+                logger.warning(f"Paper trades export failed: {e}")
+
+            try:
+                await asyncio.wait_for(
+                    self._export_paper_positions(current_day),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                logger.warning(f"Paper positions export for {current_day} timed out")
+            except Exception as e:
+                logger.warning(f"Paper positions export failed: {e}")
 
         # Close WSS connection (with timeout)
         if self.wss_client:

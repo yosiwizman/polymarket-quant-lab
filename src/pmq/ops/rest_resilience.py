@@ -225,7 +225,7 @@ def compute_backoff(
     return float(delay)
 
 
-async def retry_rest_call(
+async def retry_rest_call(  # noqa: UP047
     call_fn: Callable[[], T],
     config: RestResilienceConfig,
     rate_limiter: TokenBucketRateLimiter | None = None,

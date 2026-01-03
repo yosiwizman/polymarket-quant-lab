@@ -2522,6 +2522,178 @@ The daemon summary now includes:
 
 > ⚠️ **SAFETY**: The preflight command does NOT place orders. It only checks readiness.
 
+### Calibration + Approval TTL + Fee-Aware Net Edge (Phase 9)
+
+Phase 9 adds operator tooling for calibration and introduces a safer time-limited approval mechanism:
+
+1. **Approval with TTL**: JSON-file-based approvals under `exports/approvals/` with expiration
+2. **Calibration Command**: Analyze explain mode JSONL to tune thresholds
+3. **Fee-Aware Net Edge**: Explicit `gross_edge_bps` and `net_edge_bps` for fee-aware calibration
+
+#### Approval TTL Commands
+
+```powershell
+# Approve paper execution for 60 minutes (default)
+poetry run pmq risk approve paper_exec --ttl-minutes 60 --reason "Testing new thresholds"
+
+# Check approval status
+poetry run pmq risk status
+
+# Revoke an approval
+poetry run pmq risk revoke paper_exec
+```
+
+Approvals are stored as JSON files under `exports/approvals/`. They automatically expire after the TTL, providing a safer alternative to permanent approvals.
+
+#### Calibration Command
+
+Analyze explain mode JSONL output to understand edge distribution:
+
+```powershell
+# Analyze edge distribution from explain mode data
+poetry run pmq ops calibrate --jsonl exports/paper_exec_2026-01-03.jsonl
+
+# Output includes:
+# - Edge distribution stats (min, median, p90, p99, max)
+# - Markdown report saved to exports/calibration_<date>.md
+```
+
+Use calibration results to tune `--paper-exec-min-edge` threshold.
+
+#### Fee-Aware Net Edge
+
+All edge computations now track both gross and net values:
+
+```powershell
+# Run daemon with fee/slippage assumptions
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain \
+  --fee-bps 10 --slippage-bps 5
+```
+
+New fields in ExplainCandidate and EdgeResult:
+- `gross_edge_bps`: Edge BEFORE fees/slippage
+- `net_edge_bps`: Edge AFTER fees/slippage (`gross - 2*(fee_bps + slippage_bps)`)
+- `fee_bps`, `slippage_bps`: Applied fee parameters
+
+Daemon summary now includes "Net Edge Diagnostics" section with net edge statistics.
+
+#### Phase 9 CLI Flags (Daemon)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--fee-bps` | float | 0.0 | Trading fee in basis points |
+| `--slippage-bps` | float | 0.0 | Expected slippage in basis points |
+
+#### Phase 9 CLI Commands (Risk)
+
+| Command | Description |
+|---------|-------------|
+| `pmq risk approve <scope>` | Create TTL-limited approval |
+| `pmq risk revoke <scope>` | Remove an approval |
+| `pmq risk status` | List all active approvals |
+| `pmq ops calibrate --jsonl <path>` | Analyze edge distribution |
+
+#### Calibration Workflow
+
+1. **Collect data**: Run daemon with explain mode enabled
+   ```powershell
+   poetry run pmq ops daemon --paper-exec --paper-exec-explain --fee-bps 10 --slippage-bps 5
+   ```
+
+2. **Analyze edge distribution**:
+   ```powershell
+   poetry run pmq ops calibrate --jsonl exports/paper_exec_2026-01-03.jsonl
+   ```
+
+3. **Tune threshold**: Adjust `--paper-exec-min-edge` based on p90/p99 values
+
+4. **Grant time-limited approval**:
+   ```powershell
+   poetry run pmq risk approve paper_exec --ttl-minutes 120 --reason "Validated thresholds"
+   ```
+
+5. **Run with approved settings**: Daemon will execute trades until approval expires
+
+> ⚠️ **SAFETY**: Approvals expire automatically. If you need long-running approval, either increase TTL or re-approve periodically. This prevents forgotten approvals from allowing unintended trades.
+
+## First Paper Trade Checklist
+
+Getting your first paper trade requires several steps to work together. This checklist helps you verify everything is configured correctly.
+
+### Step 1: Verify Preflight
+
+```powershell
+poetry run pmq ops preflight --verbose
+```
+
+✓ Confirms geoblock status and API connectivity.
+
+### Step 2: Collect Baseline Data with Explain Mode
+
+```powershell
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain --max-hours 1 --fee-bps 0 --slippage-bps 0
+```
+
+This runs for 1 hour and exports:
+- `exports/paper_exec_<date>.jsonl` - Candidate data
+- `exports/daemon_summary_<date>.md` - Summary with edge statistics
+
+### Step 3: Analyze Edge Distribution
+
+```powershell
+poetry run pmq ops calibrate --jsonl exports/paper_exec_<date>.jsonl
+```
+
+Review the output:
+- **If max edge is negative**: Market is efficient, no arb opportunities exist. This is normal!
+- **If max edge is positive but below threshold**: Lower `--paper-exec-min-edge`
+- **If trades blocked by risk**: You need to grant approval (Step 4)
+
+### Step 4: Grant Time-Limited Approval
+
+```powershell
+# Grant 2-hour approval for paper execution
+poetry run pmq risk approve paper_exec --ttl-minutes 120 --reason "First paper trade test"
+
+# Verify approval is active
+poetry run pmq risk status
+```
+
+### Step 5: Run Paper Execution
+
+```powershell
+# Run with approval granted, zero fees (for testing)
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain \
+  --paper-exec-min-edge 10 --fee-bps 0 --slippage-bps 0
+```
+
+### Troubleshooting: Why No Trades?
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `blocked_by_risk > 0` | No active approval | Run `pmq risk approve paper_exec` |
+| `edge_below_min` rejections | Threshold too high | Lower `--paper-exec-min-edge` |
+| All `gross_edge_bps < 0` | Market is efficient | Normal - no arbitrage exists |
+| `net_edge_bps` much lower than `gross` | Fee assumptions too high | Use `--fee-bps 0` for testing |
+| Zero candidates | No markets with orderbook data | Check WSS/REST connectivity |
+
+### Key Defaults (Phase 10)
+
+- `--fee-bps 0`: Fee defaults to 0 (Polymarket has no taker fees for most markets)
+- `--slippage-bps 0`: Slippage defaults to 0
+- `--paper-exec-min-edge 50`: Default minimum edge in basis points
+
+### Success Criteria
+
+Your first paper trade will occur when:
+1. ✓ `pmq risk status` shows active approval
+2. ✓ Market has `gross_edge_bps >= --paper-exec-min-edge`
+3. ✓ `net_edge_bps` (after fees) >= threshold
+4. ✓ Market has sufficient liquidity
+5. ✓ No risk/safety blocks
+
+> 💡 **Tip**: If markets are efficient (no arb), you've proven the system works correctly! The absence of trades when no opportunity exists is the right behavior.
+
 ## Project Structure
 
 ```
@@ -2819,6 +2991,22 @@ poetry run mypy src
 - [x] GET `/api/paper/summary` endpoint for monitoring
 - [x] HARD RULE: Paper-only execution, no real orders or wallet logic
 - [x] Unit tests for paper executor with mocked dependencies
+
+### Phase 8 ✓
+- [x] Orderbook-based edge computation (`edge_calc.py`)
+- [x] BUY_BOTH and SELL_BOTH arb detection
+- [x] ExplainCandidate with orderbook fields (ask_yes, ask_no, bid_yes, bid_no)
+- [x] `raw_edge_bps` from real orderbook prices
+- [x] Fee/slippage parameters in edge computation
+
+### Phase 9 ✓
+- [x] Approval with TTL (`pmq risk approve/revoke/status`)
+- [x] JSON-file-based approvals under `exports/approvals/`
+- [x] Calibration command (`pmq ops calibrate --jsonl <path>`)
+- [x] Fee-aware net edge: `gross_edge_bps`, `net_edge_bps` = gross - fees
+- [x] CLI flags: `--fee-bps`, `--slippage-bps` for daemon
+- [x] Net Edge Diagnostics in daemon summary
+- [x] Tests for approval TTL and net edge math
 
 ### Phase 5.x (Future)
 - [ ] Authenticated CLOB integration

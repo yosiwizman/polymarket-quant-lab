@@ -4149,6 +4149,21 @@ def ops_daemon(
             help="JSONL export path for explain data (default: exports/paper_exec_<date>.jsonl)",
         ),
     ] = None,
+    # Phase 9: Fee/slippage for net edge computation
+    paper_exec_fee_bps: Annotated[
+        float,
+        typer.Option(
+            "--fee-bps",
+            help="Trading fee in basis points for net edge computation (default: 0)",
+        ),
+    ] = 0.0,
+    paper_exec_slippage_bps: Annotated[
+        float,
+        typer.Option(
+            "--slippage-bps",
+            help="Expected slippage in basis points for net edge computation (default: 0)",
+        ),
+    ] = 0.0,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -4270,6 +4285,9 @@ def ops_daemon(
         paper_exec_explain=paper_exec_explain,
         paper_exec_explain_top_n=paper_exec_explain_top_n,
         paper_exec_explain_export_path=paper_exec_explain_export_path,
+        # Phase 9: Fee/slippage for net edge
+        paper_exec_fee_bps=paper_exec_fee_bps,
+        paper_exec_slippage_bps=paper_exec_slippage_bps,
     )
 
     # Initialize dependencies
@@ -4329,6 +4347,7 @@ def ops_daemon(
         f"Seed Skiplist: {skiplist_str}\n"
         f"REST Resilience: {rest_rps:.1f} rps, burst {rest_burst}, {rest_retries} retries\n"
         f"Paper Execution: [cyan]{paper_str}[/cyan] (max={paper_exec_max_trades}/tick, min_edge={paper_exec_min_edge_bps}bps)\n"
+        f"Paper Fee/Slippage: fee={paper_exec_fee_bps}bps, slippage={paper_exec_slippage_bps}bps\n"
         f"Paper Explain: [cyan]{explain_str}[/cyan] (top_n={paper_exec_explain_top_n})\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
@@ -4589,6 +4608,341 @@ def ops_preflight(
         console.print("[bold red]✗ Preflight checks failed[/bold red]")
         console.print("[dim]Resolve issues above before live trading[/dim]")
         raise typer.Exit(1)
+
+
+# =============================================================================
+# Risk Commands (Phase 9)
+# =============================================================================
+
+risk_app = typer.Typer(help="Risk management and approval commands")
+app.add_typer(risk_app, name="risk")
+
+
+@risk_app.command("approve")
+def risk_approve(
+    scope: Annotated[
+        str,
+        typer.Argument(help="Approval scope (e.g., paper_exec)"),
+    ],
+    ttl_minutes: Annotated[
+        int,
+        typer.Option("--ttl-minutes", "-t", help="Time-to-live in minutes"),
+    ] = 60,
+    reason: Annotated[
+        str | None,
+        typer.Option("--reason", "-r", help="Reason for approval"),
+    ] = None,
+) -> None:
+    """Approve a scope with TTL (Phase 9).
+
+    Grants time-limited approval for a scope. Approvals expire automatically
+    and must be explicitly renewed.
+
+    Common scopes:
+        paper_exec - Allow paper execution in daemon
+
+    Example:
+        pmq risk approve paper_exec --ttl-minutes 60
+        pmq risk approve paper_exec -t 120 --reason "calibration run"
+    """
+    from pmq.risk import approve
+
+    ttl_seconds = ttl_minutes * 60
+    approval = approve(scope=scope, ttl_seconds=ttl_seconds, reason=reason)
+
+    console.print(f"[green]✓ Approved '{scope}'[/green]")
+    console.print(f"  Expires: {approval.expires_at[:19]}")
+    console.print(f"  TTL: {ttl_minutes} minutes")
+    if reason:
+        console.print(f"  Reason: {reason}")
+
+
+@risk_app.command("revoke")
+def risk_revoke(
+    scope: Annotated[
+        str,
+        typer.Argument(help="Approval scope to revoke"),
+    ],
+) -> None:
+    """Revoke an approval (Phase 9).
+
+    Immediately revokes approval for a scope.
+
+    Example:
+        pmq risk revoke paper_exec
+    """
+    from pmq.risk import revoke
+
+    deleted = revoke(scope=scope)
+    if deleted:
+        console.print(f"[green]✓ Revoked approval for '{scope}'[/green]")
+    else:
+        console.print(f"[yellow]No approval found for '{scope}'[/yellow]")
+
+
+@risk_app.command("status")
+def risk_status() -> None:
+    """Show approval status for all scopes (Phase 9).
+
+    Lists all approvals with their expiration status.
+
+    Example:
+        pmq risk status
+    """
+    from datetime import UTC, datetime
+
+    from pmq.risk import list_approvals
+
+    approvals = list_approvals()
+    now = datetime.now(UTC)
+
+    if not approvals:
+        console.print("[dim]No approvals found[/dim]")
+        console.print("[dim]Use 'pmq risk approve <scope> --ttl-minutes N' to create one[/dim]")
+        return
+
+    table = Table(title="Approval Status")
+    table.add_column("Scope", style="cyan")
+    table.add_column("Status")
+    table.add_column("Expires At")
+    table.add_column("Time Remaining")
+    table.add_column("Reason")
+
+    for approval in approvals:
+        is_valid = approval.is_valid(now)
+        remaining = approval.time_remaining(now)
+
+        if is_valid:
+            status = "[green]ACTIVE[/green]"
+            remaining_str = f"{int(remaining.total_seconds() // 60)}m"
+        else:
+            status = "[red]EXPIRED[/red]"
+            remaining_str = "—"
+
+        table.add_row(
+            approval.scope,
+            status,
+            approval.expires_at[:19],
+            remaining_str,
+            approval.reason or "—",
+        )
+
+    console.print(table)
+
+
+# =============================================================================
+# Calibration Command (Phase 9)
+# =============================================================================
+
+
+@ops_app.command("calibrate")
+def ops_calibrate(
+    jsonl_path: Annotated[
+        Path,
+        typer.Option("--jsonl", "-j", help="Path to paper_exec JSONL file"),
+    ],
+    out_path: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", help="Output markdown path (default: auto)"),
+    ] = None,
+    thresholds: Annotated[
+        str,
+        typer.Option(
+            "--thresholds",
+            help="Comma-separated threshold bps to analyze (default: 0,5,10,25,50)",
+        ),
+    ] = "0,5,10,25,50",
+) -> None:
+    """Calibrate edge thresholds from JSONL exports (Phase 9).
+
+    Analyzes paper_exec JSONL files to produce edge distribution statistics
+    and recommendations for min-edge thresholds.
+
+    Outputs:
+    - Distribution stats (min/median/p90/p99/max) for gross and net edge
+    - % of ticks above configurable thresholds
+    - Top markets by max edge and frequency
+    - Recommended starting min-edge based on data
+
+    Example:
+        pmq ops calibrate --jsonl exports/paper_exec_2026-01-03.jsonl
+        pmq ops calibrate -j exports/paper_exec_2026-01-03.jsonl --out calibration.md
+    """
+    import json
+    from collections import Counter
+
+    if not jsonl_path.exists():
+        console.print(f"[red]File not found: {jsonl_path}[/red]")
+        raise typer.Exit(1)
+
+    # Parse threshold list
+    try:
+        threshold_list = [float(t.strip()) for t in thresholds.split(",")]
+    except ValueError:
+        console.print(f"[red]Invalid thresholds: {thresholds}[/red]")
+        raise typer.Exit(1) from None
+
+    console.print(f"[cyan]Reading {jsonl_path}...[/cyan]")
+
+    # Collect data
+    ticks: list[dict[str, Any]] = []
+    gross_edges: list[float] = []
+    net_edges: list[float] = []
+    market_edges: dict[str, list[float]] = {}  # market_id -> list of edges
+    market_appearances: Counter[str] = Counter()  # market_id -> count in top-n
+
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                tick = json.loads(line)
+                ticks.append(tick)
+
+                candidates = tick.get("candidates", [])
+                for cand in candidates:
+                    market_id = cand.get("market_id", "")
+                    raw_edge = cand.get("raw_edge_bps", 0.0)
+                    net_edge = cand.get("net_edge_bps", raw_edge)  # Fall back to raw if no net
+
+                    gross_edges.append(raw_edge)
+                    net_edges.append(net_edge)
+
+                    if market_id:
+                        if market_id not in market_edges:
+                            market_edges[market_id] = []
+                        market_edges[market_id].append(net_edge)
+                        market_appearances[market_id] += 1
+
+            except json.JSONDecodeError:
+                continue
+
+    if not ticks:
+        console.print("[yellow]No ticks found in JSONL file[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓ Loaded {len(ticks)} ticks, {len(gross_edges)} candidate edges[/green]")
+
+    # Compute statistics
+    def compute_stats(values: list[float]) -> dict[str, float]:
+        if not values:
+            return {"min": 0, "median": 0, "p90": 0, "p99": 0, "max": 0, "mean": 0}
+        sorted_v = sorted(values)
+        n = len(sorted_v)
+        return {
+            "min": sorted_v[0],
+            "median": sorted_v[n // 2],
+            "p90": sorted_v[int(n * 0.90)] if n > 10 else sorted_v[-1],
+            "p99": sorted_v[int(n * 0.99)] if n > 100 else sorted_v[-1],
+            "max": sorted_v[-1],
+            "mean": sum(sorted_v) / n,
+        }
+
+    gross_stats = compute_stats(gross_edges)
+    net_stats = compute_stats(net_edges)
+
+    # Compute % above thresholds
+    def pct_above(values: list[float], threshold: float) -> float:
+        if not values:
+            return 0.0
+        return sum(1 for v in values if v >= threshold) / len(values) * 100
+
+    # Top markets
+    top_by_max = sorted(
+        [(mid, max(edges)) for mid, edges in market_edges.items()],
+        key=lambda x: x[1],
+        reverse=True,
+    )[:10]
+
+    top_by_freq = market_appearances.most_common(10)
+
+    # Recommend min-edge (use p99 of net edge as "rare but real" heuristic)
+    recommended_min_edge = max(0, net_stats["p99"] - 5) if net_stats["p99"] > 5 else 0
+
+    # Build markdown report
+    now = datetime.now(UTC).strftime("%Y-%m-%d")
+    if out_path is None:
+        out_path = Path("exports") / f"calibration_{now}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    md_content = f"""# Edge Calibration Report
+Generated: {datetime.now(UTC).isoformat()[:19]}Z
+Source: {jsonl_path}
+
+## Summary
+- **Total Ticks:** {len(ticks)}
+- **Total Candidates:** {len(gross_edges)}
+- **Unique Markets:** {len(market_edges)}
+
+## Gross Edge Distribution (raw_edge_bps)
+- Min: {gross_stats['min']:.1f} bps
+- Median: {gross_stats['median']:.1f} bps
+- Mean: {gross_stats['mean']:.1f} bps
+- P90: {gross_stats['p90']:.1f} bps
+- P99: {gross_stats['p99']:.1f} bps
+- Max: {gross_stats['max']:.1f} bps
+
+## Net Edge Distribution (net_edge_bps)
+- Min: {net_stats['min']:.1f} bps
+- Median: {net_stats['median']:.1f} bps
+- Mean: {net_stats['mean']:.1f} bps
+- P90: {net_stats['p90']:.1f} bps
+- P99: {net_stats['p99']:.1f} bps
+- Max: {net_stats['max']:.1f} bps
+
+## % Ticks Above Thresholds (Net Edge)
+"""
+    for thresh in threshold_list:
+        pct = pct_above(net_edges, thresh)
+        md_content += f"- >= {thresh:.0f} bps: {pct:.1f}%\n"
+
+    md_content += """
+## Top Markets by Max Net Edge
+"""
+    for i, (mid, max_edge) in enumerate(top_by_max, 1):
+        md_content += f"{i}. `{mid[:16]}...` — {max_edge:.1f} bps\n"
+
+    md_content += """
+## Top Markets by Frequency in Top-N
+"""
+    for i, (mid, count) in enumerate(top_by_freq, 1):
+        md_content += f"{i}. `{mid[:16]}...` — {count} appearances\n"
+
+    md_content += f"""
+## Recommendation
+**Suggested starting min_edge_bps:** {recommended_min_edge:.0f} bps
+
+This is based on p99 of net edge distribution. If net edge is consistently
+negative or zero, the market may be in no-arb equilibrium. Consider:
+- Adjusting fee/slippage assumptions
+- Expanding market universe
+- Waiting for more volatile periods
+
+---
+*Generated by pmq ops calibrate (Phase 9)*
+"""
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(md_content)
+
+    console.print(f"[green]✓ Report saved to {out_path}[/green]")
+
+    # Print terminal summary
+    console.print("\n[bold]Calibration Summary[/bold]")
+    console.print(
+        f"  Gross edge: median={gross_stats['median']:.1f} bps, max={gross_stats['max']:.1f} bps"
+    )
+    console.print(
+        f"  Net edge: median={net_stats['median']:.1f} bps, max={net_stats['max']:.1f} bps"
+    )
+    console.print(f"  Recommended min_edge: [cyan]{recommended_min_edge:.0f} bps[/cyan]")
+
+    if net_stats["max"] <= 0:
+        console.print(
+            "\n[yellow]⚠ All net edges <= 0. Market may be in no-arb equilibrium.[/yellow]"
+        )
+        console.print("[dim]Consider: lower fees, different markets, or expect no signals.[/dim]")
 
 
 if __name__ == "__main__":

@@ -2340,6 +2340,88 @@ This prevents the misleading "blocked_by_risk = 40" when running 40 ticks with n
 
 > ⚠️ **SAFETY REMINDER**: This is still PAPER TRADING. Lowering thresholds increases simulated trade volume but no real orders are placed.
 
+### Edge Model v1: Orderbook-Based Edge Computation (Phase 8)
+
+Phase 8 replaces the placeholder edge values with real arbitrage edge computed from CLOB orderbook data.
+
+#### The Problem
+
+Before Phase 8, `raw_edge_bps` was always 0 in JSONL exports because edge was computed from Gamma API prices (last trade) rather than orderbook best bid/ask. This made calibration impossible - you couldn't tell if opportunities were being missed.
+
+#### How Arb Edge Is Computed
+
+For binary markets, two arbitrage strategies exist:
+
+**BUY_BOTH**: Buy YES at ask + Buy NO at ask, profit if total < $1
+```
+raw_edge_bps = (1.0 - (ask_yes + ask_no)) × 10,000
+```
+
+**SELL_BOTH**: Sell YES at bid + Sell NO at bid, profit if total > $1
+```
+raw_edge_bps = ((bid_yes + bid_no) - 1.0) × 10,000
+```
+
+The calculator picks the strategy with the higher edge.
+
+#### Derived NO Prices
+
+Since the daemon only fetches YES token orderbooks, NO prices are derived using binary market relationships:
+```
+bid_no ≈ 1 - ask_yes   (selling NO means buying YES at ask)
+ask_no ≈ 1 - bid_yes   (buying NO means selling YES at bid)
+```
+
+> ⚠️ **Note**: Derived prices are approximations. For precise edge computation, both YES and NO orderbooks would be needed (planned for future phases).
+
+#### JSONL Export Fields (Phase 8)
+
+Explain mode candidates now include orderbook-derived fields:
+
+```json
+{
+  "market_id": "0x1234...",
+  "yes_token_id": "12345...",
+  "no_token_id": "67890...",
+  "arb_side": "BUY_BOTH",
+  "raw_edge_bps": -100.0,
+  "ask_yes": 0.48,
+  "ask_no": 0.53,
+  "bid_yes": 0.47,
+  "bid_no": 0.52,
+  "mid_price": 0.475,
+  "spread_bps": 421.1,
+  "rejection_reason": "edge_below_min"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `yes_token_id` | CLOB token ID for YES outcome |
+| `no_token_id` | CLOB token ID for NO outcome |
+| `arb_side` | `BUY_BOTH`, `SELL_BOTH`, or `NONE` |
+| `raw_edge_bps` | Edge in basis points (can be negative) |
+| `ask_yes` / `bid_yes` | Best ask/bid from YES orderbook |
+| `ask_no` / `bid_no` | Derived NO prices |
+| `mid_price` | Mid-price from orderbook (not hardcoded 0.5) |
+| `spread_bps` | Combined bid-ask spread in basis points |
+
+#### Expected Results
+
+With Phase 8:
+- **raw_edge_bps ≠ 0** for markets with orderbook data
+- **Negative edge values** are common (efficient markets)
+- **Positive edge** would indicate arbitrage opportunity
+- **mid_price** reflects actual orderbook mid, not 0.5
+- **spread_bps** shows real market spread
+
+#### Calibration Guidance
+
+1. **Negative edge is normal**: Efficient markets have `raw_edge_bps < 0` (buying both sides costs > $1)
+2. **Look for near-zero edge**: Markets with edge close to 0 are most likely to flip positive
+3. **Consider fees**: Real execution incurs ~0.5-2% fees; subtract from edge to get net
+4. **Use raw_edge for sorting**: Sort by `raw_edge_bps` descending to find best opportunities
+
 ### Phase 7 Preflight: Geoblock + Builder Keys (Phase 7)
 
 Before enabling live CLOB trading (future phases), you must pass preflight checks:

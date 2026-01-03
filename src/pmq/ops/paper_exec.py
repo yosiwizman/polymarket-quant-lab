@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pmq.logging import get_logger
+from pmq.ops.edge_calc import compute_edge_from_prices
 from pmq.strategies import ArbitrageScanner, PaperLedger, StatArbScanner
 from pmq.strategies.paper import SafetyError
 
@@ -84,6 +85,11 @@ class ExplainCandidate:
 
     Phase 7: Added raw_edge_bps which is computed BEFORE risk gating.
     This allows calibration even when risk rejects the trade.
+
+    Phase 8: Added orderbook-based arb edge fields:
+    - yes_token_id, no_token_id: CLOB token identifiers
+    - arb_side: BUY_BOTH, SELL_BOTH, or NONE
+    - ask_yes, ask_no, bid_yes, bid_no: Best prices from orderbooks
     """
 
     # Market identification
@@ -91,8 +97,13 @@ class ExplainCandidate:
     token_id: str | None = None
     market_question: str = ""
 
+    # Phase 8: Token IDs for both sides of binary market
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
+
     # Signal data
     side: str = "arb"  # "arb" for arbitrage, "long", "short" for directional
+    arb_side: str = "NONE"  # Phase 8: BUY_BOTH, SELL_BOTH, or NONE
     yes_price: float = 0.0
     no_price: float = 0.0
     mid_price: float = 0.0
@@ -101,6 +112,12 @@ class ExplainCandidate:
     raw_edge_bps: float = 0.0  # Edge computed BEFORE risk gating (Phase 7)
     liquidity: float = 0.0  # Market liquidity estimate
     size_estimate: float = 0.0  # Estimated executable size
+
+    # Phase 8: Orderbook prices for arb edge computation
+    ask_yes: float | None = None  # Best ask on YES token
+    ask_no: float | None = None  # Best ask on NO token
+    bid_yes: float | None = None  # Best bid on YES token
+    bid_no: float | None = None  # Best bid on NO token
 
     # Rejection tracking
     rejection_reason: RejectionReason = RejectionReason.NONE
@@ -115,14 +132,21 @@ class ExplainCandidate:
         return {
             "market_id": self.market_id,
             "token_id": self.token_id,
+            "yes_token_id": self.yes_token_id,
+            "no_token_id": self.no_token_id,
             "market_question": self.market_question[:100] if self.market_question else "",
             "side": self.side,
+            "arb_side": self.arb_side,
             "yes_price": round(self.yes_price, 6),
             "no_price": round(self.no_price, 6),
             "mid_price": round(self.mid_price, 6),
             "spread_bps": round(self.spread_bps, 2),
             "edge_bps": round(self.edge_bps, 2),
             "raw_edge_bps": round(self.raw_edge_bps, 2),
+            "ask_yes": round(self.ask_yes, 6) if self.ask_yes is not None else None,
+            "ask_no": round(self.ask_no, 6) if self.ask_no is not None else None,
+            "bid_yes": round(self.bid_yes, 6) if self.bid_yes is not None else None,
+            "bid_no": round(self.bid_no, 6) if self.bid_no is not None else None,
             "liquidity": round(self.liquidity, 2),
             "size_estimate": round(self.size_estimate, 2),
             "rejection_reason": self.rejection_reason.value,
@@ -361,28 +385,75 @@ class PaperExecutor:
         min_liquidity = self._arb_scanner._config.min_liquidity
 
         # Build candidates from signals
+        # Phase 8: Compute edge from orderbook data when available
         for signal in arb_signals:
             market_data = markets_lookup.get(signal.market_id, {})
-            edge_bps = signal.profit_potential * 10000
-            mid_price = (
-                (signal.yes_price + signal.no_price) / 2
-                if signal.yes_price + signal.no_price > 0
-                else 0
-            )
+            yes_token_id = market_data.get("yes_token_id")
+            no_token_id = market_data.get("no_token_id")
 
-            # Phase 7: Store raw_edge_bps BEFORE any rejection checks
-            # This ensures we capture the true edge even when risk gates block execution
+            # Phase 8: Try to use orderbook data for edge computation
+            orderbook = market_data.get("orderbook")
+            ask_yes: float | None = None
+            ask_no: float | None = None
+            bid_yes: float | None = None
+            bid_no: float | None = None
+            arb_side = "NONE"
+            mid_price = 0.0
+            spread_bps = 0.0
+
+            if orderbook and orderbook.get("best_bid") and orderbook.get("best_ask"):
+                # Phase 8: Use orderbook prices for edge computation
+                # We have YES orderbook - derive NO prices using binary relation
+                bid_yes = orderbook["best_bid"]
+                ask_yes = orderbook["best_ask"]
+                bid_no = max(0.001, 1.0 - ask_yes)  # Derive from YES ask
+                ask_no = min(0.999, 1.0 - bid_yes)  # Derive from YES bid
+
+                # Compute edge using edge_calc
+                edge_result = compute_edge_from_prices(
+                    ask_yes=ask_yes,
+                    ask_no=ask_no,
+                    bid_yes=bid_yes,
+                    bid_no=bid_no,
+                    yes_token_id=yes_token_id,
+                    no_token_id=no_token_id,
+                )
+
+                raw_edge_bps = edge_result.raw_edge_bps
+                edge_bps = raw_edge_bps
+                arb_side = edge_result.arb_side.value
+                mid_price = edge_result.mid_price or 0.0
+                spread_bps = edge_result.spread_bps or 0.0
+            else:
+                # Fallback: Use signal's profit_potential from Gamma prices
+                edge_bps = signal.profit_potential * 10000
+                raw_edge_bps = edge_bps
+                mid_price = (
+                    (signal.yes_price + signal.no_price) / 2
+                    if signal.yes_price + signal.no_price > 0
+                    else 0
+                )
+
+            # Phase 8: Build candidate with all fields
             candidate = ExplainCandidate(
                 market_id=signal.market_id,
                 market_question=signal.market_question,
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
                 side="arb",
+                arb_side=arb_side,
                 yes_price=signal.yes_price,
                 no_price=signal.no_price,
                 mid_price=mid_price,
+                spread_bps=spread_bps,
                 edge_bps=edge_bps,
-                raw_edge_bps=edge_bps,  # Preserve true edge before any gating
+                raw_edge_bps=raw_edge_bps,  # Preserve true edge before any gating
                 liquidity=signal.liquidity,
                 size_estimate=self.config.trade_quantity,
+                ask_yes=ask_yes,
+                ask_no=ask_no,
+                bid_yes=bid_yes,
+                bid_no=bid_no,
             )
 
             # Determine rejection reason (if any)
@@ -404,10 +475,11 @@ class PaperExecutor:
                     f"liquidity={signal.liquidity:.0f} < min={min_liquidity:.0f}"
                 )
                 _count_rejection(RejectionReason.LIQUIDITY_BELOW_MIN)
-            elif signal.profit_potential < min_edge:
+            elif raw_edge_bps < self.config.min_signal_edge_bps:
+                # Phase 8: Use raw_edge_bps for threshold check
                 candidate.rejection_reason = RejectionReason.EDGE_BELOW_MIN
                 candidate.rejection_detail = (
-                    f"edge={edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                    f"edge={raw_edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
                 )
                 _count_rejection(RejectionReason.EDGE_BELOW_MIN)
             # Passed basic filters - will be evaluated for execution
@@ -602,8 +674,12 @@ class PaperExecutor:
         even when the ArbitrageScanner finds no signals. We compute edge from
         YES+NO prices and classify why each market didn't qualify.
 
+        Phase 8: Uses orderbook data (if available) to compute true arb edge
+        via edge_calc. For YES orderbook, derives NO prices using binary
+        market relationship: bid_no ≈ 1 - ask_yes, ask_no ≈ 1 - bid_yes.
+
         Args:
-            markets_to_scan: List of market dicts
+            markets_to_scan: List of market dicts (may include 'orderbook' key)
             markets_lookup: Dict of market_id -> market dict
             strategy_approved: Whether strategy is approved
             approval_rejection_reason: Reason if not approved
@@ -626,29 +702,76 @@ class PaperExecutor:
             question = market.get("question", "")
             active = market.get("active", True)
             closed = market.get("closed", False)
+            yes_token_id = market.get("yes_token_id")
+            no_token_id = market.get("no_token_id")
 
             # Skip if no price data
             if yes_price <= 0 and no_price <= 0:
                 continue
 
-            # Compute edge: profit potential = 1 - (YES + NO)
-            combined_price = yes_price + no_price
-            profit_potential = max(0, 1.0 - combined_price)  # Can't be negative
-            edge_bps = profit_potential * 10000
-            mid_price = combined_price / 2 if combined_price > 0 else 0
+            # Phase 8: Try to use orderbook data for edge computation
+            orderbook = market.get("orderbook")
+            ask_yes: float | None = None
+            ask_no: float | None = None
+            bid_yes: float | None = None
+            bid_no: float | None = None
+            arb_side = "NONE"
+            mid_price = 0.0
+            spread_bps = 0.0
 
-            # Phase 7: Store raw_edge_bps BEFORE any rejection checks
+            if orderbook and orderbook.get("best_bid") and orderbook.get("best_ask"):
+                # Phase 8: Use orderbook prices for edge computation
+                # We have YES orderbook - derive NO prices using binary relation:
+                # bid_no ≈ 1 - ask_yes (to sell NO, someone buys YES at ask)
+                # ask_no ≈ 1 - bid_yes (to buy NO, someone sells YES at bid)
+                bid_yes = orderbook["best_bid"]
+                ask_yes = orderbook["best_ask"]
+                bid_no = max(0.001, 1.0 - ask_yes)  # Derive from YES ask
+                ask_no = min(0.999, 1.0 - bid_yes)  # Derive from YES bid
+
+                # Compute edge using edge_calc
+                edge_result = compute_edge_from_prices(
+                    ask_yes=ask_yes,
+                    ask_no=ask_no,
+                    bid_yes=bid_yes,
+                    bid_no=bid_no,
+                    yes_token_id=yes_token_id,
+                    no_token_id=no_token_id,
+                )
+
+                raw_edge_bps = edge_result.raw_edge_bps
+                edge_bps = raw_edge_bps  # Same until fees applied
+                arb_side = edge_result.arb_side.value
+                mid_price = edge_result.mid_price or 0.0
+                spread_bps = edge_result.spread_bps or 0.0
+            else:
+                # Fallback: Compute edge from Gamma prices
+                combined_price = yes_price + no_price
+                profit_potential = 1.0 - combined_price  # Can be negative
+                raw_edge_bps = profit_potential * 10000
+                edge_bps = raw_edge_bps
+                mid_price = combined_price / 2 if combined_price > 0 else 0
+
+            # Phase 8: Build candidate with all new fields
             candidate = ExplainCandidate(
                 market_id=market_id,
                 market_question=question,
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
                 side="arb",
+                arb_side=arb_side,
                 yes_price=yes_price,
                 no_price=no_price,
                 mid_price=mid_price,
+                spread_bps=spread_bps,
                 edge_bps=edge_bps,
-                raw_edge_bps=edge_bps,  # Preserve true edge before any gating
+                raw_edge_bps=raw_edge_bps,  # Preserve true edge before any gating
                 liquidity=liquidity,
                 size_estimate=self.config.trade_quantity,
+                ask_yes=ask_yes,
+                ask_no=ask_no,
+                bid_yes=bid_yes,
+                bid_no=bid_no,
             )
 
             # Determine rejection reason
@@ -664,16 +787,17 @@ class PaperExecutor:
             elif liquidity < min_liquidity:
                 candidate.rejection_reason = RejectionReason.LIQUIDITY_BELOW_MIN
                 candidate.rejection_detail = f"liquidity={liquidity:.0f} < min={min_liquidity:.0f}"
-            elif combined_price >= arb_threshold:
-                # No arb opportunity (prices sum to >= threshold)
-                candidate.rejection_reason = RejectionReason.NO_SIGNAL
-                candidate.rejection_detail = (
-                    f"YES+NO={combined_price:.4f} >= threshold={arb_threshold:.4f}"
-                )
-            elif profit_potential < self.config.min_signal_edge_bps / 10000:
+            elif raw_edge_bps < self.config.min_signal_edge_bps:
+                # Phase 8: Use raw_edge_bps for threshold check
                 candidate.rejection_reason = RejectionReason.EDGE_BELOW_MIN
                 candidate.rejection_detail = (
-                    f"edge={edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                    f"edge={raw_edge_bps:.1f}bps < min={self.config.min_signal_edge_bps:.1f}bps"
+                )
+            elif (yes_price + no_price) >= arb_threshold:
+                # No arb opportunity based on Gamma prices
+                candidate.rejection_reason = RejectionReason.NO_SIGNAL
+                candidate.rejection_detail = (
+                    f"YES+NO={yes_price + no_price:.4f} >= threshold={arb_threshold:.4f}"
                 )
             else:
                 # Should have been picked up by scanner - mark as no signal
@@ -682,8 +806,8 @@ class PaperExecutor:
 
             candidates.append(candidate)
 
-        # Sort by edge and return top N
-        candidates.sort(key=lambda c: c.edge_bps, reverse=True)
+        # Sort by raw_edge_bps (Phase 8: use real edge for sorting)
+        candidates.sort(key=lambda c: c.raw_edge_bps, reverse=True)
         return candidates[: self.config.explain_top_n]
 
     def get_pnl_snapshot(

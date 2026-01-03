@@ -710,8 +710,9 @@ class DaemonRunner:
             tick_stats.snapshots_saved = snapshot_count
 
             # Phase 6.1: Run paper execution if enabled
+            # Phase 8: Pass orderbook data for edge computation
             if self.config.paper_exec_enabled:
-                await self._run_paper_execution(markets, tick_stats)
+                await self._run_paper_execution(markets, tick_stats, orderbook_data)
 
             # Update runtime state
             self.dao.set_runtime_state("daemon_last_tick", snapshot_time)
@@ -1153,7 +1154,12 @@ class DaemonRunner:
         )
         return result
 
-    async def _run_paper_execution(self, markets: list[Any], tick_stats: TickStats) -> None:
+    async def _run_paper_execution(
+        self,
+        markets: list[Any],
+        tick_stats: TickStats,
+        orderbook_data: dict[str, Any] | None = None,
+    ) -> None:
         """Run paper execution loop for this tick.
 
         Phase 6.1: Generates signals from market snapshots and executes
@@ -1162,11 +1168,14 @@ class DaemonRunner:
         Phase 6.2: With explain mode, captures ALL candidates with rejection
         reasons and exports to JSONL for calibration.
 
+        Phase 8: Uses orderbook data for arb edge computation when available.
+
         HARD RULE: No real order placement. All trades go to PaperLedger.
 
         Args:
             markets: List of market objects from this tick
             tick_stats: Tick stats to update with paper execution metrics
+            orderbook_data: Optional dict of market_id -> orderbook dict (Phase 8)
         """
         from pmq.ops.paper_exec import (
             PaperExecConfig,
@@ -1212,20 +1221,29 @@ class DaemonRunner:
             )
 
         # Convert markets to dict format for scanner
+        # Phase 8: Include orderbook data for edge computation
         markets_data = []
         for m in markets:
             # Build market dict compatible with scan_from_db
-            markets_data.append(
-                {
-                    "id": m.id,
-                    "question": getattr(m, "question", ""),
-                    "active": getattr(m, "active", True),
-                    "closed": getattr(m, "closed", False),
-                    "last_price_yes": getattr(m, "yes_price", 0.0),
-                    "last_price_no": getattr(m, "no_price", 0.0),
-                    "liquidity": getattr(m, "liquidity", 0.0),
-                }
-            )
+            market_dict: dict[str, Any] = {
+                "id": m.id,
+                "question": getattr(m, "question", ""),
+                "active": getattr(m, "active", True),
+                "closed": getattr(m, "closed", False),
+                "last_price_yes": getattr(m, "yes_price", 0.0),
+                "last_price_no": getattr(m, "no_price", 0.0),
+                "liquidity": getattr(m, "liquidity", 0.0),
+                # Phase 8: Token IDs for edge computation
+                "yes_token_id": getattr(m, "yes_token_id", None),
+                "no_token_id": getattr(m, "no_token_id", None),
+            }
+
+            # Phase 8: Attach orderbook data if available
+            if orderbook_data and m.id in orderbook_data:
+                ob = orderbook_data[m.id]
+                market_dict["orderbook"] = ob
+
+            markets_data.append(market_dict)
 
         # Execute paper trading tick
         try:

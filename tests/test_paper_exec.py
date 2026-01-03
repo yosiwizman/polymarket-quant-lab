@@ -518,7 +518,12 @@ class TestPaperExecutorRiskGate:
     """Tests for PaperExecutor with risk gate."""
 
     def test_approval_required_blocks_when_not_approved(self) -> None:
-        """Should block execution when approval required but not approved."""
+        """Should block execution when approval required but not approved.
+
+        Phase 6.2.1: blocked_by_risk only increments when there were actual
+        executable signals that would have traded. If we're blocked before
+        scanning (or no signals found), blocked_by_risk is 0.
+        """
         config = PaperExecConfig(
             enabled=True,
             require_approval=True,
@@ -542,7 +547,9 @@ class TestPaperExecutorRiskGate:
 
         assert result.signals_found == 0  # Blocked before scanning
         assert result.trades_executed == 0
-        assert result.blocked_by_risk == 1
+        # Phase 6.2.1: blocked_by_risk is 0 because no executable signals were found
+        # (we were blocked before scanning, so signals_evaluated = 0)
+        assert result.blocked_by_risk == 0
         assert "Not approved" in result.blocked_reasons[0]
 
     def test_trade_limit_blocks_individual_trades(self) -> None:
@@ -911,6 +918,7 @@ class TestPaperExecResultExplain:
         result = PaperExecResult()
         assert result.explain_candidates == []
         assert result.rejection_counts == {}
+        assert result.markets_scanned == 0  # Phase 6.2.1
 
     def test_result_with_explain_data(self) -> None:
         """Result should store explain candidates and counts."""
@@ -931,7 +939,254 @@ class TestPaperExecResultExplain:
         result = PaperExecResult(
             explain_candidates=candidates,
             rejection_counts=counts,
+            markets_scanned=100,
         )
 
         assert len(result.explain_candidates) == 1
         assert result.rejection_counts["executed"] == 1
+        assert result.markets_scanned == 100
+
+
+# =============================================================================
+# Tests: Phase 6.2.1 - Always-On Explain Mode
+# =============================================================================
+
+
+class TestAlwaysOnExplainMode:
+    """Tests for Phase 6.2.1 always-on explain mode features."""
+
+    def test_near_miss_candidates_generated_when_no_signals(self) -> None:
+        """Near-miss candidates should be generated when no arb signals found."""
+        config = PaperExecConfig(
+            enabled=True,
+            require_approval=False,
+            explain_enabled=True,
+            explain_top_n=5,
+        )
+        dao = FakeDAO()
+        ledger = FakePaperLedger(dao)
+
+        # Empty scanner - no signals
+        scanner = FakeArbitrageScanner(signals=[])
+
+        executor = PaperExecutor(
+            config=config,
+            dao=dao,
+            paper_ledger=ledger,
+            arb_scanner=scanner,
+        )
+
+        # Markets with valid price data but no arb opportunities
+        markets_data = [
+            {
+                "id": "m1",
+                "question": "Test market 1",
+                "active": True,
+                "closed": False,
+                "last_price_yes": 0.50,
+                "last_price_no": 0.51,  # Sum = 1.01, no arb
+                "liquidity": 5000.0,
+            },
+            {
+                "id": "m2",
+                "question": "Test market 2",
+                "active": True,
+                "closed": False,
+                "last_price_yes": 0.48,
+                "last_price_no": 0.52,  # Sum = 1.00, no arb
+                "liquidity": 3000.0,
+            },
+        ]
+
+        result = executor.execute_tick(markets_data)
+
+        # Should have near-miss candidates even with no signals
+        assert result.signals_found == 0
+        assert len(result.explain_candidates) > 0
+        assert result.markets_scanned == 2
+
+        # All candidates should have rejection reasons
+        for cand in result.explain_candidates:
+            assert cand.rejection_reason != RejectionReason.NONE
+
+    def test_blocked_by_risk_zero_when_no_signals(self) -> None:
+        """blocked_by_risk should be 0 when there are no executable signals."""
+        config = PaperExecConfig(
+            enabled=True,
+            require_approval=True,  # Requires approval
+            explain_enabled=True,
+        )
+        dao = FakeDAO()
+        ledger = FakePaperLedger(dao)
+
+        # Risk gate that rejects everything
+        risk_gate = FakeRiskGate(approved=False, block_reason="Not approved")
+
+        # Empty scanner - no signals
+        scanner = FakeArbitrageScanner(signals=[])
+
+        executor = PaperExecutor(
+            config=config,
+            dao=dao,
+            paper_ledger=ledger,
+            risk_gate=risk_gate,
+            arb_scanner=scanner,
+        )
+
+        markets_data = [
+            {
+                "id": "m1",
+                "active": True,
+                "last_price_yes": 0.50,
+                "last_price_no": 0.51,
+                "liquidity": 5000.0,
+            },
+        ]
+
+        result = executor.execute_tick(markets_data)
+
+        # No executable signals → blocked_by_risk should be 0
+        assert result.signals_found == 0
+        assert result.signals_evaluated == 0
+        assert result.blocked_by_risk == 0
+
+    def test_blocked_by_risk_incremented_when_signals_blocked(self) -> None:
+        """blocked_by_risk should increment when executable signals are blocked."""
+        config = PaperExecConfig(
+            enabled=True,
+            require_approval=True,
+            explain_enabled=True,
+            min_signal_edge_bps=10.0,  # Low threshold
+        )
+        dao = FakeDAO()
+        ledger = FakePaperLedger(dao)
+
+        # Risk gate that rejects everything
+        risk_gate = FakeRiskGate(approved=False, block_reason="Not approved")
+
+        # Signal with good edge that would execute
+        signal = make_signal("m1", 0.40, 0.50, liquidity=5000.0)  # 10% edge
+        scanner = FakeArbitrageScanner(signals=[signal])
+
+        executor = PaperExecutor(
+            config=config,
+            dao=dao,
+            paper_ledger=ledger,
+            risk_gate=risk_gate,
+            arb_scanner=scanner,
+        )
+
+        markets_data = [
+            {
+                "id": "m1",
+                "active": True,
+                "last_price_yes": 0.40,
+                "last_price_no": 0.50,
+                "liquidity": 5000.0,
+            },
+        ]
+
+        result = executor.execute_tick(markets_data)
+
+        # Had executable signal but not approved → blocked_by_risk > 0
+        assert result.signals_found == 1
+        assert result.signals_evaluated > 0
+        assert result.blocked_by_risk > 0
+
+    def test_markets_scanned_tracked(self) -> None:
+        """markets_scanned should track number of markets processed."""
+        config = PaperExecConfig(
+            enabled=True,
+            require_approval=False,
+            max_markets_scanned=50,  # Limit to 50
+        )
+        dao = FakeDAO()
+        ledger = FakePaperLedger(dao)
+        scanner = FakeArbitrageScanner(signals=[])
+
+        executor = PaperExecutor(
+            config=config,
+            dao=dao,
+            paper_ledger=ledger,
+            arb_scanner=scanner,
+        )
+
+        # Create 100 markets but max is 50
+        markets_data = [
+            {
+                "id": f"m{i}",
+                "active": True,
+                "last_price_yes": 0.5,
+                "last_price_no": 0.5,
+                "liquidity": 1000.0,
+            }
+            for i in range(100)
+        ]
+
+        result = executor.execute_tick(markets_data)
+
+        # Should only scan up to max
+        assert result.markets_scanned == 50
+
+    def test_near_miss_candidates_have_rejection_details(self) -> None:
+        """Near-miss candidates should have detailed rejection reasons."""
+        config = PaperExecConfig(
+            enabled=True,
+            require_approval=False,
+            explain_enabled=True,
+            explain_top_n=10,
+            min_signal_edge_bps=100.0,  # 1% min edge
+        )
+        dao = FakeDAO()
+        ledger = FakePaperLedger(dao)
+        scanner = FakeArbitrageScanner(signals=[])
+
+        executor = PaperExecutor(
+            config=config,
+            dao=dao,
+            paper_ledger=ledger,
+            arb_scanner=scanner,
+        )
+
+        markets_data = [
+            {
+                "id": "m_closed",
+                "active": True,
+                "closed": True,
+                "last_price_yes": 0.45,
+                "last_price_no": 0.45,
+                "liquidity": 5000.0,
+            },
+            {
+                "id": "m_inactive",
+                "active": False,
+                "closed": False,
+                "last_price_yes": 0.45,
+                "last_price_no": 0.45,
+                "liquidity": 5000.0,
+            },
+            {
+                "id": "m_low_liq",
+                "active": True,
+                "closed": False,
+                "last_price_yes": 0.45,
+                "last_price_no": 0.45,
+                "liquidity": 10.0,  # Below min liquidity
+            },
+            {
+                "id": "m_no_arb",
+                "active": True,
+                "closed": False,
+                "last_price_yes": 0.50,
+                "last_price_no": 0.51,  # Sum > 1.0, no arb
+                "liquidity": 5000.0,
+            },
+        ]
+
+        result = executor.execute_tick(markets_data)
+
+        # Should have candidates with various rejection reasons
+        # At least some should have clear rejection reasons
+        assert len(result.explain_candidates) > 0
+        for cand in result.explain_candidates:
+            assert cand.rejection_detail != ""  # Should have detail

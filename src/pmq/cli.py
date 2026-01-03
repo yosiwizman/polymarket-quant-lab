@@ -4098,6 +4098,35 @@ def ops_daemon(
             help="Path to skiplist file for known-unseedable tokens (auto-maintained)",
         ),
     ] = None,
+    # Phase 6.1: Paper execution flags
+    paper_exec: Annotated[
+        bool,
+        typer.Option(
+            "--paper-exec/--no-paper-exec",
+            help="Enable paper execution loop (generates signals and executes paper trades)",
+        ),
+    ] = False,
+    paper_exec_max_trades: Annotated[
+        int,
+        typer.Option(
+            "--paper-exec-max-trades",
+            help="Max paper trades per tick (default: 3)",
+        ),
+    ] = 3,
+    paper_exec_min_edge_bps: Annotated[
+        float,
+        typer.Option(
+            "--paper-exec-min-edge",
+            help="Min edge in basis points to execute paper trade (default: 50)",
+        ),
+    ] = 50.0,
+    paper_exec_quantity: Annotated[
+        float,
+        typer.Option(
+            "--paper-exec-quantity",
+            help="Quantity per paper trade (default: 10)",
+        ),
+    ] = 10.0,
 ) -> None:
     """Run continuous snapshot capture daemon.
 
@@ -4125,6 +4154,8 @@ def ops_daemon(
     - exports/coverage_YYYY-MM-DD.json - Coverage + drift stats
     - exports/daemon_summary_YYYY-MM-DD.md - Human-readable summary
     - exports/snapshots_YYYY-MM-DD.csv.gz - Snapshot data (Phase 5.2)
+    - exports/paper_trades_YYYY-MM-DD.csv.gz - Paper trades (Phase 6.1, if --paper-exec)
+    - exports/paper_positions_YYYY-MM-DD.json - Paper positions (Phase 6.1, if --paper-exec)
 
     Example:
         pmq ops daemon --interval 60 --limit 200
@@ -4139,6 +4170,7 @@ def ops_daemon(
         pmq ops daemon --rest-rps 10 --rest-burst 10 --rest-retries 5  # Phase 5.8
         pmq ops daemon --seed-mode wss_first --seed-grace-seconds 12  # Phase 5.9
         pmq ops daemon --seed-skiplist-path ./skiplist.json  # Phase 5.9
+        pmq ops daemon --paper-exec --paper-exec-max-trades 3  # Phase 6.1: paper trading
     """
     import asyncio
 
@@ -4207,6 +4239,11 @@ def ops_daemon(
         seed_mode=seed_mode,
         seed_grace_seconds=seed_grace_seconds,
         seed_skiplist_path=seed_skiplist_path,
+        # Phase 6.1: Paper execution
+        paper_exec_enabled=paper_exec,
+        paper_exec_max_trades_per_tick=paper_exec_max_trades,
+        paper_exec_min_edge_bps=paper_exec_min_edge_bps,
+        paper_exec_trade_quantity=paper_exec_quantity,
     )
 
     # Initialize dependencies
@@ -4249,8 +4286,9 @@ def ops_daemon(
     seed_str = "on" if seed_cache else "off"
     seed_max_str = str(seed_max) if seed_max else str(limit)
     skiplist_str = str(seed_skiplist_path) if seed_skiplist_path else "disabled"
+    paper_str = "on" if paper_exec else "off"
     console.print(
-        f"[bold green]Starting ops daemon (Phase 5.9)[/bold green]\n"
+        f"[bold green]Starting ops daemon (Phase 6.1)[/bold green]\n"
         f"Interval: {interval}s\n"
         f"Limit: {limit} markets\n"
         f"Order Book Source: [cyan]{orderbook_source.upper()}[/cyan]\n"
@@ -4263,6 +4301,7 @@ def ops_daemon(
         f"Cache Seeding: {seed_str} (mode={seed_mode}, max={seed_max_str}, grace={seed_grace_seconds:.0f}s)\n"
         f"Seed Skiplist: {skiplist_str}\n"
         f"REST Resilience: {rest_rps:.1f} rps, burst {rest_burst}, {rest_retries} retries\n"
+        f"Paper Execution: [cyan]{paper_str}[/cyan] (max={paper_exec_max_trades}/tick, min_edge={paper_exec_min_edge_bps}bps)\n"
         f"Max Hours: {max_hours or 'infinite'}\n"
         f"Export Dir: {export_dir}\n"
         f"Snapshot Export: {'enabled' if snapshot_export else 'disabled'}\n"
@@ -4373,6 +4412,17 @@ def ops_status(
             console.print(f"  REST fallbacks: {latest_coverage.get('rest_fallbacks', 0):,}")
             wss_pct = latest_coverage.get("wss_coverage_pct", 0.0)
             console.print(f"  WSS coverage: {wss_pct:.1f}%")
+
+            # Phase 6.1: Paper execution metrics
+            paper_signals = latest_coverage.get("paper_signals_found", 0)
+            paper_trades = latest_coverage.get("paper_trades_executed", 0)
+            paper_pnl = latest_coverage.get("paper_pnl_total", 0.0)
+            if paper_signals > 0 or paper_trades > 0:
+                console.print("\n[cyan]Paper Execution (Phase 6.1):[/cyan]")
+                console.print(f"  Signals found: {paper_signals:,}")
+                console.print(f"  Trades executed: {paper_trades:,}")
+                pnl_color = "green" if paper_pnl >= 0 else "red"
+                console.print(f"  Total PnL: [{pnl_color}]${paper_pnl:.2f}[/{pnl_color}]")
         else:
             console.print("\n[dim]No coverage data found in exports/[/dim]")
 

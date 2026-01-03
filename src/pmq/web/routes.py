@@ -302,6 +302,64 @@ def get_risk_events(
     }
 
 
+@router.get("/api/paper/summary")
+def get_paper_summary() -> dict[str, Any]:
+    """Get paper trading summary statistics.
+
+    Phase 6.1: Returns paper trading metrics including:
+    - Total trades and positions
+    - PnL breakdown (realized, unrealized, total)
+    - Recent paper execution metrics from coverage exports
+
+    Returns:
+        Paper trading summary
+    """
+    import json as json_mod
+    from pathlib import Path
+
+    dao = get_dao()
+
+    # Get current paper stats from ledger
+    stats = dao.get_trading_stats()
+    positions = dao.get_positions_for_export()
+
+    # Calculate PnL
+    total_realized = sum(p.get("realized_pnl", 0.0) for p in positions)
+    total_yes_qty = sum(p.get("yes_quantity", 0.0) for p in positions)
+    total_no_qty = sum(p.get("no_quantity", 0.0) for p in positions)
+
+    # Try to find latest coverage for paper metrics
+    export_dir = Path("exports")
+    paper_metrics: dict[str, Any] = {}
+    if export_dir.exists():
+        coverage_files = sorted(export_dir.glob("coverage_*.json"), reverse=True)
+        if coverage_files:
+            try:
+                with open(coverage_files[0]) as f:
+                    coverage = json_mod.load(f)
+                    paper_metrics = {
+                        "signals_found": coverage.get("paper_signals_found", 0),
+                        "trades_executed": coverage.get("paper_trades_executed", 0),
+                        "blocked_by_risk": coverage.get("paper_blocked_by_risk", 0),
+                        "pnl_from_coverage": coverage.get("paper_pnl_total", 0.0),
+                        "coverage_date": coverage.get("date"),
+                    }
+            except Exception:
+                pass
+
+    return {
+        "stats": stats,
+        "positions": {
+            "count": len(positions),
+            "total_realized_pnl": total_realized,
+            "total_yes_quantity": total_yes_qty,
+            "total_no_quantity": total_no_qty,
+        },
+        "paper_metrics": paper_metrics,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+
 @router.get("/api/governance/summary")
 def get_governance_summary() -> dict[str, Any]:
     """Get governance summary.

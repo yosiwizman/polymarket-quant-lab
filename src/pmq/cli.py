@@ -4480,13 +4480,21 @@ def ops_preflight(
         bool,
         typer.Option("--verbose", "-V", help="Show detailed output"),
     ] = False,
+    require_auth: Annotated[
+        bool,
+        typer.Option(
+            "--require-auth",
+            help="Require valid L2 auth credentials (Phase 11)",
+        ),
+    ] = False,
 ) -> None:
     """Phase 7 preflight: Check geoblock, builder keys, and CLOB connectivity.
 
-    Performs three checks before live trading:
+    Performs checks before live trading:
     1. Geoblock: Calls Polymarket's geoblock endpoint to verify location eligibility
     2. Builder Keys: Verifies CLOB API credentials are configured (env vars)
     3. Connectivity: Tests CLOB public endpoint (does NOT place orders)
+    4. (Optional) L2 Auth: If --require-auth, validates credentials with live API
 
     If geoblock returns blocked=true, exits with error.
     If builder keys are missing, prints warning but continues.
@@ -4494,6 +4502,7 @@ def ops_preflight(
     Example:
         pmq ops preflight
         pmq ops preflight --verbose
+        pmq ops preflight --require-auth  # Phase 11: validate L2 credentials
     """
     import os
 
@@ -4598,12 +4607,44 @@ def ops_preflight(
         console.print(f"   [red]✗ Cannot reach CLOB API: {e}[/red]")
         all_passed = False
 
+    # Step 4 (Phase 11): L2 auth check if --require-auth
+    if require_auth:
+        console.print("\n[cyan]4. Testing L2 authentication (--require-auth)...[/cyan]")
+        from pmq.auth import create_l2_client, load_creds
+
+        private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("PMQ_PRIVATE_KEY")
+        creds = load_creds()
+
+        if not creds:
+            console.print("   [red]✗ No credentials found[/red]")
+            console.print("   [dim]Run 'pmq auth init' first[/dim]")
+            all_passed = False
+        elif not private_key:
+            console.print("   [red]✗ PRIVATE_KEY not set[/red]")
+            console.print("   [dim]Required for L2 authentication[/dim]")
+            all_passed = False
+        else:
+            try:
+                l2_client = create_l2_client(creds=creds, private_key=private_key)
+                open_orders = l2_client.get_open_orders()
+                console.print("   [green]✓ L2 authentication successful[/green]")
+                if verbose:
+                    console.print(f"   [dim]Open orders: {len(open_orders)}[/dim]")
+            except ImportError:
+                console.print("   [red]✗ py_clob_client not installed[/red]")
+                all_passed = False
+            except Exception as e:
+                console.print(f"   [red]✗ L2 auth failed: {e}[/red]")
+                all_passed = False
+
     # Summary
     console.print("\n" + "─" * 40)
     if all_passed:
         console.print("[bold green]✓ Preflight checks passed[/bold green]")
         if keys_present < keys_total:
             console.print("[yellow]Note: Builder keys incomplete - live trading disabled[/yellow]")
+        if require_auth:
+            console.print("[green]L2 credentials validated - ready for live operations[/green]")
     else:
         console.print("[bold red]✗ Preflight checks failed[/bold red]")
         console.print("[dim]Resolve issues above before live trading[/dim]")
@@ -4876,20 +4917,20 @@ Source: {jsonl_path}
 - **Unique Markets:** {len(market_edges)}
 
 ## Gross Edge Distribution (raw_edge_bps)
-- Min: {gross_stats['min']:.1f} bps
-- Median: {gross_stats['median']:.1f} bps
-- Mean: {gross_stats['mean']:.1f} bps
-- P90: {gross_stats['p90']:.1f} bps
-- P99: {gross_stats['p99']:.1f} bps
-- Max: {gross_stats['max']:.1f} bps
+- Min: {gross_stats["min"]:.1f} bps
+- Median: {gross_stats["median"]:.1f} bps
+- Mean: {gross_stats["mean"]:.1f} bps
+- P90: {gross_stats["p90"]:.1f} bps
+- P99: {gross_stats["p99"]:.1f} bps
+- Max: {gross_stats["max"]:.1f} bps
 
 ## Net Edge Distribution (net_edge_bps)
-- Min: {net_stats['min']:.1f} bps
-- Median: {net_stats['median']:.1f} bps
-- Mean: {net_stats['mean']:.1f} bps
-- P90: {net_stats['p90']:.1f} bps
-- P99: {net_stats['p99']:.1f} bps
-- Max: {net_stats['max']:.1f} bps
+- Min: {net_stats["min"]:.1f} bps
+- Median: {net_stats["median"]:.1f} bps
+- Mean: {net_stats["mean"]:.1f} bps
+- P90: {net_stats["p90"]:.1f} bps
+- P99: {net_stats["p99"]:.1f} bps
+- Max: {net_stats["max"]:.1f} bps
 
 ## % Ticks Above Thresholds (Net Edge)
 """
@@ -4943,6 +4984,342 @@ negative or zero, the market may be in no-arb equilibrium. Consider:
             "\n[yellow]⚠ All net edges <= 0. Market may be in no-arb equilibrium.[/yellow]"
         )
         console.print("[dim]Consider: lower fees, different markets, or expect no signals.[/dim]")
+
+
+# =============================================================================
+# Auth Commands (Phase 11)
+# =============================================================================
+
+auth_app = typer.Typer(help="Authentication and credential management commands")
+app.add_typer(auth_app, name="auth")
+
+
+@auth_app.command("init")
+def auth_init(
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip confirmation prompt (required for non-interactive use)",
+        ),
+    ] = False,
+    signature_type: Annotated[
+        int,
+        typer.Option(
+            "--signature-type",
+            help="Signature type: 0=EOA, 1=POLY_PROXY (default), 2=GNOSIS_SAFE",
+        ),
+    ] = 1,
+) -> None:
+    """Initialize CLOB API credentials (Phase 11).
+
+    Derives or creates L2 API credentials from your Ethereum private key.
+    Credentials are stored locally at ~/.pmq/creds.json with secure permissions.
+
+    ⚠️ WARNING: Creating new credentials may INVALIDATE any existing API key
+    for this wallet. Only run this if you haven't already set up credentials.
+
+    Required environment variables:
+        PRIVATE_KEY: Your Ethereum private key (hex, with or without 0x prefix)
+        FUNDER_ADDRESS: Your funder/proxy wallet address
+
+    Example:
+        # Set environment variables first:
+        # PowerShell: $env:PRIVATE_KEY = "0x..."
+        # PowerShell: $env:FUNDER_ADDRESS = "0x..."
+
+        pmq auth init
+        pmq auth init --yes  # Skip confirmation
+    """
+    import os
+
+    from pmq.auth import creds_exist, derive_or_create_api_creds, get_creds_path, save_creds
+    from pmq.auth.redact import mask_string
+
+    # Check for required environment variables
+    private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("PMQ_PRIVATE_KEY")
+    funder_address = os.environ.get("FUNDER_ADDRESS") or os.environ.get("PMQ_FUNDER_ADDRESS")
+
+    if not private_key:
+        console.print("[red]Error: PRIVATE_KEY environment variable not set[/red]")
+        console.print('[dim]Set it with: $env:PRIVATE_KEY = "0x..."[/dim]')
+        raise typer.Exit(1)
+
+    if not funder_address:
+        console.print("[red]Error: FUNDER_ADDRESS environment variable not set[/red]")
+        console.print('[dim]Set it with: $env:FUNDER_ADDRESS = "0x..."[/dim]')
+        console.print(
+            "[dim]Find your proxy wallet at: https://polymarket.com/profile/settings[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Show warning and get confirmation
+    creds_path = get_creds_path()
+    console.print("[bold yellow]⚠️  WARNING[/bold yellow]")
+    console.print(
+        "Creating or deriving API credentials may INVALIDATE any existing API key\n"
+        "for this wallet. This action cannot be undone.\n"
+    )
+    console.print(f"Credentials will be saved to: [cyan]{creds_path}[/cyan]")
+    console.print(f"Funder address: [cyan]{funder_address}[/cyan]")
+    console.print(f"Private key: [dim]{mask_string(private_key, 4)}[/dim]")
+
+    if creds_exist():
+        console.print("\n[yellow]Existing credentials found. They will be overwritten.[/yellow]")
+
+    if not yes:
+        confirmed = typer.confirm("\nProceed with credential creation?")
+        if not confirmed:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit(0)
+
+    # Create credentials
+    console.print("\n[cyan]Connecting to CLOB API...[/cyan]")
+    try:
+        creds = derive_or_create_api_creds(
+            private_key=private_key,
+            funder_address=funder_address,
+        )
+        # Override signature type if specified
+        creds.signature_type = signature_type
+
+        # Save credentials
+        saved_path = save_creds(creds)
+
+        console.print("\n[bold green]✓ Credentials created successfully[/bold green]")
+        console.print(f"  API Key: [cyan]{creds.masked_api_key()}[/cyan]")
+        console.print(f"  Saved to: [dim]{saved_path}[/dim]")
+        console.print(
+            "\n[dim]Run 'pmq ops preflight --require-auth' to verify credentials work.[/dim]"
+        )
+
+    except ImportError:
+        console.print("[red]Error: py_clob_client not installed[/red]")
+        console.print("[dim]Run: poetry add py-clob-client[/dim]")
+        raise typer.Exit(1) from None
+    except Exception as e:
+        console.print(f"[red]Error creating credentials: {e}[/red]")
+        raise typer.Exit(1) from None
+
+
+@auth_app.command("status")
+def auth_status() -> None:
+    """Show credential status (Phase 11).
+
+    Displays whether credentials exist and shows masked API key.
+    Does not expose secrets.
+
+    Example:
+        pmq auth status
+    """
+    from pmq.auth import get_creds_path, load_creds
+
+    creds_path = get_creds_path()
+
+    if not creds_path.exists():
+        console.print("[yellow]No credentials found[/yellow]")
+        console.print(f"[dim]Expected location: {creds_path}[/dim]")
+        console.print("[dim]Run 'pmq auth init' to create credentials.[/dim]")
+        return
+
+    creds = load_creds()
+    if creds is None:
+        console.print("[red]Credentials file exists but could not be loaded[/red]")
+        console.print(f"[dim]File: {creds_path}[/dim]")
+        console.print("[dim]File may be corrupted. Run 'pmq auth wipe' then 'pmq auth init'.[/dim]")
+        return
+
+    table = Table(title="CLOB Credentials")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+
+    table.add_row("Status", "[green]CONFIGURED[/green]")
+    table.add_row("API Key", creds.masked_api_key())
+    table.add_row("Funder Address", creds.funder_address)
+    table.add_row("Signature Type", str(creds.signature_type))
+    table.add_row("File", str(creds_path))
+
+    console.print(table)
+    console.print("\n[dim]Run 'pmq ops preflight --require-auth' to verify credentials work.[/dim]")
+
+
+@auth_app.command("wipe")
+def auth_wipe(
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip confirmation prompt",
+        ),
+    ] = False,
+) -> None:
+    """Delete stored credentials (Phase 11).
+
+    Removes the local credentials file. Does NOT revoke the API key on
+    Polymarket's side - you may need to re-derive it later.
+
+    Example:
+        pmq auth wipe
+        pmq auth wipe --yes  # Skip confirmation
+    """
+    from pmq.auth import delete_creds, get_creds_path, load_creds
+
+    creds_path = get_creds_path()
+
+    if not creds_path.exists():
+        console.print("[yellow]No credentials to delete[/yellow]")
+        return
+
+    # Show what will be deleted
+    creds = load_creds()
+    if creds:
+        console.print(f"API Key to delete: [cyan]{creds.masked_api_key()}[/cyan]")
+    console.print(f"File: [dim]{creds_path}[/dim]")
+
+    if not yes:
+        confirmed = typer.confirm("\nDelete local credentials?")
+        if not confirmed:
+            console.print("[dim]Aborted.[/dim]")
+            return
+
+    deleted = delete_creds()
+    if deleted:
+        console.print("[green]✓ Credentials deleted[/green]")
+    else:
+        console.print("[yellow]Could not delete credentials[/yellow]")
+
+
+# =============================================================================
+# Live Smoke Test Command (Phase 11)
+# =============================================================================
+
+
+@ops_app.command("live-smoke")
+def ops_live_smoke(
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-V", help="Show detailed output"),
+    ] = False,
+) -> None:
+    """Live connectivity smoke test with L2 authentication (Phase 11).
+
+    Verifies that CLOB credentials are valid by calling a non-trading L2
+    endpoint (get open orders). This proves auth works without placing orders.
+
+    Steps:
+    1. Check geoblock status
+    2. Load credentials from ~/.pmq/creds.json
+    3. Initialize L2 client
+    4. Call non-trading L2 method to verify auth
+
+    Prerequisites:
+    - Run 'pmq auth init' first to create credentials
+    - Set PRIVATE_KEY environment variable
+
+    Example:
+        pmq ops live-smoke
+        pmq ops live-smoke --verbose
+    """
+    import os
+
+    import httpx
+
+    console.print("[bold]Phase 11 Live Smoke Test[/bold]\n")
+
+    all_passed = True
+
+    # Step 1: Geoblock check
+    console.print("[cyan]1. Checking geoblock status...[/cyan]")
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get("https://polymarket.com/api/geoblock")
+            resp.raise_for_status()
+            geoblock_data = resp.json()
+
+            blocked = geoblock_data.get("blocked", True)
+            country = geoblock_data.get("country", "unknown")
+
+            if blocked:
+                console.print(f"   [red]✗ BLOCKED[/red] - Location: {country}")
+                console.print("   [red]Live trading not available in your region.[/red]")
+                all_passed = False
+            else:
+                console.print(f"   [green]✓ NOT BLOCKED[/green] - Location: {country}")
+    except Exception as e:
+        console.print(f"   [yellow]⚠ Could not check geoblock: {e}[/yellow]")
+        all_passed = False
+
+    # Step 2: Load credentials
+    console.print("\n[cyan]2. Loading credentials...[/cyan]")
+    from pmq.auth import load_creds
+
+    creds = load_creds()
+    if creds is None:
+        console.print("   [red]✗ No credentials found[/red]")
+        console.print("   [dim]Run 'pmq auth init' first[/dim]")
+        all_passed = False
+    else:
+        console.print(f"   [green]✓ Credentials loaded[/green] - API Key: {creds.masked_api_key()}")
+
+    # Step 3: Check private key
+    console.print("\n[cyan]3. Checking private key...[/cyan]")
+    private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("PMQ_PRIVATE_KEY")
+    if not private_key:
+        console.print("   [red]✗ PRIVATE_KEY not set[/red]")
+        console.print('   [dim]Set it with: $env:PRIVATE_KEY = "0x..."[/dim]')
+        all_passed = False
+    else:
+        from pmq.auth.redact import mask_string
+
+        console.print(f"   [green]✓ PRIVATE_KEY set[/green] - {mask_string(private_key, 4)}")
+
+    # Step 4: L2 authentication test (if credentials available)
+    if creds and private_key:
+        console.print("\n[cyan]4. Testing L2 authentication...[/cyan]")
+        try:
+            from pmq.auth import create_l2_client
+
+            l2_client = create_l2_client(creds=creds, private_key=private_key)
+
+            # Call a non-trading L2 method: get_open_orders
+            # This verifies authentication without placing any orders
+            open_orders = l2_client.get_open_orders()
+
+            console.print("   [green]✓ L2 authentication successful[/green]")
+            console.print(f"   [dim]Open orders: {len(open_orders)}[/dim]")
+
+            if verbose:
+                # Additional verbose info could go here
+                pass
+
+        except ImportError:
+            console.print("   [red]✗ py_clob_client not installed[/red]")
+            console.print("   [dim]Run: poetry add py-clob-client[/dim]")
+            all_passed = False
+        except Exception as e:
+            console.print(f"   [red]✗ L2 authentication failed: {e}[/red]")
+            console.print(
+                "   [dim]Check: API key valid, private key matches, funder address correct[/dim]"
+            )
+            all_passed = False
+    else:
+        console.print("\n[yellow]4. Skipping L2 test (missing credentials or private key)[/yellow]")
+        all_passed = False
+
+    # Summary
+    console.print("\n" + "─" * 40)
+    if all_passed:
+        console.print("[bold green]✓ Live smoke test PASSED[/bold green]")
+        console.print("[dim]Your credentials are valid for live trading.")
+        console.print(
+            "Remember: live trading requires --live-exec flag AND valid TTL approval.[/dim]"
+        )
+    else:
+        console.print("[bold red]✗ Live smoke test FAILED[/bold red]")
+        console.print("[dim]Resolve issues above before attempting live trading.[/dim]")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

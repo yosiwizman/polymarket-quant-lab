@@ -2340,6 +2340,106 @@ This prevents the misleading "blocked_by_risk = 40" when running 40 ticks with n
 
 > ⚠️ **SAFETY REMINDER**: This is still PAPER TRADING. Lowering thresholds increases simulated trade volume but no real orders are placed.
 
+### Phase 7 Preflight: Geoblock + Builder Keys (Phase 7)
+
+Before enabling live CLOB trading (future phases), you must pass preflight checks:
+1. **Geoblock**: Polymarket restricts access by location. The geoblock check verifies eligibility.
+2. **Builder Keys**: CLOB API requires API credentials from your Builder Profile.
+3. **Connectivity**: Verify the CLOB API endpoint is reachable.
+
+#### Running Preflight
+
+```powershell
+# Run preflight checks
+poetry run pmq ops preflight
+
+# Verbose output (shows IP, server time)
+poetry run pmq ops preflight --verbose
+```
+
+#### Expected Output
+
+```
+Phase 7 Preflight Check
+
+1. Checking geoblock status...
+   ✓ NOT BLOCKED - Location: CA/ON
+
+2. Checking builder key configuration...
+   ✓ POLY_API_KEY / CLOB_API_KEY - configured
+   ✓ POLY_API_SECRET / CLOB_API_SECRET - configured
+   ✓ POLY_API_PASSPHRASE / CLOB_API_PASSPHRASE - configured
+   All 3 keys configured
+
+3. Testing CLOB connectivity...
+   ✓ CLOB API reachable
+
+────────────────────────────────────────
+✓ Preflight checks passed
+```
+
+#### Geoblock Behavior
+
+If you are in a restricted region, the preflight will fail:
+
+```
+1. Checking geoblock status...
+   ✗ BLOCKED - Location: US/DC, IP: 34.96.50.71
+   Polymarket is not available in your region.
+   Live CLOB trading requires an eligible location.
+```
+
+**Note**: Geoblock is based on your IP address. VPN usage may affect results.
+
+#### Builder Keys Setup
+
+To obtain builder keys:
+1. Go to https://polymarket.com/profile/builder
+2. Generate API credentials (apiKey, secret, passphrase)
+3. Set environment variables:
+
+```powershell
+# Windows PowerShell
+$env:POLY_API_KEY = "your-api-key"
+$env:POLY_API_SECRET = "your-api-secret"
+$env:POLY_API_PASSPHRASE = "your-passphrase"
+
+# Or use CLOB_ prefix (also accepted)
+$env:CLOB_API_KEY = "your-api-key"
+$env:CLOB_API_SECRET = "your-api-secret"
+$env:CLOB_API_PASSPHRASE = "your-passphrase"
+```
+
+**IMPORTANT**: Never commit API credentials to version control. Use `.env` files or secure secret management.
+
+#### Preflight Exit Codes
+
+| Exit Code | Meaning |
+|-----------|----------|
+| 0 | All checks passed (keys may be incomplete) |
+| 1 | Geoblock BLOCKED or CLOB API unreachable |
+
+#### Phase 7 Raw Edge Metrics
+
+Phase 7 also adds `raw_edge_bps` to explain mode, which shows edge **before** risk gating:
+
+```json
+{
+  "edge_bps": 0.0,
+  "raw_edge_bps": 75.5,
+  "rejection_reason": "risk_not_approved"
+}
+```
+
+This helps calibrate thresholds even when trades are blocked by governance.
+
+The daemon summary now includes:
+- **Ticks with Raw Edge >= Xbps**: Count of ticks with pre-gating edge above threshold
+- **Max Raw Edge**: Maximum pre-gating edge seen across all ticks
+- **Avg Top Raw Edge**: Average pre-gating edge for calibration
+
+> ⚠️ **SAFETY**: The preflight command does NOT place orders. It only checks readiness.
+
 ## Project Structure
 
 ```

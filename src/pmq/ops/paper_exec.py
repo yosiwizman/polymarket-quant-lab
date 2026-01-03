@@ -81,6 +81,9 @@ class ExplainCandidate:
 
     Phase 6.2: Captures all relevant data for a potential trade,
     including why it was rejected (if applicable).
+
+    Phase 7: Added raw_edge_bps which is computed BEFORE risk gating.
+    This allows calibration even when risk rejects the trade.
     """
 
     # Market identification
@@ -95,6 +98,7 @@ class ExplainCandidate:
     mid_price: float = 0.0
     spread_bps: float = 0.0  # Bid-ask spread in basis points (if available)
     edge_bps: float = 0.0  # Computed edge/profit potential in basis points
+    raw_edge_bps: float = 0.0  # Edge computed BEFORE risk gating (Phase 7)
     liquidity: float = 0.0  # Market liquidity estimate
     size_estimate: float = 0.0  # Estimated executable size
 
@@ -118,6 +122,7 @@ class ExplainCandidate:
             "mid_price": round(self.mid_price, 6),
             "spread_bps": round(self.spread_bps, 2),
             "edge_bps": round(self.edge_bps, 2),
+            "raw_edge_bps": round(self.raw_edge_bps, 2),
             "liquidity": round(self.liquidity, 2),
             "size_estimate": round(self.size_estimate, 2),
             "rejection_reason": self.rejection_reason.value,
@@ -365,6 +370,8 @@ class PaperExecutor:
                 else 0
             )
 
+            # Phase 7: Store raw_edge_bps BEFORE any rejection checks
+            # This ensures we capture the true edge even when risk gates block execution
             candidate = ExplainCandidate(
                 market_id=signal.market_id,
                 market_question=signal.market_question,
@@ -373,6 +380,7 @@ class PaperExecutor:
                 no_price=signal.no_price,
                 mid_price=mid_price,
                 edge_bps=edge_bps,
+                raw_edge_bps=edge_bps,  # Preserve true edge before any gating
                 liquidity=signal.liquidity,
                 size_estimate=self.config.trade_quantity,
             )
@@ -629,6 +637,7 @@ class PaperExecutor:
             edge_bps = profit_potential * 10000
             mid_price = combined_price / 2 if combined_price > 0 else 0
 
+            # Phase 7: Store raw_edge_bps BEFORE any rejection checks
             candidate = ExplainCandidate(
                 market_id=market_id,
                 market_question=question,
@@ -637,6 +646,7 @@ class PaperExecutor:
                 no_price=no_price,
                 mid_price=mid_price,
                 edge_bps=edge_bps,
+                raw_edge_bps=edge_bps,  # Preserve true edge before any gating
                 liquidity=liquidity,
                 size_estimate=self.config.trade_quantity,
             )
@@ -773,6 +783,7 @@ class ExplainSummary:
     """Summary statistics from explain mode data.
 
     Phase 6.2: Computed from accumulated explain tick data for daemon_summary.
+    Phase 7: Added raw_edge statistics for calibration when risk gates reject.
     """
 
     total_ticks: int = 0
@@ -787,6 +798,11 @@ class ExplainSummary:
     avg_top_edge_bps: float = 0.0
     median_top_edge_bps: float = 0.0
     max_top_edge_bps: float = 0.0
+
+    # Phase 7: Raw edge statistics (before risk gating)
+    avg_top_raw_edge_bps: float = 0.0
+    max_raw_edge_bps: float = 0.0
+    ticks_with_raw_edge_above_threshold: int = 0  # Ticks with raw_edge >= threshold
 
     # Ticks with opportunities
     ticks_with_candidates: int = 0  # Ticks with at least 1 candidate
@@ -811,6 +827,7 @@ class ExplainSummary:
         summary.total_ticks = len(results)
 
         top_edges: list[float] = []
+        top_raw_edges: list[float] = []  # Phase 7
         combined_rejection_counts: dict[str, int] = {}
 
         for result in results:
@@ -822,8 +839,16 @@ class ExplainSummary:
                 top_edge = candidates[0].edge_bps if candidates else 0
                 top_edges.append(top_edge)
 
+                # Phase 7: Track raw edge from top candidate
+                top_raw_edge = candidates[0].raw_edge_bps if candidates else 0
+                top_raw_edges.append(top_raw_edge)
+
                 if top_edge >= min_edge_bps:
                     summary.ticks_with_candidates_above_min_edge += 1
+
+                # Phase 7: Count ticks with raw_edge above threshold
+                if top_raw_edge >= min_edge_bps:
+                    summary.ticks_with_raw_edge_above_threshold += 1
 
             summary.total_candidates += len(candidates)
 
@@ -850,5 +875,10 @@ class ExplainSummary:
             else:
                 summary.median_top_edge_bps = sorted_edges[mid_idx]
             summary.max_top_edge_bps = max(top_edges)
+
+        # Phase 7: Compute raw edge statistics
+        if top_raw_edges:
+            summary.avg_top_raw_edge_bps = sum(top_raw_edges) / len(top_raw_edges)
+            summary.max_raw_edge_bps = max(top_raw_edges)
 
         return summary

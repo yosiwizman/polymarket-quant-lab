@@ -2694,6 +2694,124 @@ Your first paper trade will occur when:
 
 > 💡 **Tip**: If markets are efficient (no arb), you've proven the system works correctly! The absence of trades when no opportunity exists is the right behavior.
 
+## First Live Trade Checklist (Phase 11)
+
+**⚠️ IMPORTANT**: Live trading is NOT yet implemented. Phase 11 provides the authentication bootstrap and smoke test infrastructure needed BEFORE live trading can be enabled.
+
+### Prerequisites
+
+1. You must be in a region where Polymarket is available (geoblock check)
+2. You need an Ethereum wallet with:
+   - Private key
+   - Funder/proxy wallet address (from https://polymarket.com/profile/settings)
+3. You must have completed the Paper Trade Checklist above
+
+### Step 1: Initialize Credentials
+
+```powershell
+# Set environment variables (DO NOT commit these!)
+$env:PRIVATE_KEY = "0x...your-private-key..."
+$env:FUNDER_ADDRESS = "0x...your-funder-address..."
+
+# Initialize CLOB API credentials
+poetry run pmq auth init
+```
+
+⚠️ **WARNING**: Creating new API credentials may INVALIDATE any existing keys for this wallet. Only run this once unless you need to regenerate.
+
+### Step 2: Verify Credentials
+
+```powershell
+# Check credentials are saved
+poetry run pmq auth status
+```
+
+Expected output:
+```
+CLOB Credentials
+┌─────────────────┬──────────────────┐
+│ Field           │ Value            │
+├─────────────────┼──────────────────┤
+│ Status          │ CONFIGURED       │
+│ API Key         │ 550e...0000      │
+└─────────────────┴──────────────────┘
+```
+
+### Step 3: Run Live Smoke Test
+
+```powershell
+# Run comprehensive live connectivity test
+poetry run pmq ops live-smoke
+```
+
+This test:
+1. Checks geoblock status (✗ if blocked - **stop here**)
+2. Verifies credentials are loaded
+3. Confirms PRIVATE_KEY is set
+4. Tests L2 authentication by calling a non-trading endpoint
+
+✓ All steps must pass before proceeding.
+
+### Step 4: Run Calibration (Same as Paper)
+
+```powershell
+# Collect data with explain mode
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-explain --max-hours 1
+
+# Analyze edge distribution
+poetry run pmq ops calibrate --jsonl exports/paper_exec_<date>.jsonl
+```
+
+### Step 5: Grant Approval
+
+```powershell
+# For paper execution only (live exec requires separate approval scope)
+poetry run pmq risk approve paper_exec --ttl-minutes 120 --reason "Tested with live-smoke"
+```
+
+### Step 6: Paper Execution with Auth
+
+```powershell
+# Run paper execution (still paper, not live)
+poetry run pmq ops daemon --interval 60 --paper-exec --paper-exec-min-edge 10
+```
+
+### Future: Live Execution
+
+**Live trading is NOT YET IMPLEMENTED.** When it is:
+
+- Will require `--live-exec` flag (disabled by default)
+- Will require valid TTL approval for `live_exec` scope
+- Will require passing `pmq ops live-smoke` test
+- Will place REAL orders with REAL money
+
+### Phase 11 CLI Commands (Auth)
+
+| Command | Description |
+|---------|-------------|
+| `pmq auth init` | Initialize CLOB credentials from PRIVATE_KEY |
+| `pmq auth status` | Show credential status (masked) |
+| `pmq auth wipe` | Delete local credentials |
+| `pmq ops preflight --require-auth` | Preflight with L2 auth validation |
+| `pmq ops live-smoke` | Full live connectivity smoke test |
+
+### Credential Storage
+
+- Location: `~/.pmq/creds.json`
+- Permissions: 0600 (owner read/write only)
+- Contains: API key, secret, passphrase, funder address
+- **NEVER** committed to git
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| "BLOCKED" in geoblock | Polymarket not available in your region |
+| "No credentials found" | Run `pmq auth init` first |
+| "PRIVATE_KEY not set" | Set `$env:PRIVATE_KEY` before running |
+| "L2 auth failed" | Check: private key matches funder, credentials valid |
+| "INVALID_SIGNATURE" | Private key may be incorrect or malformed |
+
 ## Project Structure
 
 ```
@@ -2726,6 +2844,9 @@ polymarket-quant-lab/
 │   ├── evaluation/         # Evaluation pipeline (Phase 4)
 │   │   ├── pipeline.py     # End-to-end orchestration
 │   │   └── reporter.py     # Report generation
+│   ├── auth/               # Authentication (Phase 11)
+│   │   ├── creds.py        # Credential storage
+│   │   └── redact.py       # Secret redaction
 │   └── web/
 │       ├── app.py          # FastAPI application
 │       ├── routes.py       # API endpoints

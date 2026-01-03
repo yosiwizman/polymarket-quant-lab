@@ -5413,9 +5413,7 @@ def ops_live_preflight(
             checks.append(("TTL Approval", True, f"Approved for {remaining_minutes}m"))
         elif approval and not approval.is_valid():
             console.print("   [red]✗ live_exec EXPIRED[/red]")
-            console.print(
-                "   [dim]Run: pmq risk approve live_exec --ttl-minutes 60[/dim]"
-            )
+            console.print("   [dim]Run: pmq risk approve live_exec --ttl-minutes 60[/dim]")
             checks.append(("TTL Approval", False, "Expired"))
             all_passed = False
         else:
@@ -5437,9 +5435,7 @@ def ops_live_preflight(
             from pmq.auth import load_creds
             from pmq.auth.client_factory import check_auth_sanity, create_clob_client
 
-            private_key = os.environ.get("PRIVATE_KEY") or os.environ.get(
-                "PMQ_PRIVATE_KEY"
-            )
+            private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("PMQ_PRIVATE_KEY")
             creds = load_creds()
 
             if not creds:
@@ -5467,9 +5463,7 @@ def ops_live_preflight(
                     )
                     checks.append(("Auth", True, result.message))
                     if verbose and result.open_orders_count is not None:
-                        console.print(
-                            f"   [dim]Open orders: {result.open_orders_count}[/dim]"
-                        )
+                        console.print(f"   [dim]Open orders: {result.open_orders_count}[/dim]")
                 else:
                     console.print("   [red]✗ Auth sanity check failed[/red]")
                     console.print(f"   [dim]{result.message}[/dim]")
@@ -5491,12 +5485,8 @@ def ops_live_preflight(
     try:
         from pmq.ops.live_exec import DEFAULT_MAX_ORDER_USD, DEFAULT_MAX_ORDERS_PER_HOUR
 
-        console.print(
-            f"   [green]✓[/green] Max order size: ${DEFAULT_MAX_ORDER_USD:.2f}"
-        )
-        console.print(
-            f"   [green]✓[/green] Max orders/hour: {DEFAULT_MAX_ORDERS_PER_HOUR}"
-        )
+        console.print(f"   [green]✓[/green] Max order size: ${DEFAULT_MAX_ORDER_USD:.2f}")
+        console.print(f"   [green]✓[/green] Max orders/hour: {DEFAULT_MAX_ORDERS_PER_HOUR}")
         console.print("   [green]✓[/green] Confirm flag required (dry-run by default)")
         console.print("   [green]✓[/green] SELL_BOTH disabled")
         checks.append(("Safety Defaults", True, "Conservative limits active"))
@@ -5731,11 +5721,13 @@ def ops_live_probe(
     side_upper = side.upper()
     if side_upper == "BUY":
         probe_price = compute_non_marketable_buy_price(
-            constraints.best_bid, constraints.tick_size  # type: ignore
+            constraints.best_bid,
+            constraints.tick_size,  # type: ignore
         )
     else:
         probe_price = compute_non_marketable_sell_price(
-            constraints.best_ask, constraints.tick_size  # type: ignore
+            constraints.best_ask,
+            constraints.tick_size,  # type: ignore
         )
 
     # Quantize size
@@ -5874,7 +5866,9 @@ def ops_live_probe(
 
         # Create kill switch file
         kill_switch_path.parent.mkdir(parents=True, exist_ok=True)
-        kill_switch_path.write_text(f"Triggered by unexpected fill at {datetime.now(UTC).isoformat()}")
+        kill_switch_path.write_text(
+            f"Triggered by unexpected fill at {datetime.now(UTC).isoformat()}"
+        )
 
         # Record in ledger
         fill_record = LiveOrderRecord(
